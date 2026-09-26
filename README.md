@@ -38,7 +38,7 @@ Build-order steps 1–4, which is everything that needs no credential:
 | 2. Webhook intake, signature verification, dedupe | done |
 | 3. Simulated Devin adapter, worker loop | done |
 | 4. Outbox, notification formatting, fake Slack transport | done |
-| 5. Live Slack transport | implemented, needs an authorized webhook URL |
+| 5. Live Slack transport | done — verified against a real channel |
 | 6. Live Devin adapter | implemented, needs a service-user token |
 | 7. Reconciliation loop | partial — poll and tag-based orphan recovery |
 | 8. Report endpoint | done |
@@ -71,6 +71,17 @@ python scripts/run_simulation.py
 Replays `issue_opened` → `issue_labeled` → a simulated Devin session →
 `pull_request.opened` → `pull_request.closed(merged)` and prints the task
 state and the Slack messages that would have been sent. No network.
+
+To prove the notification path against a real channel without spending an ACU,
+keep Devin simulated and send for real:
+
+```bash
+export SLACK_WEBHOOK_ENGINEERING_UPDATES='https://hooks.slack.com/services/...'
+python scripts/run_simulation.py --live-slack
+```
+
+Two messages arrive in the channel behind that URL, so only run it against a
+destination whose owner has authorized it.
 
 ### Replaying a captured delivery
 
