@@ -1,0 +1,15 @@
+[
+  {
+    "status": "new"
+  },
+  {
+    "status": "running",
+    "status_detail": "working",
+    "acus_consumed": 0.75
+  },
+  {
+    "status": "running",
+    "status_detail": "waiting_for_user",
+    "acus_consumed": 1.0
+  }
+]

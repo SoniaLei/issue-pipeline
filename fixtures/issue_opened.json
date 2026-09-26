@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "issue": {
+    "number": 4242,
+    "title": "Dashboard filter resets when a chart is refreshed",
+    "state": "open",
+    "body": "## Repro\n1. Open a dashboard with a native filter\n2. Refresh one chart\n3. The filter value is lost\n\n## Expected\nThe filter value survives a single-chart refresh.",
+    "labels": [
+      {
+        "name": "bug"
+      }
+    ],
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo/issues/4242"
+  },
+  "repository": {
+    "full_name": "SoniaLei/superset-cognition-demo",
+    "name": "superset-cognition-demo",
+    "owner": {
+      "login": "SoniaLei"
+    }
+  },
+  "sender": {
+    "login": "outside-contributor"
+  }
+}

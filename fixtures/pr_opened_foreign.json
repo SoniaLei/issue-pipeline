@@ -1,0 +1,33 @@
+{
+  "action": "opened",
+  "pull_request": {
+    "number": 92,
+    "title": "fix(dashboard): keep native filter state across single-chart refresh",
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91",
+    "body": "Cause: the refresh path rebuilt filter state from defaults.\n\nFixes #4242\n\n<!-- automation-run: RUN_ID -->",
+    "head": {
+      "ref": "patch-1",
+      "sha": "deadbeef",
+      "repo": {
+        "full_name": "stranger/superset-cognition-demo"
+      }
+    },
+    "base": {
+      "ref": "master",
+      "sha": "0501796837"
+    }
+  },
+  "repository": {
+    "full_name": "SoniaLei/superset-cognition-demo",
+    "name": "superset-cognition-demo",
+    "owner": {
+      "login": "SoniaLei"
+    }
+  },
+  "sender": {
+    "login": "stranger"
+  }
+}

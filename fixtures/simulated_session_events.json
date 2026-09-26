@@ -1,0 +1,31 @@
+[
+  {
+    "status": "new"
+  },
+  {
+    "status": "running",
+    "status_detail": "working",
+    "acus_consumed": 1.5
+  },
+  {
+    "status": "running",
+    "status_detail": "working",
+    "acus_consumed": 3.0
+  },
+  {
+    "status": "running",
+    "status_detail": "finished",
+    "acus_consumed": 4.25,
+    "structured_output": {
+      "outcome": "fixed",
+      "tests_added": true,
+      "tests_run": "pytest tests/unit_tests/dashboards"
+    },
+    "pull_requests": [
+      {
+        "pr_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91",
+        "pr_state": "open"
+      }
+    ]
+  }
+]
