@@ -59,7 +59,28 @@ def test_payload_names_the_next_human_action(intake: Intake, store: Store) -> No
     text = payload["blocks"][0]["text"]["text"]
     assert "Next action:" in text
     assert "SoniaLei/superset-cognition-demo" in text
-    assert payload["text"].startswith("PR opened")
+    assert "PR opened" in payload["text"]
+
+
+def test_status_is_readable_from_the_emoji_alone(intake: Intake, store: Store) -> None:
+    result = deliver(intake, "issues", "issue_labeled.json")
+    task = store.get_task(int(result.task_id or 0))
+    assert task is not None
+
+    merged = build_payload(kind=Kind.PR_MERGED, task=task, run=None)
+    closed = build_payload(kind=Kind.PR_CLOSED, task=task, run=None)
+    blocked = build_payload(
+        kind=Kind.NEEDS_HUMAN, task=task, run=None, reason="waiting_for_user"
+    )
+    operator = build_payload(
+        kind=Kind.NEEDS_HUMAN, task=task, run=None, reason="capacity"
+    )
+
+    assert merged["text"].startswith(":white_check_mark:")
+    assert closed["text"].startswith(":x:")
+    assert blocked["text"].startswith(":warning:")
+    # An out-of-credits org is not a stuck session and should not look like one.
+    assert operator["text"].startswith(":rotating_light:")
 
 
 def test_ready_for_review_does_not_claim_ci_passed(

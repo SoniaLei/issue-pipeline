@@ -67,6 +67,37 @@ def escape(text: str | None) -> str:
     return escaped
 
 
+# Status is carried by a leading emoji so the channel is scannable without
+# reading any of the text. Shortcodes rather than literals: Slack renders them
+# consistently across clients.
+_KIND_EMOJI = {
+    Kind.PR_OPENED: ":inbox_tray:",
+    Kind.READY_FOR_REVIEW: ":eyes:",
+    Kind.VERIFIED: ":large_green_circle:",
+    Kind.PR_MERGED: ":white_check_mark:",
+    Kind.PR_CLOSED: ":x:",
+}
+
+_CHECKS_EMOJI = {
+    "passed": ":white_check_mark:",
+    "failed": ":x:",
+    "pending": ":hourglass_flowing_sand:",
+}
+
+
+def _emoji(kind: Kind, reason: str | None) -> str:
+    if kind is Kind.NEEDS_HUMAN:
+        # An operator problem and a stuck session both need a human, but not
+        # the same human.
+        return ":rotating_light:" if destination_is_operator(reason) else ":warning:"
+    return _KIND_EMOJI.get(kind, ":bell:")
+
+
+def _checks_label(checks: str) -> str:
+    # Absent checks are unknown, never passed.
+    return f"{_CHECKS_EMOJI.get(checks, ':grey_question:')} {checks}"
+
+
 def _link(url: str | None, label: str) -> str:
     if not url:
         return label
@@ -104,15 +135,16 @@ def build_payload(
     pr_state = _pr_state(kind, run, draft)
 
     headline, next_action = _headline(kind, title, reason, detail, draft)
+    emoji = _emoji(kind, reason)
 
     lines = [
-        f"*{headline}*",
+        f"{emoji} *{headline}*",
         f"Repository: `{escape(repo)}`",
         f"Issue: {_link(_issue_url(repo, issue_number), f'#{issue_number} {title}')}",
     ]
     if pr_url:
         lines.append(f"PR: {_link(pr_url, f'#{pr_number}')}")
-        lines.append(f"State: {pr_state} | Checks: {checks}")
+        lines.append(f"State: {pr_state} | Checks: {_checks_label(checks)}")
     if session_url:
         lines.append(f"Devin session: {_link(session_url, 'open session')}")
     if run_id:
@@ -121,7 +153,7 @@ def build_payload(
         lines.append(f"Detail: {escape(detail)}")
     lines.append(f"Next action: {next_action}")
 
-    text = f"{headline} — {repo}#{issue_number}"
+    text = f"{emoji} {headline} — {repo}#{issue_number}"
     return {
         "text": text,
         "blocks": [
