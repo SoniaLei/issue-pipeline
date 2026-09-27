@@ -54,6 +54,7 @@ Build-order steps 1–4, which is everything that needs no credential:
 | 6. Live Devin adapter | implemented, needs a service-user token |
 | 7. Reconciliation loop | partial — poll and tag-based orphan recovery |
 | 8. Report endpoint | done |
+| 9. Dashboard: workload, results, speed, throughput, health, run timeline | done |
 
 The whole pipeline runs end to end with `DEVIN_MODE=sim` and
 `SLACK_MODE=fake`, spending nothing and calling nobody.
@@ -80,8 +81,11 @@ python scripts/run_simulation.py
 ```
 
 Replays `issue_opened` → `issue_labeled` → a simulated Devin session →
-`pull_request.opened` → `pull_request.closed(merged)` and prints the task
-state and the Slack messages that would have been sent. No network.
+`pull_request.opened` → `check_suite` (queued, then passed) →
+`pull_request_review` → `pull_request.closed(merged)` and prints the task
+state, the Slack messages that would have been sent and the dashboard's
+summary. No network. Add `--serve` to keep the store alive and browse
+`/dashboard` over that simulated run afterwards.
 
 To prove the notification path against a real channel without spending an ACU,
 keep Devin simulated and send for real:
@@ -102,6 +106,50 @@ python scripts/replay_webhook.py fixtures/issue_labeled.json
 
 Signs the body with `GITHUB_WEBHOOK_SECRET` and posts it to a running API,
 which is also the easiest way to check signature verification is on.
+
+## Dashboard
+
+`GET /dashboard` is a self-contained page over the store; `GET /api/dashboard`
+is the same data as JSON and `GET /api/tasks/{id}/timeline` is the drawer that
+opens when a row is clicked.
+
+**Live and Simulation are separate pages, never a total.** Every run is stored
+with the `env` it was created under (`DEVIN_MODE`), and the dashboard reports
+exactly one env at a time — `?env=live` or `?env=sim`, defaulting to the
+service's own mode. A banner names which one is shown; there is no "all" view,
+so a simulated merge can never inflate a live success number.
+
+The outcome words are used precisely, and the page states its definitions:
+
+| Word | Means | Evidence |
+| --- | --- | --- |
+| PR opened | a pull request exists for the run; checks may be pending | `pull_request.opened` correlated to the run |
+| Verified | every check suite GitHub reported for the PR's **current** head completed successfully | `check_suite` events for `checks_head_sha == head_sha`; a new commit resets it |
+| Merged | GitHub reported the PR closed with `merged=true` | `pull_request.closed` |
+| Blocked / failed | the run needs a human, with the reason and the next action shown | run state + `failure_reason` |
+
+A session saying it added and ran a test is displayed as *the session's
+account* and is never counted as verification. "Verified" is currently "all
+suites GitHub reported", not "the suites branch protection requires"; reading
+branch protection to narrow it is a later uplift.
+
+Sections: **current workload** (queued, running, PR opened, awaiting review,
+blocked, failed), **results** (opened / verified / merged), **speed** (median and
+p90 from maintainer approval to first verification, with the sample count),
+**throughput** (verified and merged per UTC day, last 14 days), **needs
+attention** (blocker, age, next action), **integration health** (last GitHub
+delivery, last Devin poll, worker heartbeat, Slack failures) and the **task
+table** — issue, state, elapsed, tests, PR, Slack status, last update. The
+header shows `data as of` (the newest write in the store) separately from when
+the page was rendered.
+
+The run timeline is durable: every state transition, session observation, PR
+event, check suite, verification, review and Slack attempt is a row in
+`run_events`/`outbox`, so the drawer shows what happened, not a reconstruction.
+
+It only knows about runs *this service* tracked. Sessions started by the Devin
+Automations are not in its store, so until the service is hosted the Live page
+is empty by construction.
 
 ## Configuration
 

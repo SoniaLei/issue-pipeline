@@ -197,6 +197,16 @@ def _headline(
 
 
 def _needs_human_headline(title: str, reason: str | None) -> tuple[str, str]:
+    headline, action = needs_human_text(reason)
+    return f"{headline}: {title}", action
+
+
+def needs_human_text(reason: str | None) -> tuple[str, str]:
+    """(what is wrong, what a human does about it) for a needs-human reason.
+
+    One vocabulary shared by the Slack message and the dashboard, so the two
+    never disagree about what the next action is.
+    """
     mapping = {
         "waiting_for_user": (
             "Session is waiting for a human",
@@ -236,10 +246,7 @@ def _needs_human_headline(title: str, reason: str | None) -> tuple[str, str]:
             "check whether the change outgrew its scope",
         ),
     }
-    headline, action = mapping.get(
-        reason or "", ("Run needs attention", "inspect the run")
-    )
-    return f"{headline}: {title}", action
+    return mapping.get(reason or "", ("Run needs attention", "inspect the run"))
 
 
 def destination_is_operator(reason: str | None) -> bool:

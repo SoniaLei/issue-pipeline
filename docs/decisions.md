@@ -581,3 +581,49 @@ identical ceiling fails identically, at the same price.
 **Revisit when** step 2's data exists — this decision is designed to be
 superseded, and a ceiling still at 20 after fifty runs means the measurement
 loop was never closed.
+
+## D-030 — Observability reports one environment at a time, and "verified" means the current head
+
+**Decision.** The dashboard (`/dashboard`, `/api/dashboard`,
+`/api/tasks/{id}/timeline`) reads only the store. It is filtered to exactly
+one `env` (`live` or `sim`) per request, with no aggregate view. A run is
+*verified* only when every check suite GitHub reported for the PR's **current**
+head completed successfully; a new head resets the answer to unknown until new
+suites arrive. Check evaluation still drives no state transition (D-011) — the
+"awaiting review" bucket is derived at report time from `pr_open` plus that
+verification fact.
+
+**Why one env.** A simulated merge is a fixture replayed against an in-memory
+database; counting it beside a live one would report success that never
+happened. The page therefore has no "all" mode, names the environment in a
+banner and shows how many runs of each kind the store holds, so an empty live
+page is legible as "nothing ran", not "nothing recorded".
+
+**Why current head.** Check results are keyed by head SHA (`checks` table) and
+folded per run into `checks_state` + `checks_head_sha`. `is_verified` requires
+`checks_head_sha == head_sha`. Without that, a passing suite for commit A would
+continue to vouch for a PR whose head had moved to commit B — the stale
+verification problem in one line. A late suite for a superseded head is
+recorded and ignored.
+
+**What is evidence and what is testimony.** A session's structured output
+("tests added", "tests run") is displayed as the session's account in the
+timeline and task table, and never counted as verification. Only GitHub's check
+suites do. The state-change, session, PR, check, verification, review and
+Slack rows in the timeline are durable (`run_events`, `outbox`) and written at
+the moment they happen, not reconstructed.
+
+**What "verified" is not yet.** It is "all suites GitHub reported", not "the
+suites branch protection requires". Narrowing it means reading branch
+protection through the App and is a later uplift; until then a repository with
+an optional, flaky suite will under-report verification, which is the safe
+direction to be wrong in.
+
+**Freshness.** `data_as_of` is the newest write across runs, deliveries,
+outbox and heartbeats — a store-side fact. `generated_at` is when the report
+was built. The worker heartbeat is separate again, so a stale worker is visible
+even while the API keeps answering.
+
+**Revisit when** the service is hosted and has live runs: the metrics only
+describe runs this service tracked, so Automation-started sessions are not in
+them by construction.

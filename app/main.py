@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""HTTP surface: the GitHub webhook, health, and the task report.
+"""HTTP surface: the GitHub webhook, health, the task report and the dashboard.
 
 The handler does verification, deduplication and a transaction, and nothing
 else. Session creation and Slack delivery belong to the worker, because a
@@ -27,13 +27,17 @@ import json
 import logging
 from typing import Any
 
-from fastapi import FastAPI, Header, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Header, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from app.config import load_settings, Settings
+from app.dashboard import build_dashboard, build_timeline
+from app.dashboard_page import render_page
 from app.intake import Intake, verify_signature
 from app.reporting import build_report, render_text
 from app.store import Store
+
+ENVS = ("live", "sim")
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +103,47 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     def report_text() -> str:
         return render_text(build_report(backing))
 
+    _mount_dashboard(app, resolved, backing)
     return app
+
+
+def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
+    """Read-only reporting routes. Nothing here writes to a run."""
+
+    def _env(requested: str | None) -> str | None:
+        # Default to the environment this instance runs in; never to "all".
+        env = requested or settings.env
+        return env if env in ENVS else None
+
+    @app.get("/api/dashboard")
+    def api_dashboard(env: str | None = Query(default=None)) -> Response:
+        chosen = _env(env)
+        if chosen is None:
+            return JSONResponse({"detail": "env must be live or sim"}, status_code=400)
+        store.heartbeat("api", "api")
+        return JSONResponse(
+            build_dashboard(
+                store,
+                chosen,
+                worker_stale_after_seconds=max(
+                    60, int(settings.poll_interval_seconds * 10)
+                ),
+            )
+        )
+
+    @app.get("/api/tasks/{task_id}/timeline")
+    def api_timeline(task_id: int) -> Response:
+        timeline = build_timeline(store, task_id)
+        if timeline is None:
+            return JSONResponse({"detail": "unknown task"}, status_code=404)
+        return JSONResponse(timeline)
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard(env: str | None = Query(default=None)) -> Response:
+        chosen = _env(env)
+        if chosen is None:
+            return PlainTextResponse("env must be live or sim", status_code=400)
+        return HTMLResponse(render_page(default_env=chosen))
 
 
 def get_app() -> FastAPI:  # pragma: no cover - uvicorn entry point

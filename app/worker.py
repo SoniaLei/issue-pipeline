@@ -121,6 +121,7 @@ class Worker:
 
     def tick(self) -> bool:
         """Advance at most one run and deliver any due notifications."""
+        self.store.heartbeat("worker", self.owner)
         advanced = self.advance_one()
         delivered = self.drain_outbox()
         return advanced or delivered > 0
@@ -335,6 +336,27 @@ class Worker:
             fields["failure_reason"] = reason
 
         self.store.update_run(conn, run_id, **fields)
+
+        provider_before = (run["session_status"], run["session_status_detail"])
+        provider_after = (snapshot.status, snapshot.status_detail)
+        if run["session_id"] is None or provider_before != provider_after:
+            # Provider status is recorded on change, never per poll: the
+            # timeline should read as a story, not as a heartbeat log.
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind="session",
+                reason="created" if run["session_id"] is None else "status",
+                detail={
+                    "session_id": snapshot.session_id,
+                    "url": snapshot.url,
+                    "status": snapshot.status,
+                    "status_detail": snapshot.status_detail,
+                    "acus_consumed": snapshot.acus_consumed,
+                    "structured_output": snapshot.structured_output,
+                },
+            )
 
         if target is not current and target in NEEDS_HUMAN_STATES:
             self._notify_state_change(
