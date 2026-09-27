@@ -125,3 +125,41 @@ ruff check . && ruff format --check . && mypy app scripts
 The suite runs against fixtures and the simulated adapters. No test touches a
 network. `pre-commit install` runs the same checks on each commit; CI runs
 them plus the simulated end-to-end run on every push and pull request.
+
+## Observability
+
+Open `http://localhost:8000/dashboard` after starting the API. Select **sim**
+(the default with simulated Devin) or **live**, optionally filter by repository,
+and choose 1–90 UTC calendar days for throughput. `/reports/summary` accepts the
+same `env`, `repo` and `days` parameters and returns JSON. `/runs/{run_id}` shows
+recorded state transitions and notification attempts.
+
+The dashboard separates current workload from observed PR/merge throughput,
+shows unsuccessful and blocked attempts, and preserves unknown ACU usage as
+unknown. Median approval-to-PR time includes only runs with recorded approval
+and PR transitions and shows the sample count. These are elapsed times, not
+engineer time saved. Current state counts and timing samples cover all matching
+runs; only throughput is restricted to the selected window.
+
+State history is persisted transactionally through SQLite triggers. Existing
+runs acquire a labelled snapshot on upgrade: earlier milestone times cannot be
+reconstructed and do not contribute to throughput. Back up the database before
+upgrading. No existing run or notification rows are rewritten. Throughput counts
+observed state transitions, not the original remote event timestamps.
+
+CI evaluation remains outside this worker (D-011). The dashboard explicitly
+shows checks as **not evaluated** rather than treating an opened or merged PR
+as proof of a passing regression test. Native Devin Automations that run without
+this service do not automatically populate its database. The dashboard only
+reports work recorded by this service.
+
+Notification state is independent of remediation state. The mode describes the
+Devin run: simulated runs can still send real Slack messages when explicitly
+configured. Report generation and provider poll times are not worker-health
+checks. The existing `/report` and `/report.txt` remain legacy aggregate views;
+use the new dashboard/summary for isolated modes and unknown-usage accounting.
+
+These read-only routes follow the existing report's access model: they are not
+authenticated. Keep them private or behind authenticated ingress. Expose only
+`/webhooks/github` through a public webhook tunnel. Raw webhook payloads, session
+outputs and Slack destination URLs are not included in the new report.
