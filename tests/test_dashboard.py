@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -296,6 +297,18 @@ def test_health_reports_polls_heartbeat_and_slack_failures(
     assert health["slack"]["failed"] + health["slack"]["pending"] >= 1
     assert board["tasks"][0]["slack"]["status"] in {"failed", "pending"}
     assert board["tasks"][0]["slack"]["last_error"]
+    assert health["slack"]["last_error"] == board["tasks"][0]["slack"]["last_error"]
+
+
+def test_serving_the_dashboard_does_not_refresh_data_as_of(
+    client: TestClient, store: Store
+) -> None:
+    store.heartbeat("worker", "w1")
+    first = client.get("/api/dashboard").json()["data_as_of"]
+    time.sleep(0.01)
+    second = client.get("/api/dashboard").json()["data_as_of"]
+    assert first == second
+    assert {row["component"] for row in store.heartbeats()} == {"api", "worker"}
 
 
 def test_a_silent_worker_is_reported_stale(store: Store) -> None:

@@ -376,9 +376,10 @@ def _health(
     worker = beats.get("worker")
     worker_at = str(worker["at"]) if worker else None
     worker_age = _seconds_between(worker_at, now.isoformat()) if worker_at else None
-    failed = [r for r in runs if r["slack"]["status"] == "failed"]
+    undelivered = [r for r in runs if r["slack"]["status"] in {"failed", "pending"}]
     last_error = next(
-        (r["slack"]["last_error"] for r in failed if r["slack"]["last_error"]), None
+        (r["slack"]["last_error"] for r in undelivered if r["slack"]["last_error"]),
+        None,
     )
     last_sent = max(
         (r["slack"]["last_sent_at"] for r in runs if r["slack"]["last_sent_at"]),
@@ -475,8 +476,9 @@ def build_dashboard(
     ]
 
     data_points = [r["last_update"] for r in runs] + [store.last_delivery_at()]
-    beats = store.heartbeats()
-    data_points += [str(row["at"]) for row in beats]
+    data_points += [
+        str(row["at"]) for row in store.heartbeats() if row["component"] != "api"
+    ]
     data_as_of = max((p for p in data_points if p), default=None)
 
     return {

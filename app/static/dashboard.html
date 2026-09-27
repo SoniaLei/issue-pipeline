@@ -293,20 +293,21 @@ async function openTimeline(taskId) {
     else text = `${e.kind} ${e.reason || ""}`;
     if (e.reason && ["failed", "no_output", "expired", "session_blocked", "closed_unmerged"].includes(e.to_state || "")) { cls += " bad"; text += ` · reason: ${e.reason}`; }
     if (e.kind === "checks" && e.reason === "failed") cls += " bad";
-    const li = el("li", { class: cls }, [el("time", { text: fmtTime(e.at) }), text]);
+    const li = el("li", { class: cls }, [el("time", { text: fmtTime(e.at), datetime: e.at }), text]);
     if (e.kind === "session" && d.structured_output) li.append(el("pre", { text: JSON.stringify(d.structured_output, null, 2) }));
-    items.push(li);
+    items.push([e.at, li]);
   }
   for (const n of t.notifications) {
-    items.push(el("li", { class: n.state === "failed" ? "bad" : "note" }, [el("time", { text: fmtTime(n.sent_at || n.at) }),
-      `Slack ${n.kind} → ${n.destination}: ${n.state} (${n.attempts} attempt${n.attempts === 1 ? "" : "s"})`, n.last_error ? ` · ${n.last_error}` : ""]));
+    const at = n.sent_at || n.at;
+    items.push([at, el("li", { class: n.state === "failed" ? "bad" : "note" }, [el("time", { text: fmtTime(at), datetime: at }),
+      `Slack ${n.kind} → ${n.destination}: ${n.state} (${n.attempts} attempt${n.attempts === 1 ? "" : "s"})`, n.last_error ? ` · ${n.last_error}` : ""])]);
   }
-  items.sort((a, b) => a.firstChild.textContent.localeCompare(b.firstChild.textContent));
+  items.sort((a, b) => new Date(a[0]) - new Date(b[0]));
 
   drawer.replaceChildren(close, el("h2", { text: `#${t.issue.number} ${t.issue.title}` }),
     el("p", { class: "muted small", text: `${t.repo} · issue ${t.issue.state} · labels: ${(t.issue.labels || []).join(", ") || "none"}` }),
     links, facts, el("h2", { text: "Timeline", style: "margin-top:16px" }),
-    items.length ? el("ul", { class: "tl" }, items) : el("p", { class: "muted", text: "no events" }));
+    items.length ? el("ul", { class: "tl" }, items.map(([, li]) => li)) : el("p", { class: "muted", text: "no events" }));
 }
 function closeTimeline() { const d = $("drawer"); d.classList.remove("open"); d.setAttribute("aria-hidden", "true"); }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeTimeline(); });
