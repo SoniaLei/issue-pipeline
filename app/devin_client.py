@@ -37,6 +37,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from app.prompts import STRUCTURED_OUTPUT_SCHEMA
 from app.states import State
 
 
@@ -177,9 +178,10 @@ class LiveDevinClient:
     message             ``POST   /sessions/{devin_id}/messages``
     ==================  ==========================================
 
-    Authentication is a dedicated service user holding ``UseDevinSessions``,
-    not an individual's token: an unattended pipeline keyed to one person's
-    account stops working the moment their access changes.
+    Authentication is a dedicated service user holding ``UseDevinSessions``
+    (create) and ``ViewOrgSessions`` (get, list), not an individual's token: an
+    unattended pipeline keyed to one person's account stops working the moment
+    their access changes.
     """
 
     def __init__(
@@ -189,10 +191,12 @@ class LiveDevinClient:
         org_id: str,
         token: str,
         timeout: float = 30.0,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._base = f"{base_url.rstrip('/')}/v3/organizations/{org_id}"
         self._client = httpx.Client(
             timeout=timeout,
+            transport=transport,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -244,6 +248,10 @@ class LiveDevinClient:
             # Omitting this grants the session every organization secret, so it
             # is always sent, even when empty.
             "secret_ids": secret_ids or [],
+            # The session must report its outcome in this shape before it ends;
+            # it is what the dashboard shows as test evidence.
+            "structured_output_schema": STRUCTURED_OUTPUT_SCHEMA,
+            "structured_output_required": True,
         }
         if playbook_id:
             body["playbook_id"] = playbook_id
@@ -259,9 +267,8 @@ class LiveDevinClient:
         appending it would leave it absent in exactly the failure case that
         needs it.
         """
-        data = self._request("GET", "/sessions", params={"tags": tag})
-        sessions = data.get("sessions") or data.get("data") or []
-        for item in sessions:
+        data = self._request("GET", "/sessions", params={"tags": [tag]})
+        for item in data.get("items") or []:
             snapshot = _parse_session(item)
             if tag in snapshot.tags:
                 return snapshot

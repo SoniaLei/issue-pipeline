@@ -107,6 +107,47 @@ python scripts/replay_webhook.py fixtures/issue_labeled.json
 Signs the body with `GITHUB_WEBHOOK_SECRET` and posts it to a running API,
 which is also the easiest way to check signature verification is on.
 
+### Running it live
+
+Nothing in the repository decides whether a run is real; the environment does.
+Going live is four things, and the service refuses to start in live mode until
+the ones it can check are present:
+
+1. **A reachable endpoint.** GitHub must be able to POST to
+   `/webhooks/github`. For a durable deployment that is `docker compose up`
+   behind any HTTPS host with a persistent volume. To prove the path from a
+   laptop or a throwaway VM without hosting anything:
+
+   ```bash
+   scripts/run_live.sh --tunnel
+   ```
+
+   starts the API and the worker against one store plus a Cloudflare quick
+   tunnel, and prints the public webhook and dashboard URLs. The endpoint
+   lives as long as the shell does.
+
+2. **A repository webhook** (or a GitHub App) on each repository in
+   `REPO_ALLOWLIST`, pointed at that URL, content type `application/json`,
+   secret equal to `GITHUB_WEBHOOK_SECRET`, subscribed to *Issues*,
+   *Pull requests*, *Pull request reviews* and *Check suites*. The service
+   never calls the GitHub API, so the webhook needs no token; it only needs to
+   be delivered.
+
+3. **A Devin service user**, org-scoped, holding `UseDevinSessions` (create)
+   and `ViewOrgSessions` (get, list). Set `DEVIN_MODE=live`, `DEVIN_ORG_ID`
+   and `DEVIN_API_TOKEN`. `DEVIN_MODE=live` is also what makes runs land on
+   the dashboard's *Live* view rather than *Simulation*; the two are never
+   summed.
+
+4. **A Slack incoming webhook** per logical destination in
+   `SLACK_DESTINATIONS`, with `SLACK_MODE=live`.
+
+Then a maintainer in `MAINTAINER_ALLOWLIST` applies `devin-ready` to an issue,
+and `/dashboard?env=live` shows the run from `queued` onwards: the session
+link once Devin accepts it, the PR once GitHub reports it, checks as suites
+complete, the Slack post state, and the worker and delivery heartbeats under
+*Integration health*.
+
 ## Dashboard
 
 `GET /dashboard` is a self-contained page over the store; `GET /api/dashboard`
