@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, Header, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from app.config import load_settings, Settings
 from app.intake import Intake, verify_signature
+from app.observability import build_overview, render_dashboard, render_run
 from app.reporting import build_report, render_text
 from app.store import Store
 
@@ -99,6 +100,8 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     def report_text() -> str:
         return render_text(build_report(backing))
 
+    register_reports(app, backing, resolved)
+
     return app
 
 
@@ -111,3 +114,31 @@ def get_app() -> FastAPI:  # pragma: no cover - uvicorn entry point
     """
     logging.basicConfig(level=logging.INFO)
     return create_app()
+
+
+def register_reports(app: FastAPI, backing: Store, resolved: Settings) -> None:
+    @app.get("/reports/summary")
+    def summary(
+        env: Literal["sim", "live"] | None = None,
+        repo: str | None = None,
+        days: int = Query(default=7, ge=1, le=90),
+    ) -> dict[str, Any]:
+        return build_overview(backing, env=env or resolved.env, repo=repo, days=days)
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard(
+        env: Literal["sim", "live"] | None = None,
+        repo: str | None = None,
+        days: int = Query(default=7, ge=1, le=90),
+    ) -> str:
+        return render_dashboard(
+            build_overview(backing, env=env or resolved.env, repo=repo, days=days)
+        )
+
+    @app.get("/runs/{run_id}", response_class=HTMLResponse)
+    def run_detail(run_id: str) -> str:
+        row = backing.get_run(run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        report = build_overview(backing, env=str(row["env"]))
+        return render_run(next(r for r in report["runs"] if r["run_id"] == run_id))
