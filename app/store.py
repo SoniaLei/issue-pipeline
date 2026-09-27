@@ -166,6 +166,22 @@ CREATE TABLE IF NOT EXISTS checks (
     PRIMARY KEY (run_id, head_sha, suite_id)
 );
 
+-- Check suites keyed by repository head, whether or not a run tracks that
+-- head yet. GitHub reports suites for a pushed commit before the pull request
+-- that carries it is opened; a run that only learns about suites after its PR
+-- exists would see the first completed one arrive alone and call it a pass.
+CREATE TABLE IF NOT EXISTS head_checks (
+    repo        TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    suite_id    TEXT NOT NULL,
+    app         TEXT,
+    status      TEXT NOT NULL,
+    conclusion  TEXT,
+    url         TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (repo, head_sha, suite_id)
+);
+
 -- Liveness of the processes that are supposed to be running. A dashboard
 -- that cannot tell "nothing happened" from "nobody is looking" is useless.
 CREATE TABLE IF NOT EXISTS heartbeats (
@@ -503,6 +519,59 @@ class Store:
             """,
             (run_id, head_sha, suite_id, app, status, conclusion, url, now_iso()),
         )
+
+    def record_head_check_suite(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        repo: str,
+        head_sha: str,
+        suite_id: str,
+        app: str | None,
+        status: str,
+        conclusion: str | None,
+        url: str | None,
+        retention: timedelta = timedelta(days=14),
+    ) -> None:
+        conn.execute(
+            "DELETE FROM head_checks WHERE updated_at < ?",
+            ((utcnow() - retention).isoformat(),),
+        )
+        conn.execute(
+            """
+            INSERT INTO head_checks
+                (repo, head_sha, suite_id, app, status, conclusion, url, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (repo, head_sha, suite_id) DO UPDATE SET
+                app = excluded.app,
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                url = excluded.url,
+                updated_at = excluded.updated_at
+            """,
+            (repo, head_sha, suite_id, app, status, conclusion, url, now_iso()),
+        )
+
+    def adopt_head_checks(
+        self, conn: sqlite3.Connection, *, run_id: str, repo: str, head_sha: str
+    ) -> int:
+        """Copy every suite already seen for this head onto the run."""
+        cursor = conn.execute(
+            """
+            INSERT INTO checks
+                (run_id, head_sha, suite_id, app, status, conclusion, url, updated_at)
+            SELECT ?, head_sha, suite_id, app, status, conclusion, url, updated_at
+            FROM head_checks WHERE repo = ? AND head_sha = ?
+            ON CONFLICT (run_id, head_sha, suite_id) DO UPDATE SET
+                app = excluded.app,
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                url = excluded.url,
+                updated_at = excluded.updated_at
+            """,
+            (run_id, repo, head_sha),
+        )
+        return int(cursor.rowcount or 0)
 
     def checks_for_head(self, run_id: str, head_sha: str) -> list[sqlite3.Row]:
         return list(

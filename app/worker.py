@@ -93,6 +93,10 @@ def _pull_request_fields(run: sqlite3.Row, snapshot: SessionSnapshot) -> dict[st
     return fields
 
 
+# States a pull-request webhook put the run in; session polls do not leave them.
+GITHUB_OWNED: frozenset[State] = frozenset({State.PR_OPEN, State.AWAITING_REVIEW})
+
+
 class Worker:
     """One iteration of work: advance a run, then drain the outbox."""
 
@@ -132,6 +136,10 @@ class Worker:
             return False
         try:
             self._advance(run)
+        except Exception:
+            # One run's bad day must not stop every other run from moving;
+            # the row stays as it was and is picked up again next tick.
+            logger.exception("advancing run %s failed", run["id"])
         finally:
             self.store.release_run(str(run["id"]))
         return True
@@ -290,18 +298,12 @@ class Worker:
         with self.store.transaction() as conn:
             self._record_snapshot(conn, run_id, snapshot)
 
-    def _record_snapshot(
-        self, conn: sqlite3.Connection, run_id: str, snapshot: SessionSnapshot
-    ) -> None:
-        run = self.store.get_run(run_id)
-        if run is None:  # pragma: no cover
-            return
-        task_id = int(run["task_id"])
-        current = State(str(run["state"]))
+    def _resolve_target(
+        self, run: sqlite3.Row, snapshot: SessionSnapshot, fields: dict[str, Any]
+    ) -> tuple[State, str | None]:
+        """What the provider's report, plus our own budgets, says the run is."""
         has_pr = bool(snapshot.pull_requests) or run["pr_number"] is not None
         target, reason = map_status(snapshot, has_pr)
-
-        fields = _snapshot_fields(snapshot)
 
         if reason == "finished_no_pr":
             fields["session_finished_at"] = run["session_finished_at"] or now_iso()
@@ -319,15 +321,35 @@ class Worker:
             # identical retry fails identically at the same price.
             target, reason = State.FAILED, "acu_limit"
 
-        if target is State.PR_OPEN and snapshot.pull_requests:
-            fields.update(_pull_request_fields(run, snapshot))
-
         elapsed = utcnow() - datetime.fromisoformat(str(run["created_at"]))
         if (
             target not in {State.PR_OPEN, State.FAILED}
             and elapsed.total_seconds() > self.settings.run_max_seconds
         ):
             target, reason = State.EXPIRED, "expired"
+        return target, reason
+
+    def _record_snapshot(
+        self, conn: sqlite3.Connection, run_id: str, snapshot: SessionSnapshot
+    ) -> None:
+        run = self.store.get_run(run_id)
+        if run is None:  # pragma: no cover
+            return
+        task_id = int(run["task_id"])
+        current = State(str(run["state"]))
+        fields = _snapshot_fields(snapshot)
+        target, reason = self._resolve_target(run, snapshot, fields)
+
+        if target is State.PR_OPEN and snapshot.pull_requests:
+            fields.update(_pull_request_fields(run, snapshot))
+
+        if current in GITHUB_OWNED:
+            # Once a PR exists its lifecycle belongs to GitHub events. The
+            # session is still observed for ACUs and structured output, but
+            # whatever it reports about itself moves the run nowhere: the
+            # webhook that opened the PR may land between claiming this run
+            # and recording the poll.
+            target, reason = current, None
 
         if target is not current:
             check_transition(current, target)

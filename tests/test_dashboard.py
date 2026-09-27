@@ -181,6 +181,53 @@ def test_derive_checks_state_never_passes_on_silence(store: Store) -> None:
     assert derive_checks_state([]) == "unknown"
 
 
+def test_suites_requested_before_the_pr_opens_are_adopted_and_keep_it_pending(
+    intake: Intake, worker: Worker, store: Store
+) -> None:
+    """GitHub reports suites for the pushed commit before the PR carrying it
+    exists. Two are requested; one finishes early. The run must not read the
+    lone completed suite as a pass."""
+    result = deliver(intake, "issues", "issue_labeled.json")
+    run_id = str(result.run_id)
+    for _ in range(10):
+        worker.tick()
+
+    requested = substitute_run_id(load_fixture("check_suite_requested.json"), run_id)
+    second = substitute_run_id(load_fixture("check_suite_requested.json"), run_id)
+    second["check_suite"]["id"] = 7002
+    finished_first = substitute_run_id(load_fixture("check_suite_success.json"), run_id)
+    for payload in (requested, second, finished_first):
+        outcome = intake.handle(
+            delivery_id=next_delivery_id(), event="check_suite", payload=payload
+        )
+        assert not outcome.accepted
+        assert outcome.reason == "check suite for an untracked head"
+
+    send(intake, "pull_request", "pr_opened.json", run_id)
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["state"] == State.PR_OPEN.value
+    assert run["checks_state"] == "pending"
+    assert not is_verified(run)
+    assert len(store.checks_for_head(run_id, "a1b2c3d4")) == 2
+    assert build_dashboard(store, "sim")["results"]["verified"] == 0
+
+    # Only once the second suite completes does the head verify.
+    finished_second = substitute_run_id(
+        load_fixture("check_suite_success.json"), run_id
+    )
+    finished_second["check_suite"]["id"] = 7002
+    intake.handle(
+        delivery_id=next_delivery_id(), event="check_suite", payload=finished_second
+    )
+    run = store.get_run(run_id)
+    assert run is not None
+    assert is_verified(run)
+    kinds = [row["kind"] for row in store.events_for_run(run_id)]
+    assert kinds.count("verified") == 1
+
+
 # ---------------------------------------------------------------- merged / review
 
 
