@@ -14,21 +14,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+[project]
+name = "issue-pipeline"
+version = "0.1.0"
+description = "GitHub issue -> Devin session -> PR -> Slack delivery pipeline"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
 
-# This service is standalone: it imports nothing from `superset` and runs in
-# its own container. It inherits Superset's lint rules and narrows the few
-# that assume the Superset package is importable.
 [tool.ruff]
-extend = "../pyproject.toml"
+line-length = 88
+indent-width = 4
+target-version = "py311"
+exclude = [".git", ".venv", ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "B",
+    "C",
+    "E",
+    "F",
+    "G",
+    "I",
+    "N",
+    "PT",
+    "Q",
+    "S",
+    "T",
+    "TRY201",
+    "W",
+]
+ignore = [
+    "S101",
+    "PT001",
+    "PT006",
+    "T201",
+    "N999",
+    "G201",
+]
+fixable = ["ALL"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.lint.per-file-ignores]
-# `superset.utils.json` is not a dependency of this service.
-"*.py" = ["TID251"]
 # Placeholders are generated from a fixed set of application states and bound
 # as parameters; no value reaches these strings from a request.
 "app/store.py" = ["S608"]
 "tests/*.py" = ["S105", "S106", "S107"]
 "scripts/*.py" = ["S106"]
+
+[tool.ruff.lint.isort]
+case-sensitive = false
+combine-as-imports = true
+order-by-type = false
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+check_untyped_defs = false
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+disable_error_code = "annotation-unchecked"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

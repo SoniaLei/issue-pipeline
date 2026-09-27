@@ -25,8 +25,20 @@ The design this implements lives in `docs/`: `architecture.md` (components,
 state machine, schema), `decisions.md` (29 decisions with rationale) and
 `open-questions.md` (what is still undecided and what the default is).
 
-It is deliberately self-contained under `issue-pipeline/` and shares no code,
-dependencies or database with Superset itself.
+It is a standalone service and shares no code, dependencies or database with
+the repositories it watches. It began life under `issue-pipeline/` in
+[SoniaLei/superset-cognition-demo](https://github.com/SoniaLei/superset-cognition-demo)
+and was split out with its history intact.
+
+## How it relates to the Devin Automations
+
+Two Devin Automations act on `SoniaLei/superset-cognition-demo` today without
+this service running anywhere: one turns a `devin-ready` label into a Devin
+session that opens a PR, the other posts to Slack when a `devin/issue-*` PR is
+merged. They are configured in Devin, not in either repository, so moving this
+code does not affect them. This service is the durable version of that flow —
+pre-spend maintainer gate, webhook dedupe, task state, PR correlation — for
+when it is hosted behind a public HTTPS endpoint.
 
 ## What is built
 
@@ -49,7 +61,6 @@ The whole pipeline runs end to end with `DEVIN_MODE=sim` and
 ## Running it
 
 ```bash
-cd issue-pipeline
 python3 -m venv .venv && . .venv/bin/activate   # or your usual venv
 pip install -r requirements.txt
 
@@ -107,8 +118,10 @@ The two that decide whether anything happens at all:
 ## Testing
 
 ```bash
-cd issue-pipeline && pytest tests
+pytest
+ruff check . && ruff format --check . && mypy app scripts
 ```
 
 The suite runs against fixtures and the simulated adapters. No test touches a
-network.
+network. `pre-commit install` runs the same checks on each commit; CI runs
+them plus the simulated end-to-end run on every push and pull request.
