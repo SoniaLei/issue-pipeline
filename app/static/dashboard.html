@@ -302,7 +302,9 @@ async function openTimeline(taskId) {
     items.push([at, el("li", { class: n.state === "failed" ? "bad" : "note" }, [el("time", { text: fmtTime(at), datetime: at }),
       `Slack ${n.kind} → ${n.destination}: ${n.state} (${n.attempts} attempt${n.attempts === 1 ? "" : "s"})`, n.last_error ? ` · ${n.last_error}` : ""])]);
   }
-  items.sort((a, b) => new Date(a[0]) - new Date(b[0]));
+  // Lexicographic on the ISO string: Date() would drop the microseconds that
+  // separate a Slack send from the next event.
+  items.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 
   drawer.replaceChildren(close, el("h2", { text: `#${t.issue.number} ${t.issue.title}` }),
     el("p", { class: "muted small", text: `${t.repo} · issue ${t.issue.state} · labels: ${(t.issue.labels || []).join(", ") || "none"}` }),
