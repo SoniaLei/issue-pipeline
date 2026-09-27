@@ -134,6 +134,30 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (state, next_attempt_at);
+
+-- Existing runs start with a snapshot, never an invented historical transition.
+CREATE TABLE IF NOT EXISTS run_events (
+    id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    from_state TEXT,
+    to_state TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    kind TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_events_run ON run_events(run_id, id);
+CREATE TRIGGER IF NOT EXISTS run_created_event AFTER INSERT ON runs BEGIN
+    INSERT INTO run_events(run_id, to_state, recorded_at, kind)
+    VALUES (NEW.id, NEW.state, NEW.created_at, 'created');
+END;
+CREATE TRIGGER IF NOT EXISTS run_state_event AFTER UPDATE OF state ON runs
+WHEN OLD.state <> NEW.state BEGIN
+    INSERT INTO run_events(run_id, from_state, to_state, recorded_at, kind)
+    VALUES (NEW.id, OLD.state, NEW.state, NEW.updated_at, 'transition');
+END;
+INSERT INTO run_events(run_id, to_state, recorded_at, kind)
+SELECT id, state, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'), 'snapshot'
+FROM runs WHERE NOT EXISTS (SELECT 1 FROM run_events WHERE run_id = runs.id);
+
 """.format(active=", ".join(f"'{value}'" for value in sorted(s.value for s in ACTIVE)))
 
 
@@ -561,3 +585,10 @@ class Store:
 
     def all_notifications(self) -> list[sqlite3.Row]:
         return list(self._conn.execute("SELECT * FROM outbox ORDER BY id").fetchall())
+
+    def events_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM run_events WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+        )
