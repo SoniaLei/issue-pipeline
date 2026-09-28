@@ -734,9 +734,14 @@ class Store:
             ).fetchall()
         )
 
-    def latest_notification_sent_at(self) -> str | None:
+    def latest_notification_sent_at(self, env: str) -> str | None:
         row = self._conn.execute(
-            "SELECT MAX(sent_at) AS at FROM outbox WHERE state = 'sent'"
+            """
+            SELECT MAX(outbox.sent_at) AS at FROM outbox
+            JOIN runs ON runs.id = outbox.run_id
+            WHERE outbox.state = 'sent' AND runs.env = ?
+            """,
+            (env,),
         ).fetchone()
         return str(row["at"]) if row and row["at"] else None
 

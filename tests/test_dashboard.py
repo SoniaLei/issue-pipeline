@@ -29,6 +29,7 @@ from app.intake import Intake
 from app.main import create_app
 from app.states import State
 from app.store import Store
+from app.worker import Worker
 from tests.conftest import (
     deliver,
     load_fixture,
@@ -168,6 +169,19 @@ def test_merged_requires_github_confirmation(intake: Intake, store: Store) -> No
     assert data["speed"]["median_seconds_to_review_ready"] >= 0
 
 
+def test_reverifying_the_same_pr_counts_once_in_throughput(
+    intake: Intake, store: Store
+) -> None:
+    run_id = queued_run(intake, store)
+    deliver_pr(intake, "pr_opened.json", run_id)
+    deliver_checks(intake, run_id, head_sha="a1b2c3d4", conclusion="success")
+    deliver_checks(intake, run_id, head_sha="a1b2c3d4", conclusion="failure")
+    deliver_checks(intake, run_id, head_sha="a1b2c3d4", conclusion="success")
+    data = build_dashboard(store, "sim")
+    assert data["results"]["verified"] == 1
+    assert sum(day["verified"] for day in data["throughput"]) == 1
+
+
 # ------------------------------------------------------------- workload/attention
 
 
@@ -230,6 +244,21 @@ def test_live_metrics_never_include_simulation_runs(
     sim = build_dashboard(store, "sim")
     assert sim["results"]["verified"] == 1
     assert sim["generated_at"]
+
+
+def test_slack_health_is_scoped_to_the_environment(
+    intake: Intake, store: Store, worker: Worker
+) -> None:
+    run_id = queued_run(intake, store)
+    deliver_pr(intake, "pr_opened.json", run_id)
+    assert worker.drain_outbox() == 1
+    sim = build_dashboard(store, "sim")["health"]
+    live = build_dashboard(store, "live")["health"]
+    assert sim["slack"]["last_successful_delivery"] is not None
+    assert live["slack"]["last_successful_delivery"] is None
+    # Deliveries carry no environment; the figure says so rather than pretend.
+    assert live["github"]["scope"] == "all environments"
+    assert live["github"]["last_webhook_received"] is not None
 
 
 def test_an_unknown_env_is_refused(store: Store) -> None:

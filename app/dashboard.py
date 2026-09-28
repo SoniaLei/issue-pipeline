@@ -245,17 +245,19 @@ def _speed(store: Store, runs: list[sqlite3.Row]) -> dict[str, Any]:
 
 
 def _throughput(store: Store, env: str) -> list[dict[str, Any]]:
-    """Per-day counts of verified and merged transitions. A run verified twice
-    (checks re-run after a push) counts once per day it happened."""
-    days: dict[str, dict[str, int]] = {}
+    """Per-day counts of distinct runs that became verified or merged. A run
+    that is verified, demoted by a failed re-run and verified again counts
+    once, on the day it first got there."""
+    first_seen: dict[tuple[str, str], str] = {}
     for event in store.state_events(env):
         target = event["to_value"]
         if target not in {State.AWAITING_REVIEW.value, State.MERGED.value}:
             continue
-        day = str(event["at"])[:10]
-        bucket = days.setdefault(day, {"verified": 0, "merged": 0})
         key = "verified" if target == State.AWAITING_REVIEW.value else "merged"
-        bucket[key] += 1
+        first_seen.setdefault((str(event["run_id"]), key), str(event["at"])[:10])
+    days: dict[str, dict[str, int]] = {}
+    for (_, key), day in first_seen.items():
+        days.setdefault(day, {"verified": 0, "merged": 0})[key] += 1
     return [{"day": day, **days[day]} for day in sorted(days)]
 
 
@@ -294,8 +296,10 @@ def _attention(rows: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]
 
 def _health(store: Store, env: str, now: datetime) -> dict[str, Any]:
     last_poll = store.latest_session_poll_at(env)
+    # Webhook deliveries are not tagged with an environment (one GitHub App
+    # feeds both), so this figure is global and labelled as such.
     last_delivery = store.latest_delivery_at()
-    last_slack = store.latest_notification_sent_at()
+    last_slack = store.latest_notification_sent_at(env)
     failed = store.failed_notifications(env)
     return {
         "devin": {
@@ -303,6 +307,7 @@ def _health(store: Store, env: str, now: datetime) -> dict[str, Any]:
             "age_seconds": _age_seconds(last_poll, now),
         },
         "github": {
+            "scope": "all environments",
             "last_webhook_received": last_delivery,
             "age_seconds": _age_seconds(last_delivery, now),
         },
