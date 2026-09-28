@@ -42,6 +42,13 @@ DEFAULT_NO_OUTPUT_GRACE_SECONDS = 300
 DEFAULT_RUN_MAX_SECONDS = 4 * 60 * 60
 DEFAULT_LEASE_SECONDS = 120
 
+# Devin analytics. Insights are re-read when a run moves and otherwise every
+# refresh interval; a finished run keeps being re-read for the settle window
+# because billing-grade consumption lands after the session does.
+DEFAULT_INSIGHTS_REFRESH_SECONDS = 600
+DEFAULT_INSIGHTS_SETTLE_SECONDS = 24 * 60 * 60
+DEFAULT_METRICS_REFRESH_SECONDS = 300
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment cannot produce a usable configuration."""
@@ -108,6 +115,14 @@ class Settings:
 
     poll_interval_seconds: float = 2.0
     delivery_retention_days: int = 30
+
+    # Devin analytics (Session Insights, consumption, org metrics). Read on the
+    # worker's tick, bounded to one session per tick and one metrics call per
+    # interval, so a slow analytics endpoint never delays a run.
+    analytics_enabled: bool = True
+    insights_refresh_seconds: int = DEFAULT_INSIGHTS_REFRESH_SECONDS
+    insights_settle_seconds: int = DEFAULT_INSIGHTS_SETTLE_SECONDS
+    metrics_refresh_seconds: int = DEFAULT_METRICS_REFRESH_SECONDS
 
     def repo_allowed(self, full_name: str) -> bool:
         return full_name.lower() in self.repo_allowlist
@@ -190,6 +205,17 @@ def load_settings() -> Settings:
         run_max_seconds=_env_int("RUN_MAX_SECONDS", DEFAULT_RUN_MAX_SECONDS),
         lease_seconds=_env_int("LEASE_SECONDS", DEFAULT_LEASE_SECONDS),
         delivery_retention_days=_env_int("DELIVERY_RETENTION_DAYS", 30),
+        analytics_enabled=os.environ.get("ANALYTICS_ENABLED", "true").lower()
+        not in {"0", "false", "no"},
+        insights_refresh_seconds=_env_int(
+            "INSIGHTS_REFRESH_SECONDS", DEFAULT_INSIGHTS_REFRESH_SECONDS
+        ),
+        insights_settle_seconds=_env_int(
+            "INSIGHTS_SETTLE_SECONDS", DEFAULT_INSIGHTS_SETTLE_SECONDS
+        ),
+        metrics_refresh_seconds=_env_int(
+            "METRICS_REFRESH_SECONDS", DEFAULT_METRICS_REFRESH_SECONDS
+        ),
     )
 
     if devin_mode == "live" and not (

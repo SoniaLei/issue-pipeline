@@ -26,6 +26,12 @@ numbers depend on:
   *opened* when GitHub has it, *verified* when every check suite GitHub
   reported for the PR's current head has passed, and *merged* when GitHub says
   ``merged=true``. A finished session is none of these.
+
+A third layer sits beside those two: what Devin reports about its own work
+(ACUs, session size, its analysis of the session, organization-level PR
+counts). It answers *what did this cost and what did the provider think* and
+is shown under those labels; it never decides whether a run succeeded, and
+where it disagrees with the store the disagreement is shown as drift.
 """
 
 from __future__ import annotations
@@ -61,7 +67,32 @@ DEFINITIONS: dict[str, str] = {
     "environments": (
         "Live and simulated runs are reported separately and never combined."
     ),
+    "cost": (
+        "ACUs are Devin's own figures. Billing-grade daily consumption is used "
+        "when the provider has published it; otherwise the session's running "
+        "total, marked as such. Neither changes a run's outcome."
+    ),
+    "session_size": (
+        "Devin's size class for the session (XS-XL); L and XL are the provider's "
+        "own signal that a session ran long or went back and forth."
+    ),
+    "drift": (
+        "Devin's organization counts for the pipeline's service user, compared "
+        "with what GitHub told this service. GitHub stays authoritative; a gap "
+        "means a session or PR this service did not track, or one Devin "
+        "counted differently."
+    ),
 }
+
+SESSION_SIZES = ("xs", "s", "m", "l", "xl")
+ACTION_ITEM_TYPES = (
+    "machine_setup",
+    "repo_config",
+    "knowledge",
+    "prompt_improvement",
+    "external",
+    "other",
+)
 
 # Application state -> the bucket the overview counts it under. `pr_open` is
 # split at report time into pr_open / awaiting_review by verification.
@@ -208,6 +239,96 @@ def _slack_view(rows: list[sqlite3.Row]) -> dict[str, Any]:
     }
 
 
+def _insights_view(store: Store, run: sqlite3.Row) -> dict[str, Any]:
+    """Devin's account of the session's cost and its own review of it.
+
+    ``cost.acus`` picks the best figure available and names its source:
+    ``billing`` (daily consumption), ``session`` (the insights total), or
+    ``poll`` (the last snapshot the worker saw). ``None`` means the provider has
+    published nothing yet, which is not the same as zero.
+    """
+    row = store.insights_for_run(str(run["id"]))
+    poll_acus = run["acus_consumed"]
+    if row is None:
+        acus = float(poll_acus) if poll_acus is not None else None
+        return {
+            "available": False,
+            "fetched_at": None,
+            "cost": {
+                "acus": acus,
+                "source": "poll" if acus is not None else None,
+                "billed_acus": None,
+                "by_day": [],
+            },
+            "session_size": None,
+            "category": None,
+            "messages": None,
+            "analysis_status": None,
+            "analysis": None,
+            "last_error": None,
+        }
+    billed = row["billed_acus"]
+    if billed is not None and float(billed) > 0:
+        acus, source = float(billed), "billing"
+    elif row["acus_consumed"] is not None:
+        acus, source = float(row["acus_consumed"]), "session"
+    elif poll_acus is not None:
+        acus, source = float(poll_acus), "poll"
+    else:
+        acus, source = None, None
+    analysis = _json(row["analysis"])
+    summary = None
+    if analysis is not None:
+        skills = analysis.get("skill_usage") or {}
+        prompt = analysis.get("suggested_prompt") or {}
+        summary = {
+            "issues": [
+                {
+                    "title": item.get("title"),
+                    "issue": item.get("issue"),
+                    "impact": item.get("impact"),
+                    "label": item.get("label"),
+                }
+                for item in analysis.get("issues") or []
+            ],
+            "action_items": [
+                {"type": item.get("type", "other"), "text": item.get("action_item")}
+                for item in analysis.get("action_items") or []
+            ],
+            "skills": {
+                "good": [
+                    {"name": s.get("skill_name"), "reason": s.get("reason")}
+                    for s in skills.get("good_usages") or []
+                ],
+                "bad": [
+                    {"name": s.get("skill_name"), "reason": s.get("reason")}
+                    for s in skills.get("bad_usages") or []
+                ],
+            },
+            "suggested_prompt": prompt.get("suggested_prompt") or None,
+            "classification": analysis.get("classification"),
+        }
+    return {
+        "available": True,
+        "fetched_at": str(row["fetched_at"]),
+        "cost": {
+            "acus": acus,
+            "source": source,
+            "billed_acus": float(billed) if billed is not None else None,
+            "by_day": _json(row["consumption"]) or [],
+        },
+        "session_size": row["session_size"],
+        "category": row["category"],
+        "messages": {
+            "user": row["num_user_messages"],
+            "devin": row["num_devin_messages"],
+        },
+        "analysis_status": row["analysis_status"],
+        "analysis": summary,
+        "last_error": row["last_error"],
+    }
+
+
 def _first_event_at(events: list[sqlite3.Row], kind: str) -> str | None:
     for event in events:
         if event["kind"] == kind:
@@ -329,6 +450,7 @@ def _run_view(store: Store, run: sqlite3.Row, now: datetime) -> dict[str, Any]:
             "review_state": run["review_state"],
         },
         "tests": _tests_view(store, run),
+        "insights": _insights_view(store, run),
         "slack": slack,
         "timing": timing,
         "attention": _attention(run, bucket, timing, slack),
@@ -401,6 +523,180 @@ def _health(
             "last_sent_at": last_sent,
             "last_error": last_error,
         },
+    }
+
+
+def _ratio(total: float, count: int) -> float | None:
+    return total / count if count else None
+
+
+def _cost(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Cost and efficiency for one environment, from the provider's figures.
+
+    Denominators are GitHub outcomes (PRs opened, verified, merged); numerators
+    are Devin's ACUs. Spend is attributed to a run only when the provider has
+    published a figure for its session; runs without one are counted under
+    ``coverage.no_cost_yet`` rather than silently treated as free.
+    """
+    with_session = [r for r in runs if r["session"]["id"]]
+    priced = [r for r in with_session if r["insights"]["cost"]["acus"] is not None]
+    acus = [float(r["insights"]["cost"]["acus"]) for r in priced]
+    total = sum(acus)
+
+    opened = [r for r in runs if r["pr"]["number"] is not None]
+    verified = [r for r in runs if r["verified"]]
+    merged = [r for r in runs if r["state"] == State.MERGED.value]
+    acus_without_pr = sum(
+        float(r["insights"]["cost"]["acus"])
+        for r in priced
+        if r["pr"]["number"] is None and is_terminal(State(str(r["state"])))
+    )
+
+    sizes = {size: 0 for size in SESSION_SIZES}
+    for r in with_session:
+        size = r["insights"]["session_size"]
+        if size in sizes:
+            sizes[size] += 1
+    sized = sum(sizes.values())
+
+    categories: dict[str, int] = defaultdict(int)
+    action_items: dict[str, int] = {kind: 0 for kind in ACTION_ITEM_TYPES}
+    top_actions: list[dict[str, Any]] = []
+    skills_good = skills_bad = 0
+    analysed = 0
+    user_messages: list[float] = []
+    for r in with_session:
+        insights = r["insights"]
+        if insights["category"]:
+            categories[str(insights["category"])] += 1
+        if insights["messages"] and insights["messages"]["user"] is not None:
+            user_messages.append(float(insights["messages"]["user"]))
+        analysis = insights["analysis"]
+        if analysis is None:
+            continue
+        analysed += 1
+        for item in analysis["action_items"]:
+            kind = item["type"] if item["type"] in action_items else "other"
+            action_items[kind] += 1
+            if len(top_actions) < 10:
+                top_actions.append(
+                    {
+                        "type": kind,
+                        "text": item["text"],
+                        "issue_number": r["issue"]["number"],
+                        "task_id": r["task_id"],
+                    }
+                )
+        skills_good += len(analysis["skills"]["good"])
+        skills_bad += len(analysis["skills"]["bad"])
+
+    sources: dict[str, int] = defaultdict(int)
+    for r in priced:
+        sources[str(r["insights"]["cost"]["source"])] += 1
+
+    return {
+        "acus_total": total,
+        "acus_median_per_run": statistics.median(acus) if acus else None,
+        "acus_p90_per_run": _percentile(acus, 0.9) if acus else None,
+        # A ratio over unpriced sessions would read as "free"; it is unknown.
+        "acus_per_pr_opened": _ratio(total, len(opened)) if priced else None,
+        "acus_per_verified_pr": _ratio(total, len(verified)) if priced else None,
+        "acus_per_merged_pr": _ratio(total, len(merged)) if priced else None,
+        "acus_without_pr": acus_without_pr,
+        "denominators": {
+            "pr_opened": len(opened),
+            "verified": len(verified),
+            "merged": len(merged),
+        },
+        "sources": dict(sources),
+        "coverage": {
+            "runs_with_session": len(with_session),
+            "priced": len(priced),
+            "no_cost_yet": len(with_session) - len(priced),
+            "billing_grade": sources.get("billing", 0),
+            "analysed": analysed,
+            "analysis_pending": sum(
+                1
+                for r in with_session
+                if r["insights"]["analysis"] is None
+                and r["insights"]["analysis_status"] not in {"failed"}
+            ),
+        },
+        "session_sizes": sizes,
+        "large_share": _ratio(float(sizes["l"] + sizes["xl"]), sized),
+        "categories": dict(categories),
+        "user_messages_median": (
+            statistics.median(user_messages) if user_messages else None
+        ),
+        "action_items": action_items,
+        "top_action_items": top_actions,
+        "skills": {"good": skills_good, "bad": skills_bad},
+        "fetched_at": max(
+            (r["insights"]["fetched_at"] for r in runs if r["insights"]["fetched_at"]),
+            default=None,
+        ),
+    }
+
+
+def _drift(
+    store: Store, env: str, runs: list[dict[str, Any]], results: dict[str, Any]
+) -> dict[str, Any]:
+    """Devin's organization counts against the store's, as a cross-check.
+
+    The pipeline side counts what GitHub reported for runs in this
+    environment; the provider side is Devin's count for the same service user
+    over a window that covers every run. They should agree. When they do not,
+    the gap is reported as drift, not reconciled away.
+    """
+    row = store.provider_metrics(env)
+    pipeline = {
+        "sessions_created": sum(1 for r in runs if r["session"]["id"]),
+        "prs_opened": results["pr_opened"],
+        "prs_merged": results["merged"],
+    }
+    if row is None:
+        return {
+            "status": "unavailable",
+            "fetched_at": None,
+            "window": None,
+            "service_user_ids": [],
+            "provider": None,
+            "pipeline": pipeline,
+            "drift": None,
+            "last_error": None,
+        }
+    metrics = _json(row["metrics"])
+    provider = None
+    drift = None
+    status = "unavailable"
+    if metrics is not None:
+        provider = {
+            "sessions_created": int(metrics.get("sessions_created") or 0),
+            "prs_created": int(metrics.get("prs_created") or 0),
+            "prs_opened": int(metrics.get("prs_opened") or 0),
+            "prs_merged": int(metrics.get("prs_merged") or 0),
+            "prs_closed": int(metrics.get("prs_closed") or 0),
+            "sessions_with_merged_prs": int(
+                metrics.get("sessions_with_merged_prs") or 0
+            ),
+            "avg_acus_per_session": metrics.get("avg_acus_per_session"),
+            "sessions_by_size": metrics.get("sessions_by_size") or {},
+        }
+        drift = {
+            "sessions": provider["sessions_created"] - pipeline["sessions_created"],
+            "prs": provider["prs_created"] - pipeline["prs_opened"],
+            "merged": provider["prs_merged"] - pipeline["prs_merged"],
+        }
+        status = "drift" if any(drift.values()) else "ok"
+    return {
+        "status": status,
+        "fetched_at": str(row["fetched_at"]),
+        "window": {"after": row["window_after"], "before": row["window_before"]},
+        "service_user_ids": _json(row["service_user_ids"]) or [],
+        "provider": provider,
+        "pipeline": pipeline,
+        "drift": drift,
+        "last_error": row["last_error"],
     }
 
 
@@ -481,6 +777,9 @@ def build_dashboard(
     ]
     data_as_of = max((p for p in data_points if p), default=None)
 
+    health = _health(store, env, runs, current, worker_stale_after_seconds)
+    health["devin_analytics"] = _drift(store, env, runs, results)
+
     return {
         "env": env,
         "envs_available": store.count_runs_by_env(),
@@ -491,8 +790,9 @@ def build_dashboard(
         "results": results,
         "speed": speed,
         "throughput": _throughput(store, env, current),
+        "cost": _cost(runs),
         "attention": attention,
-        "health": _health(store, env, runs, current, worker_stale_after_seconds),
+        "health": health,
         "tasks": tasks,
         "totals": {
             "tasks": len(tasks),

@@ -24,6 +24,7 @@ nothing and invites a second session.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import socket
@@ -34,7 +35,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.config import Settings
-from app.devin_client import DevinClient, DevinError, map_status, SessionSnapshot
+from app.devin_client import (
+    DevinClient,
+    DevinError,
+    map_status,
+    SessionInsights,
+    SessionSnapshot,
+)
 from app.notifications import build_payload, destination_is_operator, fingerprint, Kind
 from app.prompts import (
     branch_name,
@@ -43,7 +50,7 @@ from app.prompts import (
     session_title,
 )
 from app.slack_client import SlackTransport
-from app.states import check_transition, State
+from app.states import check_transition, is_terminal, State
 from app.store import now_iso, Store, utcnow
 
 logger = logging.getLogger(__name__)
@@ -93,6 +100,10 @@ def _pull_request_fields(run: sqlite3.Row, snapshot: SessionSnapshot) -> dict[st
     return fields
 
 
+def _session_finished(insights: SessionInsights) -> bool:
+    return insights.status == "exit" or insights.status_detail == "finished"
+
+
 # States a pull-request webhook put the run in; session polls do not leave them.
 GITHUB_OWNED: frozenset[State] = frozenset({State.PR_OPEN, State.AWAITING_REVIEW})
 
@@ -124,10 +135,18 @@ class Worker:
                 time.sleep(self.settings.poll_interval_seconds)
 
     def tick(self) -> bool:
-        """Advance at most one run and deliver any due notifications."""
+        """Advance at most one run, deliver due notifications, then read
+        analytics for at most one session."""
         self.store.heartbeat("worker", self.owner)
         advanced = self.advance_one()
         delivered = self.drain_outbox()
+        if self.settings.analytics_enabled:
+            try:
+                self.refresh_analytics()
+            except Exception:
+                # Analytics are observation, not control: a broken analytics
+                # endpoint must never stop runs from advancing.
+                logger.exception("analytics refresh failed")
         return advanced or delivered > 0
 
     def advance_one(self) -> bool:
@@ -455,6 +474,158 @@ class Worker:
                 kind=kind, task=task, run=run, reason=reason, detail=detail
             ),
         )
+
+    # ------------------------------------------------------------------ analytics
+
+    def refresh_analytics(self) -> bool:
+        """Read Devin's account of one session, and the org counts on schedule.
+
+        Everything read here is stored beside the run, never applied to it:
+        the run's state comes from GitHub and the session poll, the numbers
+        here say what the run cost and what the provider thinks of it.
+        """
+        env = self.settings.env
+        now = utcnow()
+        worked = False
+        cutoff = now - timedelta(seconds=self.settings.insights_refresh_seconds)
+        candidates = self.store.insights_candidates(env, cutoff)
+        if candidates:
+            self._refresh_insights(candidates[0], now)
+            worked = True
+        # Nothing to filter on until a session has said which identity it ran
+        # as; unfiltered org numbers would count every human's session as
+        # pipeline work. A run moving is the moment the two sides can diverge,
+        # so the counts are re-read then as well as on the interval.
+        if self.store.service_user_ids(env) and (worked or self._metrics_due(env, now)):
+            self._refresh_metrics(env, now)
+            worked = True
+        return worked
+
+    def _refresh_insights(self, run: sqlite3.Row, now: datetime) -> None:
+        run_id = str(run["id"])
+        session_id = str(run["session_id"])
+        fields: dict[str, Any] = {
+            "session_id": session_id,
+            "env": str(run["env"]),
+            "run_state": run["state"],
+            "session_status": run["session_status"],
+            "session_status_detail": run["session_status_detail"],
+            "last_error": None,
+        }
+        try:
+            insights = self.devin.get_session_insights(session_id)
+        except DevinError as exc:
+            logger.warning("insights read failed for %s: %s", run_id, exc)
+            fields["last_error"] = str(exc)
+            with self.store.transaction() as conn:
+                self.store.upsert_session_insights(conn, run_id, **fields)
+            return
+
+        fields.update(
+            acus_consumed=insights.acus_consumed,
+            session_size=insights.session_size,
+            category=insights.category,
+            subcategory=insights.subcategory,
+            origin=insights.origin,
+            service_user_id=insights.service_user_id,
+            num_user_messages=insights.num_user_messages,
+            num_devin_messages=insights.num_devin_messages,
+            analysis_status=insights.analysis_status,
+            analysis=(
+                json.dumps(insights.analysis) if insights.analysis is not None else None
+            ),
+        )
+        try:
+            consumption = self.devin.get_session_consumption(session_id)
+            fields["billed_acus"] = consumption.total_acus
+            fields["consumption"] = json.dumps(list(consumption.by_date))
+        except DevinError as exc:
+            logger.warning("consumption read failed for %s: %s", run_id, exc)
+            fields["last_error"] = str(exc)
+
+        previous = self.store.insights_for_run(run_id)
+        finished = _session_finished(insights) or is_terminal(State(str(run["state"])))
+        if (
+            finished
+            and insights.analysis_status is None
+            and (previous is None or previous["generate_requested_at"] is None)
+        ):
+            # Small sessions are not analysed unless asked; asking is free and
+            # idempotent (the provider answers `already_exists` the second time).
+            try:
+                self.devin.request_session_insights(session_id)
+                fields["generate_requested_at"] = now_iso()
+            except DevinError as exc:
+                logger.warning("insights generate failed for %s: %s", run_id, exc)
+                fields["last_error"] = str(exc)
+
+        analysis_done = insights.analysis_status in {"completed", "failed"}
+        ended = datetime.fromisoformat(str(run["updated_at"]))
+        if ended.tzinfo is None:  # pragma: no cover - defensive
+            ended = ended.replace(tzinfo=timezone.utc)
+        fields["settled"] = int(
+            is_terminal(State(str(run["state"])))
+            and analysis_done
+            and (now - ended).total_seconds() > self.settings.insights_settle_seconds
+        )
+
+        with self.store.transaction() as conn:
+            self.store.upsert_session_insights(conn, run_id, **fields)
+            newly_analysed = insights.analysis_status == "completed" and (
+                previous is None or previous["analysis_status"] != "completed"
+            )
+            if newly_analysed:
+                analysis = insights.analysis or {}
+                self.store.record_event(
+                    conn,
+                    run_id=run_id,
+                    task_id=int(run["task_id"]),
+                    kind="insights",
+                    reason="analysed",
+                    detail={
+                        "session_size": insights.session_size,
+                        "category": insights.category,
+                        "acus_consumed": insights.acus_consumed,
+                        "billed_acus": fields.get("billed_acus"),
+                        "issues": len(analysis.get("issues") or []),
+                        "action_items": len(analysis.get("action_items") or []),
+                    },
+                )
+
+    def _metrics_due(self, env: str, now: datetime) -> bool:
+        row = self.store.provider_metrics(env)
+        if row is None:
+            return True
+        fetched = datetime.fromisoformat(str(row["fetched_at"]))
+        return (now - fetched).total_seconds() >= self.settings.metrics_refresh_seconds
+
+    def _refresh_metrics(self, env: str, now: datetime) -> None:
+        ids = self.store.service_user_ids(env)
+        earliest = self.store.earliest_run_created_at(env)
+        after = datetime.fromisoformat(earliest) if earliest else now
+        if after.tzinfo is None:  # pragma: no cover - defensive
+            after = after.replace(tzinfo=timezone.utc)
+        after -= timedelta(hours=1)
+        metrics: dict[str, Any] | None = None
+        error: str | None = None
+        try:
+            result = self.devin.get_provider_metrics(
+                service_user_ids=ids, time_after=after, time_before=now
+            )
+            metrics = dataclasses.asdict(result)
+        except DevinError as exc:
+            logger.warning("provider metrics read failed: %s", exc)
+            error = str(exc)
+        self.store.save_provider_metrics(
+            env,
+            window_after=after,
+            window_before=now,
+            service_user_ids=ids,
+            metrics=metrics,
+            error=error,
+        )
+
+    # --------------------------------------------------------------- notifications
 
     def drain_outbox(self) -> int:
         """Send due notifications.

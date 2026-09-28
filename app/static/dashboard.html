@@ -3,106 +3,207 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>issue-pipeline dashboard</title>
+<title>issue-pipeline · delivery dashboard</title>
+<link rel="icon" href="/static/superset-mark.png">
 <style>
   :root {
-    --bg: #f6f7f9; --card: #fff; --ink: #1d232b; --muted: #667085; --line: #e4e7ec;
-    --ok: #12805c; --warn: #b54708; --bad: #b42318; --info: #175cd3; --sim: #6941c6;
+    --bg: #0b0d12; --bg-2: #10131a; --card: #151922; --card-2: #1b2030; --line: #242a38; --line-2: #2f3748;
+    --ink: #e8ecf3; --ink-2: #b7c0d0; --muted: #7d8799; --faint: #556072;
+    --accent: #7c8cff; --accent-2: #a78bfa; --cyan: #20c8f7;
+    --ok: #3ddc97; --warn: #f5b942; --bad: #ff6b6b; --info: #6aa9ff; --sim: #c084fc;
+    --ok-bg: rgba(61,220,151,.12); --warn-bg: rgba(245,185,66,.14); --bad-bg: rgba(255,107,107,.14);
+    --info-bg: rgba(106,169,255,.14); --sim-bg: rgba(192,132,252,.14); --neutral-bg: rgba(255,255,255,.06);
+    --radius: 14px; --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 12px 32px -20px rgba(0,0,0,.8);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-         color: var(--ink); background: var(--bg); }
-  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center;
-           padding: 14px 24px; background: var(--card); border-bottom: 1px solid var(--line); }
-  header h1 { font-size: 18px; margin: 0; }
-  .env-switch { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .env-switch button { border: 0; background: var(--card); padding: 6px 14px; cursor: pointer; color: var(--muted); }
-  .env-switch button.active { background: var(--ink); color: #fff; }
-  .env-switch button[data-env="sim"].active { background: var(--sim); }
-  .fresh { color: var(--muted); font-size: 13px; }
-  .fresh b { color: var(--ink); }
-  .banner { padding: 8px 24px; font-size: 13px; }
-  .banner.sim { background: #f4f0ff; color: var(--sim); border-bottom: 1px solid #e0d4ff; }
-  .banner.live { background: #ecfdf3; color: var(--ok); border-bottom: 1px solid #c8f0d9; }
-  .banner.stale { background: #fff4e5; color: var(--warn); }
-  main { padding: 20px 24px; display: grid; gap: 16px; }
-  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
-  .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; }
-  .stat { padding: 8px 10px; border-radius: 8px; background: var(--bg); }
-  .stat .n { font-size: 22px; font-weight: 600; }
-  .stat .l { color: var(--muted); font-size: 12px; }
-  .stat.bad .n { color: var(--bad); } .stat.warn .n { color: var(--warn); } .stat.ok .n { color: var(--ok); }
-  .def { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: 12px; color: var(--muted); font-weight: 600; }
-  tbody tr { cursor: pointer; } tbody tr:hover { background: var(--bg); }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
-          background: #eef2f6; color: var(--ink); }
-  .pill.ok { background: #e6f7ee; color: var(--ok); } .pill.warn { background: #fff4e5; color: var(--warn); }
-  .pill.bad { background: #fee4e2; color: var(--bad); } .pill.info { background: #e7f0fd; color: var(--info); }
-  .muted { color: var(--muted); } .small { font-size: 12px; }
-  .bars { display: flex; gap: 4px; align-items: flex-end; height: 70px; margin-top: 6px; }
-  .bar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; min-width: 6px; }
-  .bar div { border-radius: 2px 2px 0 0; }
-  .bar .v { background: #7fc8a9; } .bar .m { background: var(--ok); }
-  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
-  .health dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
-  .health dt { color: var(--muted); } .health dd { margin: 0; }
-  #drawer { position: fixed; inset: 0 0 0 auto; width: min(760px, 100%); background: var(--card);
-            border-left: 1px solid var(--line); box-shadow: -8px 0 24px rgba(0,0,0,.08);
-            transform: translateX(100%); transition: transform .15s ease; overflow: auto; padding: 18px 22px; }
-  #drawer.open { transform: none; }
-  #drawer h2 { margin: 0 0 4px; font-size: 16px; }
-  #drawer .close { float: right; border: 0; background: none; font-size: 20px; cursor: pointer; color: var(--muted); }
-  .links a { margin-right: 14px; }
-  .tl { list-style: none; margin: 12px 0 0; padding: 0 0 0 14px; border-left: 2px solid var(--line); }
-  .tl li { position: relative; padding: 0 0 12px 14px; }
-  .tl li::before { content: ""; position: absolute; left: -19px; top: 5px; width: 8px; height: 8px;
-                   border-radius: 50%; background: var(--muted); }
-  .tl li.state::before { background: var(--info); } .tl li.verified::before { background: var(--ok); }
-  .tl li.bad::before { background: var(--bad); } .tl li.pr::before { background: #7fc8a9; }
-  .tl time { color: var(--muted); font-size: 12px; margin-right: 8px; }
-  pre { background: var(--bg); padding: 8px 10px; border-radius: 6px; font-size: 12px; overflow: auto; margin: 6px 0 0; }
-  .empty { color: var(--muted); padding: 20px; text-align: center; }
+  html { color-scheme: dark; }
+  body { margin: 0; color: var(--ink); background: var(--bg);
+         font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         -webkit-font-smoothing: antialiased; }
+  body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(900px 420px at 8% -10%, rgba(124,140,255,.22), transparent 60%),
+      radial-gradient(700px 360px at 95% -5%, rgba(32,200,247,.14), transparent 60%),
+      linear-gradient(180deg, var(--bg-2), var(--bg) 40%); }
   a { color: var(--info); text-decoration: none; } a:hover { text-decoration: underline; }
+
+  header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center;
+           padding: 12px 28px; background: rgba(11,13,18,.82); backdrop-filter: blur(10px);
+           border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 12px; margin-right: 6px; }
+  .brand img { width: 30px; height: 30px; border-radius: 8px; background: #1c1f26; padding: 3px; }
+  .brand h1 { font-size: 16px; font-weight: 600; letter-spacing: -.01em; margin: 0; line-height: 1.15; }
+  .brand .sub { font-size: 11.5px; color: var(--muted); letter-spacing: .02em; }
+  .brand .sub b { color: var(--ink-2); font-weight: 500; }
+  .env-switch { display: inline-flex; padding: 3px; gap: 2px; border: 1px solid var(--line-2); border-radius: 10px;
+                background: var(--bg-2); }
+  .env-switch button { border: 0; background: transparent; padding: 5px 14px; border-radius: 7px; cursor: pointer;
+                       color: var(--muted); font: inherit; font-weight: 500; font-size: 13px; transition: all .15s; }
+  .env-switch button:hover { color: var(--ink); }
+  .env-switch button.active { background: var(--accent); color: #0b0d12; font-weight: 600; box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset; }
+  .env-switch button[data-env="sim"].active { background: var(--sim); }
+  .fresh { color: var(--muted); font-size: 12.5px; }
+  .fresh b { color: var(--ink-2); font-weight: 500; font-family: var(--mono); font-size: 12px; }
+  .spacer { flex: 1; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 6px;
+         vertical-align: 1px; box-shadow: 0 0 0 3px var(--ok-bg); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-bg); }
+
+  .banner { padding: 8px 28px; font-size: 12.5px; letter-spacing: .01em; border-bottom: 1px solid var(--line); }
+  .banner b { font-weight: 600; letter-spacing: .06em; font-size: 11px; margin-right: 8px; padding: 2px 8px; border-radius: 6px; }
+  .banner.sim { color: #d8c4ff; background: linear-gradient(90deg, rgba(192,132,252,.16), transparent 70%); }
+  .banner.sim b { background: var(--sim); color: #14081f; }
+  .banner.live { color: #bfeed8; background: linear-gradient(90deg, rgba(61,220,151,.14), transparent 70%); }
+  .banner.live b { background: var(--ok); color: #05130c; }
+  .banner.stale { color: #ffe1a6; background: linear-gradient(90deg, rgba(245,185,66,.2), transparent 70%); }
+  .banner.stale b { background: var(--warn); color: #1a1200; }
+
+  main { padding: 22px 28px 40px; display: grid; gap: 18px; max-width: 1600px; margin: 0 auto; }
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .grid.two { grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); }
+  .card { background: linear-gradient(180deg, var(--card-2), var(--card)); border: 1px solid var(--line);
+          border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
+  .card h2 { margin: 0 0 12px; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em;
+             color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .card h2 .tag { font-size: 10px; letter-spacing: .06em; padding: 1px 7px; border-radius: 6px; text-transform: none;
+                  font-weight: 600; }
+  .tag.github { background: var(--ok-bg); color: var(--ok); }
+  .tag.devin { background: var(--info-bg); color: var(--info); }
+  .tag.pipeline { background: var(--neutral-bg); color: var(--ink-2); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; }
+  .stat { padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.035); border: 1px solid rgba(255,255,255,.04); }
+  .stat .n { font-size: 24px; font-weight: 600; letter-spacing: -.02em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+  .stat .s { color: var(--faint); font-size: 11px; margin-top: 1px; }
+  .stat.bad .n { color: var(--bad); } .stat.warn .n { color: var(--warn); } .stat.ok .n { color: var(--ok); }
+  .stat.info .n { color: var(--info); } .stat.dim .n { color: var(--muted); }
+  .def { color: var(--faint); font-size: 12px; margin-top: 10px; line-height: 1.45; }
+  .def b { color: var(--muted); font-weight: 500; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr.row { cursor: pointer; transition: background .12s; } tbody tr.row:hover { background: rgba(255,255,255,.035); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+          font-weight: 600; background: var(--neutral-bg); color: var(--ink-2); white-space: nowrap; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .9; }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); } .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); } .pill.info { background: var(--info-bg); color: var(--info); }
+  .pill.sim { background: var(--sim-bg); color: var(--sim); }
+  .pill.plain::before { display: none; }
+  .muted { color: var(--muted); } .faint { color: var(--faint); } .small { font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .title { color: var(--ink); }
+
+  .bars { display: flex; gap: 5px; align-items: flex-end; height: 76px; margin-top: 8px; padding-bottom: 6px;
+          border-bottom: 1px solid var(--line); }
+  .bar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; min-width: 6px; border-radius: 3px; }
+  .bar:hover { background: rgba(255,255,255,.04); }
+  .bar div { border-radius: 3px 3px 1px 1px; }
+  .bar .v { background: linear-gradient(180deg, #5ee0b1, #2fa77a); } .bar .m { background: linear-gradient(180deg, #7c8cff, #5b6ae6); }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+  .health dl { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; margin: 0; align-items: center; }
+  .health dt { color: var(--muted); font-size: 12.5px; } .health dd { margin: 0; font-size: 13px; }
+  .health .group { grid-column: 1 / -1; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--line);
+                   font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .08em; }
+
+  .sizes { display: flex; gap: 3px; height: 10px; border-radius: 6px; overflow: hidden; background: rgba(255,255,255,.05); margin-top: 8px; }
+  .sizes span { display: block; height: 100%; }
+  .sz-xs { background: #3ddc97; } .sz-s { background: #7ee3b8; } .sz-m { background: #f5b942; } .sz-l { background: #ff9f6b; } .sz-xl { background: #ff6b6b; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { font-size: 11.5px; padding: 2px 8px; border-radius: 6px; background: var(--neutral-bg); color: var(--ink-2); }
+  .chip b { color: var(--ink); font-weight: 600; margin-left: 4px; }
+  .cmp { display: grid; grid-template-columns: 1fr auto auto auto; gap: 6px 14px; align-items: center; margin-top: 4px; font-size: 13px; }
+  .cmp .h { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .08em; }
+  .cmp .num { font-variant-numeric: tabular-nums; text-align: right; font-family: var(--mono); font-size: 12.5px; }
+  .actions { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+  .actions li { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; color: var(--ink-2); }
+  .actions .kind { flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; padding: 2px 6px;
+                   border-radius: 5px; background: var(--info-bg); color: var(--info); margin-top: 2px; }
+  .actions .kind.machine_setup { background: var(--warn-bg); color: var(--warn); }
+  .actions .kind.repo_config { background: var(--sim-bg); color: var(--sim); }
+  .actions .kind.knowledge { background: var(--ok-bg); color: var(--ok); }
+
+  #drawer { position: fixed; inset: 0 0 0 auto; width: min(820px, 100%); background: var(--bg-2);
+            border-left: 1px solid var(--line-2); box-shadow: -24px 0 60px rgba(0,0,0,.55);
+            transform: translateX(100%); transition: transform .18s ease; overflow: auto; padding: 22px 26px; z-index: 10; }
+  #drawer.open { transform: none; }
+  #drawer h2 { margin: 0 0 4px; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+  #drawer h3 { margin: 22px 0 8px; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
+  #drawer .card h2 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
+  #drawer .close { float: right; border: 1px solid var(--line-2); background: var(--card); width: 30px; height: 30px; border-radius: 8px;
+                   font-size: 18px; line-height: 1; cursor: pointer; color: var(--muted); }
+  #drawer .close:hover { color: var(--ink); }
+  #drawer .grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .links a { margin-right: 16px; font-size: 13px; }
+  .links a::before { content: "↗ "; color: var(--faint); }
+  .tl { list-style: none; margin: 8px 0 0; padding: 0 0 0 16px; border-left: 2px solid var(--line-2); }
+  .tl li { position: relative; padding: 0 0 14px 16px; font-size: 13px; color: var(--ink-2); }
+  .tl li::before { content: ""; position: absolute; left: -21px; top: 6px; width: 8px; height: 8px;
+                   border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 3px var(--bg-2); }
+  .tl li.state::before { background: var(--info); } .tl li.verified::before { background: var(--ok); box-shadow: 0 0 0 3px var(--bg-2), 0 0 0 6px var(--ok-bg); }
+  .tl li.bad::before { background: var(--bad); } .tl li.pr::before { background: #5ee0b1; }
+  .tl li.insights::before { background: var(--accent-2); } .tl li.review::before { background: var(--accent); }
+  .tl time { color: var(--faint); font-size: 11.5px; margin-right: 10px; font-family: var(--mono); }
+  pre { background: var(--bg); border: 1px solid var(--line); padding: 10px 12px; border-radius: 8px; font-size: 12px;
+        overflow: auto; margin: 8px 0 0; color: var(--ink-2); font-family: var(--mono); }
+  .empty { color: var(--faint); padding: 22px; text-align: center; }
+  .kv { margin: 6px 0; font-size: 13px; color: var(--ink-2); } .kv b { color: var(--ink); font-weight: 600; }
+  .note { font-size: 12px; color: var(--faint); margin-top: 8px; line-height: 1.45; }
+  .issue-list { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--ink-2); }
+  .issue-list li { margin-bottom: 6px; } .issue-list .imp { color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
-  <h1>issue-pipeline</h1>
+  <div class="brand">
+    <img src="/static/superset-mark.png" alt="Apache Superset">
+    <div>
+      <h1>issue-pipeline</h1>
+      <div class="sub">issue → Devin → PR delivery for <b id="repo-name">Apache Superset</b></div>
+    </div>
+  </div>
   <div class="env-switch" role="group" aria-label="Environment">
     <button data-env="live">Live</button>
     <button data-env="sim">Simulation</button>
   </div>
+  <span class="spacer"></span>
   <span class="fresh" id="fresh">loading…</span>
   <span class="fresh" id="counts"></span>
 </header>
 <div class="banner" id="banner"></div>
 <main>
   <section class="grid">
-    <div class="card"><h2>Current workload</h2><div class="stats" id="workload"></div></div>
-    <div class="card"><h2>Results</h2><div class="stats" id="results"></div>
+    <div class="card"><h2>Current workload <span class="tag pipeline">pipeline</span></h2><div class="stats" id="workload"></div></div>
+    <div class="card"><h2>Results <span class="tag github">GitHub authoritative</span></h2><div class="stats" id="results"></div>
       <div class="def" id="results-def"></div></div>
-    <div class="card"><h2>Speed</h2><div class="stats" id="speed"></div>
+    <div class="card"><h2>Speed <span class="tag pipeline">pipeline</span></h2><div class="stats" id="speed"></div>
       <div class="def" id="speed-def"></div></div>
-    <div class="card"><h2>Throughput · last 14 UTC days</h2><div id="throughput"></div>
-      <div class="legend"><span><i style="background:#7fc8a9"></i>verified</span>
-      <span><i style="background:var(--ok)"></i>merged</span></div></div>
+    <div class="card"><h2>Throughput · last 14 UTC days <span class="tag github">GitHub</span></h2><div id="throughput"></div>
+      <div class="legend"><span><i style="background:#5ee0b1"></i>verified</span>
+      <span><i style="background:#7c8cff"></i>merged</span></div></div>
+  </section>
+  <section class="grid two">
+    <div class="card"><h2>Cost &amp; efficiency <span class="tag devin">Devin analytics</span></h2>
+      <div class="stats" id="cost"></div>
+      <div id="cost-sizes"></div>
+      <div id="cost-actions"></div>
+      <div class="def" id="cost-def"></div></div>
     <div class="card health"><h2>Integration health</h2><dl id="health"></dl></div>
   </section>
   <section class="card">
-    <h2>Needs attention</h2>
+    <h2>Needs attention <span class="tag pipeline">pipeline</span></h2>
     <table><thead><tr><th>Issue</th><th>State</th><th>Blocker</th><th>Age</th><th>Next action</th></tr></thead>
     <tbody id="attention"></tbody></table>
   </section>
   <section class="card">
     <h2>Tasks</h2>
     <table><thead><tr>
-      <th>Issue</th><th>State</th><th>Elapsed</th><th>Tests</th><th>PR</th><th>Slack</th><th>Last update</th>
+      <th>Issue</th><th>State</th><th>Elapsed</th><th>Tests</th><th>PR</th><th>ACUs</th><th>Slack</th><th>Last update</th>
     </tr></thead><tbody id="tasks"></tbody></table>
   </section>
 </main>
@@ -137,6 +238,8 @@ const fmtTime = (iso) => {
   return isNaN(d) ? iso : d.toISOString().replace("T", " ").slice(0, 19) + "Z";
 };
 const ago = (iso) => iso ? `${fmtDur((Date.now() - new Date(iso)) / 1000)} ago` : "never";
+const fmtAcu = (n) => (n === null || n === undefined) ? "—" : (Math.round(n * 100) / 100).toString();
+const pct = (x) => (x === null || x === undefined) ? "—" : `${Math.round(x * 100)}%`;
 
 const BUCKET_LABEL = {
   awaiting_approval: ["awaiting approval", ""], queued: ["queued", ""], running: ["running", "info"],
@@ -149,25 +252,120 @@ const pill = (bucket, extra) => {
   return el("span", { class: `pill ${tone}`, text: extra ? `${label} · ${extra}` : label });
 };
 const CHECK_TONE = { passed: "ok", failed: "bad", pending: "warn", unknown: "" };
+const SIZE_LABEL = { xs: "XS", s: "S", m: "M", l: "L", xl: "XL" };
+const SOURCE_LABEL = { billing: "billed", session: "session total", poll: "last poll" };
 
 let env = new URLSearchParams(location.search).get("env") || DEFAULT_ENV;
 let timer = null;
 
-function stat(label, n, tone) {
-  return el("div", { class: `stat ${tone || ""}` }, [el("div", { class: "n", text: String(n) }), el("div", { class: "l", text: label })]);
+function stat(label, n, tone, sub) {
+  return el("div", { class: `stat ${tone || ""}` }, [
+    el("div", { class: "n", text: String(n) }), el("div", { class: "l", text: label }),
+    sub ? el("div", { class: "s", text: sub }) : null]);
+}
+
+function acuCell(ins) {
+  const c = ins && ins.cost;
+  if (!c || c.acus === null || c.acus === undefined) return el("span", { class: "muted small", text: ins && ins.available ? "pending" : "—" });
+  return el("div", {}, [el("span", { class: "mono", text: fmtAcu(c.acus) }), " ",
+    el("span", { class: "small faint", text: SOURCE_LABEL[c.source] || c.source }),
+    ins.session_size ? el("div", { class: "small muted", text: `size ${SIZE_LABEL[ins.session_size] || ins.session_size}` }) : null]);
+}
+
+function renderCost(c, defs) {
+  const cov = c.coverage;
+  const n = (v, d) => v === null || v === undefined ? "—" : fmtAcu(v);
+  $("cost").replaceChildren(
+    stat("ACUs total", n(c.acus_total), cov.priced ? "" : "dim", `${cov.priced}/${cov.runs_with_session} sessions priced`),
+    stat("per PR opened", n(c.acus_per_pr_opened), "info", `${c.denominators.pr_opened} PR${c.denominators.pr_opened === 1 ? "" : "s"}`),
+    stat("per verified PR", n(c.acus_per_verified_pr), "ok", `${c.denominators.verified} verified`),
+    stat("per merged PR", n(c.acus_per_merged_pr), "ok", `${c.denominators.merged} merged`),
+    stat("median / run", n(c.acus_median_per_run), "", c.acus_p90_per_run !== null ? `p90 ${fmtAcu(c.acus_p90_per_run)}` : ""),
+    stat("spent without a PR", n(c.acus_without_pr), c.acus_without_pr ? "warn" : "dim", "terminal runs, no PR"),
+    stat("awaiting cost", cov.no_cost_yet, cov.no_cost_yet ? "warn" : "dim", "provider has not published"),
+    stat("large sessions", pct(c.large_share), c.large_share ? "warn" : "dim", "L + XL share"));
+  const sizes = c.session_sizes; const sized = Object.values(sizes).reduce((a, b) => a + b, 0);
+  const sizesEl = $("cost-sizes");
+  sizesEl.replaceChildren(
+    el("div", { class: "sizes", title: "session size distribution" }, Object.entries(sizes).filter(([, v]) => v).map(([k, v]) =>
+      el("span", { class: `sz-${k}`, style: `flex:${v}`, title: `${SIZE_LABEL[k]}: ${v}` }))),
+    el("div", { class: "chips" }, [
+      ...Object.entries(sizes).map(([k, v]) => el("span", { class: "chip" }, [SIZE_LABEL[k], el("b", { text: String(v) })])),
+      el("span", { class: "chip" }, ["sized", el("b", { text: `${sized}/${cov.runs_with_session}` })]),
+      el("span", { class: "chip" }, ["analysed", el("b", { text: `${cov.analysed}` })]),
+      cov.analysis_pending ? el("span", { class: "chip" }, ["analysis pending", el("b", { text: `${cov.analysis_pending}` })]) : null,
+      el("span", { class: "chip" }, ["skill uses", el("b", { text: `${c.skills.good} good · ${c.skills.bad} bad` })]),
+      ...Object.entries(c.categories).map(([k, v]) => el("span", { class: "chip" }, [k.replace(/_/g, " "), el("b", { text: String(v) })])),
+    ]));
+  const actions = $("cost-actions");
+  actions.replaceChildren(...(c.top_action_items.length ? [
+    el("div", { class: "small muted", style: "margin-top:12px", text: "What Devin says would have made these sessions cheaper:" }),
+    el("ul", { class: "actions" }, c.top_action_items.map((a) => {
+      const li = el("li", {}, [el("span", { class: `kind ${a.type}`, text: a.type.replace(/_/g, " ") }),
+        el("span", {}, [a.text || "", " ", el("span", { class: "faint small", text: `· #${a.issue_number}` })])]);
+      li.style.cursor = "pointer"; li.onclick = () => openTimeline(a.task_id);
+      return li;
+    }))] : []));
+  const src = Object.entries(c.sources).map(([k, v]) => `${v} ${SOURCE_LABEL[k] || k}`).join(", ");
+  $("cost-def").replaceChildren(
+    el("b", { text: "Provider figures. " }), defs.cost, " ", defs.session_size,
+    src ? ` Sources: ${src}.` : "",
+    c.fetched_at ? ` Last read from Devin ${ago(c.fetched_at)}.` : " No analytics read from Devin yet.",
+    cov.priced && cov.priced < 5 ? " Fewer than 5 priced sessions: ratios are anecdotes, not rates." : "");
+}
+
+function renderHealth(h, defs) {
+  const dt = (k, v, tone) => [el("dt", { text: k }), el("dd", { class: tone || "" }, v)];
+  const group = (t) => [el("div", { class: "group", text: t })];
+  const a = h.devin_analytics;
+  const rows = [
+    ...group("GitHub · Slack · worker"),
+    ...dt("last GitHub delivery", `${fmtTime(h.github.last_delivery_at)} (${ago(h.github.last_delivery_at)})`),
+    ...dt("last Devin poll", `${fmtTime(h.devin.last_poll_at)} (${ago(h.devin.last_poll_at)})`),
+    ...dt("worker heartbeat", el("span", { class: h.worker.stale ? "pill warn" : "pill ok", text: h.worker.stale ? `stale · ${ago(h.worker.last_tick_at)}` : `ok · ${ago(h.worker.last_tick_at)}` })),
+    ...dt("Slack delivery", el("span", { class: h.slack.failed ? "pill bad" : "pill ok", text: `${h.slack.failed} failed · ${h.slack.pending} pending · ${h.slack.sent} sent` })),
+    ...(h.slack.last_error ? dt("last Slack error", el("span", { class: "small", text: h.slack.last_error })) : []),
+    ...dt("last Slack post", `${fmtTime(h.slack.last_sent_at)} (${ago(h.slack.last_sent_at)})`),
+    ...group("Devin analytics cross-check · GitHub stays authoritative"),
+  ];
+  if (a.status === "unavailable") {
+    rows.push(...dt("provider metrics", el("span", { class: "pill plain", text: "not read yet" })));
+    if (a.last_error) rows.push(...dt("last analytics error", el("span", { class: "small", text: a.last_error })));
+  } else {
+    const tone = a.status === "ok" ? "ok" : "warn";
+    rows.push(...dt("provider vs GitHub", el("span", { class: `pill ${tone}`, text: a.status === "ok" ? "counts agree" : "drift" })));
+    const cmp = el("div", { class: "cmp" }, [
+      el("span", { class: "h" }), el("span", { class: "h", text: "Devin" }), el("span", { class: "h", text: "GitHub/pipeline" }), el("span", { class: "h", text: "Δ" })]);
+    const row = (label, prov, pipe, delta) => cmp.append(el("span", { class: "small muted", text: label }),
+      el("span", { class: "num", text: String(prov) }), el("span", { class: "num", text: String(pipe) }),
+      el("span", { class: `num ${delta ? "warn" : "faint"}`, style: delta ? "color:var(--warn)" : "", text: delta > 0 ? `+${delta}` : String(delta) }));
+    row("sessions created", a.provider.sessions_created, a.pipeline.sessions_created, a.drift.sessions);
+    row("PRs created", a.provider.prs_created, a.pipeline.prs_opened, a.drift.prs);
+    row("PRs merged", a.provider.prs_merged, a.pipeline.prs_merged, a.drift.merged);
+    rows.push(el("dd", { style: "grid-column:1/-1" }, cmp));
+    rows.push(...dt("provider window", el("span", { class: "small muted", text: `${fmtTime(a.window.after)} → ${fmtTime(a.window.before)} · service user ${a.service_user_ids.join(", ") || "—"} · read ${ago(a.fetched_at)}` })));
+    if (a.provider.avg_acus_per_session !== null && a.provider.avg_acus_per_session !== undefined)
+      rows.push(...dt("Devin avg ACU / session", el("span", { class: "mono", text: fmtAcu(a.provider.avg_acus_per_session) })));
+    if (a.last_error) rows.push(...dt("last analytics error", el("span", { class: "small", text: a.last_error })));
+  }
+  rows.push(el("dd", { class: "def", style: "grid-column:1/-1;margin-top:2px", text: defs.drift }));
+  $("health").replaceChildren(...rows);
 }
 
 function render(d) {
   document.querySelectorAll(".env-switch button").forEach((b) => b.classList.toggle("active", b.dataset.env === env));
   const stale = d.health.worker.stale;
-  $("fresh").replaceChildren("data as of ", el("b", { text: fmtTime(d.data_as_of) }), ` (${ago(d.data_as_of)}) · rendered ${fmtTime(d.generated_at)}`);
+  $("fresh").replaceChildren(el("span", { class: `dot ${stale ? "warn" : ""}` }), "data as of ", el("b", { text: fmtTime(d.data_as_of) }), ` (${ago(d.data_as_of)})`);
   $("counts").textContent = `runs stored: live ${d.envs_available.live || 0} · sim ${d.envs_available.sim || 0}`;
+  const repo = d.tasks.length ? d.tasks[0].repo : null;
+  if (repo) $("repo-name").textContent = repo;
   const banner = $("banner");
   banner.className = `banner ${env}${stale ? " stale" : ""}`;
-  banner.textContent = (env === "sim"
-    ? "SIMULATION — every number on this page comes from simulated runs and fixtures. Nothing here happened on GitHub or in Devin."
-    : "LIVE — numbers come only from live runs; simulated runs are excluded.")
-    + (stale ? `  ·  Worker heartbeat is stale (last tick ${ago(d.health.worker.last_tick_at)}): counts may be behind reality.` : "");
+  banner.replaceChildren(el("b", { text: env === "sim" ? "SIMULATION" : "LIVE" }),
+    env === "sim"
+      ? "Every number on this page comes from simulated runs and fixtures. Nothing here happened on GitHub or in Devin."
+      : "Numbers come only from live runs; simulated runs are excluded.",
+    stale ? `  ·  Worker heartbeat is stale (last tick ${ago(d.health.worker.last_tick_at)}): counts may be behind reality.` : "");
 
   const w = d.workload;
   $("workload").replaceChildren(
@@ -176,7 +374,7 @@ function render(d) {
     stat("failed", w.failed, w.failed ? "bad" : ""), stat("awaiting approval", w.awaiting_approval));
   const r = d.results;
   $("results").replaceChildren(stat("PRs opened", r.pr_opened), stat("verified", r.verified, "ok"), stat("merged", r.merged, "ok"), stat("closed unmerged", r.closed_unmerged, r.closed_unmerged ? "bad" : ""));
-  $("results-def").textContent = `Opened: ${d.definitions.pr_opened} Verified: ${d.definitions.verified} Merged: ${d.definitions.merged}`;
+  $("results-def").replaceChildren(el("b", { text: "Opened: " }), d.definitions.pr_opened, " ", el("b", { text: "Verified: " }), d.definitions.verified, " ", el("b", { text: "Merged: " }), d.definitions.merged);
   const s = d.speed;
   $("speed").replaceChildren(
     stat("median to review-ready", fmtDur(s.review_ready.median_seconds)), stat("p90", fmtDur(s.review_ready.p90_seconds)),
@@ -191,19 +389,12 @@ function render(d) {
       el("div", { class: "m", style: `height:${(day.merged / max) * 64}px` }),
     ]))));
 
-  const h = d.health;
-  const dt = (k, v, tone) => [el("dt", { text: k }), el("dd", { class: tone || "" }, v)];
-  $("health").replaceChildren(
-    ...dt("last GitHub delivery", `${fmtTime(h.github.last_delivery_at)} (${ago(h.github.last_delivery_at)})`),
-    ...dt("last Devin poll", `${fmtTime(h.devin.last_poll_at)} (${ago(h.devin.last_poll_at)})`),
-    ...dt("worker heartbeat", el("span", { class: h.worker.stale ? "pill warn" : "pill ok", text: h.worker.stale ? `stale · ${ago(h.worker.last_tick_at)}` : `ok · ${ago(h.worker.last_tick_at)}` })),
-    ...dt("Slack delivery failures", el("span", { class: h.slack.failed ? "pill bad" : "pill ok", text: `${h.slack.failed} failed · ${h.slack.pending} pending · ${h.slack.sent} sent` })),
-    ...(h.slack.last_error ? dt("last Slack error", el("span", { class: "small", text: h.slack.last_error })) : []),
-    ...dt("last Slack post", `${fmtTime(h.slack.last_sent_at)} (${ago(h.slack.last_sent_at)})`));
+  renderCost(d.cost, d.definitions);
+  renderHealth(d.health, d.definitions);
 
   const att = $("attention");
   att.replaceChildren(...(d.attention.length ? d.attention.map((a) => {
-    const row = el("tr", {}, [
+    const row = el("tr", { class: "row" }, [
       el("td", {}, [link(a.issue.url, `#${a.issue.number}`), " ", el("span", { class: "muted small", text: a.issue.title })]),
       el("td", {}, pill(BUCKET_FOR_STATE(a.state), a.reason)), el("td", { text: a.blocker }),
       el("td", { text: fmtDur(a.age_seconds) }), el("td", { text: a.next_action })]);
@@ -216,22 +407,22 @@ function render(d) {
     const checks = t.tests.checks;
     const tests = el("div", {}, [
       el("span", { class: `pill ${CHECK_TONE[checks.state] || ""}`, text: `checks ${checks.state}` }), " ",
-      el("span", { class: "small muted", text: `regression test ${t.tests.regression_test}` }),
-      t.tests.tests_run ? el("div", { class: "small muted", text: t.tests.tests_run }) : null]);
+      el("div", { class: "small muted", text: `regression test ${t.tests.regression_test}` }),
+      t.tests.tests_run ? el("div", { class: "small faint mono", text: t.tests.tests_run }) : null]);
     const pr = t.pr.number ? el("div", {}, [link(t.pr.url, `#${t.pr.number}`), " ",
       el("span", { class: "small muted", text: t.pr.state + (t.pr.draft ? " · draft" : "") + (t.verified ? " · verified" : "") })]) : el("span", { class: "muted", text: "—" });
-    const slack = el("span", { class: `pill ${{ sent: "ok", failed: "bad", pending: "warn", none: "" }[t.slack.status]}`,
+    const slack = el("span", { class: `pill ${{ sent: "ok", failed: "bad", pending: "warn", none: "plain" }[t.slack.status]}`,
       text: t.slack.status === "none" ? "no messages" : `${t.slack.status} · ${t.slack.sent}/${t.slack.sent + t.slack.pending + t.slack.failed}` });
-    const row = el("tr", {}, [
-      el("td", {}, [link(t.issue.url, `#${t.issue.number}`), " ", el("span", { text: t.issue.title }),
+    const row = el("tr", { class: "row" }, [
+      el("td", {}, [link(t.issue.url, `#${t.issue.number}`), " ", el("span", { class: "title", text: t.issue.title }),
         t.attempts > 1 ? el("span", { class: "small muted", text: ` · ${t.attempts} runs` }) : null]),
       el("td", {}, [pill(t.bucket), t.failure_reason && ["blocked", "failed"].includes(t.bucket) ? el("div", { class: "small muted", text: t.failure_reason }) : null]),
       el("td", { text: fmtDur(t.timing.elapsed_seconds) + (t.timing.ended_at ? "" : " ⏱") }),
-      el("td", {}, tests), el("td", {}, pr), el("td", {}, slack),
+      el("td", {}, tests), el("td", {}, pr), el("td", {}, acuCell(t.insights)), el("td", {}, slack),
       el("td", { class: "small muted", text: `${fmtTime(t.last_update)} · ${ago(t.last_update)}` })]);
     row.onclick = () => openTimeline(t.task_id);
     return row;
-  }) : [el("tr", {}, el("td", { colspan: 7, class: "empty", text: `No ${env === "sim" ? "simulated" : "live"} runs recorded yet.` }))]));
+  }) : [el("tr", {}, el("td", { colspan: 8, class: "empty", text: `No ${env === "sim" ? "simulated" : "live"} runs recorded yet.` }))]));
 }
 
 const STATE_BUCKET = { awaiting_approval: "awaiting_approval", queued: "queued", starting: "running", running: "running",
@@ -249,6 +440,36 @@ async function load() {
   }
 }
 
+function insightsCard(ins) {
+  const head = el("h2", {}, ["Devin's account ", el("span", { class: "tag devin", text: "provider" })]);
+  if (!ins || !ins.available) {
+    return el("div", { class: "card" }, [head,
+      el("p", { class: "kv" }, [el("b", { text: "ACUs: " }), ins && ins.cost.acus !== null ? `${fmtAcu(ins.cost.acus)} (last poll)` : "not read yet"]),
+      el("p", { class: "note", text: "Session analytics have not been read from Devin for this run yet." })]);
+  }
+  const c = ins.cost;
+  const parts = [head,
+    el("p", { class: "kv" }, [el("b", { text: "ACUs: " }), c.acus === null ? "pending — provider has published no figure" : `${fmtAcu(c.acus)} (${SOURCE_LABEL[c.source] || c.source})`,
+      c.by_day.length ? el("span", { class: "muted small", text: ` · ${c.by_day.map(([d, v]) => `${String(d).slice(0, 10)}: ${fmtAcu(v)}`).join(", ")}` }) : null]),
+    el("p", { class: "kv" }, [el("b", { text: "Size: " }), ins.session_size ? SIZE_LABEL[ins.session_size] || ins.session_size : "—",
+      ins.category ? ` · ${ins.category.replace(/_/g, " ")}` : "",
+      ins.messages && ins.messages.user !== null ? ` · ${ins.messages.user} user / ${ins.messages.devin} Devin messages` : ""]),
+    el("p", { class: "kv" }, [el("b", { text: "Analysis: " }), ins.analysis_status || "not generated"]),
+  ];
+  const a = ins.analysis;
+  if (a) {
+    if (a.issues.length) parts.push(el("ul", { class: "issue-list" }, a.issues.map((i) => el("li", {}, [el("b", { text: i.title || "issue" }), i.issue ? ` — ${i.issue}` : "", i.impact ? el("div", { class: "imp", text: i.impact }) : null]))));
+    if (a.action_items.length) parts.push(el("ul", { class: "actions" }, a.action_items.map((x) => el("li", {}, [el("span", { class: `kind ${x.type}`, text: x.type.replace(/_/g, " ") }), el("span", { text: x.text || "" })]))));
+    if (a.skills.good.length || a.skills.bad.length) parts.push(el("p", { class: "kv small" }, [el("b", { text: "Skills: " }),
+      ...a.skills.good.map((s) => el("span", { class: "pill ok", style: "margin-right:6px", text: s.name || "skill" })),
+      ...a.skills.bad.map((s) => el("span", { class: "pill bad", style: "margin-right:6px", text: s.name || "skill" }))]));
+    if (a.suggested_prompt) parts.push(el("pre", { text: a.suggested_prompt }));
+  }
+  if (ins.last_error) parts.push(el("p", { class: "note", text: `last analytics error: ${ins.last_error}` }));
+  parts.push(el("p", { class: "note", text: `Devin's own figures and analysis, read ${ago(ins.fetched_at)}. They describe cost and process; the outcome above comes from GitHub.` }));
+  return el("div", { class: "card" }, parts);
+}
+
 async function openTimeline(taskId) {
   const drawer = $("drawer");
   drawer.replaceChildren(el("p", { class: "muted", text: "loading…" }));
@@ -264,20 +485,21 @@ async function openTimeline(taskId) {
     ...t.runs.map((r) => r.session.url ? link(r.session.url, `Devin session ${r.session.id || ""}`.trim()) : null),
     ...t.runs.map((r) => r.pr.url ? link(r.pr.url, `PR #${r.pr.number}`) : null)]);
   const facts = latest ? el("div", { class: "grid" }, [
-    el("div", { class: "card" }, [el("h2", { text: "Outcome" }),
-      el("div", {}, [pill(latest.bucket), " ", el("span", { class: "muted small", text: `env ${latest.env} · run ${latest.run_id}` })]),
-      latest.failure_reason ? el("p", {}, [el("b", { text: "Reason: " }), latest.failure_reason]) : null,
-      latest.attention ? el("p", {}, [el("b", { text: "Next action: " }), latest.attention.next_action]) : null,
-      el("p", { class: "small muted", text: `elapsed ${fmtDur(latest.timing.elapsed_seconds)} · to PR ${fmtDur(latest.timing.pr_opened_seconds)} · to review-ready ${fmtDur(latest.timing.review_ready_seconds)} · ACUs ${latest.session.acus_consumed ?? "—"}/${latest.session.max_acu_limit ?? "—"}` })]),
-    el("div", { class: "card" }, [el("h2", { text: "Test evidence" }),
-      el("p", {}, [el("b", { text: "GitHub checks: " }), el("span", { class: `pill ${CHECK_TONE[latest.tests.checks.state] || ""}`, text: latest.tests.checks.state }),
+    el("div", { class: "card" }, [el("h2", {}, ["Outcome ", el("span", { class: "tag github", text: "GitHub" })]),
+      el("div", {}, [pill(latest.bucket), " ", el("span", { class: latest.env === "sim" ? "pill sim" : "pill ok", text: latest.env }), " ", el("span", { class: "faint small mono", text: `run ${latest.run_id}` })]),
+      latest.failure_reason ? el("p", { class: "kv" }, [el("b", { text: "Reason: " }), latest.failure_reason]) : null,
+      latest.attention ? el("p", { class: "kv" }, [el("b", { text: "Next action: " }), latest.attention.next_action]) : null,
+      el("p", { class: "small muted", text: `elapsed ${fmtDur(latest.timing.elapsed_seconds)} · to PR ${fmtDur(latest.timing.pr_opened_seconds)} · to review-ready ${fmtDur(latest.timing.review_ready_seconds)} · polled ACUs ${latest.session.acus_consumed ?? "—"}/${latest.session.max_acu_limit ?? "—"}` })]),
+    el("div", { class: "card" }, [el("h2", {}, ["Test evidence ", el("span", { class: "tag github", text: "GitHub" })]),
+      el("p", { class: "kv" }, [el("b", { text: "GitHub checks: " }), el("span", { class: `pill ${CHECK_TONE[latest.tests.checks.state] || ""}`, text: latest.tests.checks.state }),
         el("span", { class: "small muted", text: latest.tests.checks.head_sha ? ` on ${latest.tests.checks.head_sha.slice(0, 10)}` : " (no PR head yet)" })]),
-      latest.tests.checks.suites.length ? el("ul", { class: "small" }, latest.tests.checks.suites.map((s) => el("li", {}, [s.url ? link(s.url, s.app || "check suite") : (s.app || "check suite"), ` · ${s.status}${s.conclusion ? " · " + s.conclusion : ""}`]))) : null,
-      el("p", {}, [el("b", { text: "Session's account: " }), `regression test ${latest.tests.regression_test}`, latest.tests.tests_run ? `, ran "${latest.tests.tests_run}"` : "", latest.tests.session_outcome ? `, outcome "${latest.tests.session_outcome}"` : ""]),
-      el("p", { class: "small muted", text: "The session's account is what Devin reported; only GitHub checks count as verification." })]),
-    el("div", { class: "card" }, [el("h2", { text: "Human review" }),
-      t.review ? el("p", {}, [el("b", { text: "Outcome: " }), t.review.outcome, t.review.review_state ? ` · latest review ${t.review.review_state}` : " · no review submitted",
+      latest.tests.checks.suites.length ? el("ul", { class: "small issue-list" }, latest.tests.checks.suites.map((s) => el("li", {}, [s.url ? link(s.url, s.app || "check suite") : (s.app || "check suite"), ` · ${s.status}${s.conclusion ? " · " + s.conclusion : ""}`]))) : null,
+      el("p", { class: "kv" }, [el("b", { text: "Session's account: " }), `regression test ${latest.tests.regression_test}`, latest.tests.tests_run ? `, ran "${latest.tests.tests_run}"` : "", latest.tests.session_outcome ? `, outcome "${latest.tests.session_outcome}"` : ""]),
+      el("p", { class: "note", text: "The session's account is what Devin reported; only GitHub checks count as verification." })]),
+    el("div", { class: "card" }, [el("h2", {}, ["Human review ", el("span", { class: "tag github", text: "GitHub" })]),
+      t.review ? el("p", { class: "kv" }, [el("b", { text: "Outcome: " }), t.review.outcome, t.review.review_state ? ` · latest review ${t.review.review_state}` : " · no review submitted",
         t.review.merged_by ? ` · merged by ${t.review.merged_by}` : "", t.review.merged_sha ? ` · ${t.review.merged_sha.slice(0, 10)}` : ""]) : el("p", { class: "muted", text: "no run yet" })]),
+    insightsCard(latest.insights),
   ]) : el("p", { class: "muted", text: "No runs for this task yet." });
 
   const items = [];
@@ -290,6 +512,7 @@ async function openTimeline(taskId) {
     else if (e.kind === "checks") text = `check suite ${d.app || ""} ${d.status || ""}${d.conclusion ? " · " + d.conclusion : ""} → head ${e.reason}`;
     else if (e.kind === "verified") text = `verified: all check suites passed on ${String(d.head_sha || "").slice(0, 10)}`;
     else if (e.kind === "review") text = `review ${e.reason}${d.reviewer ? " by " + d.reviewer : ""}`;
+    else if (e.kind === "insights") text = `Devin analysis available` + (d.session_size ? ` · size ${SIZE_LABEL[d.session_size] || d.session_size}` : "") + (d.acus_consumed != null ? ` · ${fmtAcu(d.acus_consumed)} ACU` : "") + (d.action_items != null ? ` · ${d.action_items} action item${d.action_items === 1 ? "" : "s"}` : "");
     else text = `${e.kind} ${e.reason || ""}`;
     if (e.reason && ["failed", "no_output", "expired", "session_blocked", "closed_unmerged"].includes(e.to_state || "")) { cls += " bad"; text += ` · reason: ${e.reason}`; }
     if (e.kind === "checks" && e.reason === "failed") cls += " bad";
@@ -308,7 +531,7 @@ async function openTimeline(taskId) {
 
   drawer.replaceChildren(close, el("h2", { text: `#${t.issue.number} ${t.issue.title}` }),
     el("p", { class: "muted small", text: `${t.repo} · issue ${t.issue.state} · labels: ${(t.issue.labels || []).join(", ") || "none"}` }),
-    links, facts, el("h2", { text: "Timeline", style: "margin-top:16px" }),
+    links, facts, el("h3", { text: "Timeline" }),
     items.length ? el("ul", { class: "tl" }, items.map(([, li]) => li)) : el("p", { class: "muted", text: "no events" }));
 }
 function closeTimeline() { const d = $("drawer"); d.classList.remove("open"); d.setAttribute("aria-hidden", "true"); }

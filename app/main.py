@@ -28,11 +28,16 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+)
 
 from app.config import load_settings, Settings
 from app.dashboard import build_dashboard, build_timeline
-from app.dashboard_page import render_page
+from app.dashboard_page import render_page, STATIC_DIR
 from app.intake import Intake, verify_signature
 from app.reporting import build_report, render_text
 from app.store import Store
@@ -144,6 +149,10 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
         if chosen is None:
             return PlainTextResponse("env must be live or sim", status_code=400)
         return HTMLResponse(render_page(default_env=chosen))
+
+    @app.get("/static/superset-mark.png", include_in_schema=False)
+    def superset_mark() -> Response:
+        return FileResponse(STATIC_DIR / "superset-mark.png", media_type="image/png")
 
 
 def get_app() -> FastAPI:  # pragma: no cover - uvicorn entry point
