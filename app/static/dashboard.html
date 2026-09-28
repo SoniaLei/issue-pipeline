@@ -264,7 +264,7 @@ const gatePill = (rv) => {
   const [label, tone] = GATE_LABEL[rv.state] || [`review ${rv.state}`, ""];
   const n = rv.findings;
   const kinds = Object.entries(rv.findings_by_kind || {}).map(([k, v]) => `${v} ${k}`).join(", ");
-  const text = rv.state === "findings" ? `${n} finding${n === 1 ? "" : "s"}${kinds ? ` (${kinds})` : ""}` : label;
+  const text = rv.state === "findings" && n != null ? `${n} finding${n === 1 ? "" : "s"}${kinds ? ` (${kinds})` : ""}` : label;
   return el("span", { class: `pill ${tone}`, title: rv.head_sha ? `Devin Review of ${rv.head_sha.slice(0, 10)} · mode ${rv.mode}` : `mode ${rv.mode}`, text });
 };
 const SIZE_LABEL = { xs: "XS", s: "S", m: "M", l: "L", xl: "XL" };
@@ -395,7 +395,7 @@ function render(d) {
   const gateEntries = Object.entries(g.states);
   $("gate-states").replaceChildren(el("p", { class: "small muted", style: "margin:8px 0 0" }, [
     "Open PRs by review state: ",
-    ...(gateEntries.length ? gateEntries.flatMap(([s, n]) => [gatePill({ state: s, mode: g.mode, findings: n, findings_by_kind: {} }), ` ×${n} `]) : ["none"]),
+    ...(gateEntries.length ? gateEntries.flatMap(([s, n]) => [gatePill({ state: s, mode: g.mode, findings: null, findings_by_kind: {} }), ` ×${n} `]) : ["none"]),
     g.last_call_at ? el("span", { class: "faint", text: ` · last pr-reviews read ${ago(g.last_call_at)}` }) : null]));
   $("results-def").replaceChildren(el("b", { text: "Opened: " }), d.definitions.pr_opened, " ", el("b", { text: "Checks passed: " }), d.definitions.checks_passed, " ", el("b", { text: "Verified: " }), d.definitions.verified, " ", el("b", { text: "Merged: " }), d.definitions.merged, " ", el("b", { text: "Review gate: " }), d.definitions.review_gate);
   const s = d.speed;

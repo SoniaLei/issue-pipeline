@@ -139,9 +139,11 @@ the ones it can check are present:
 2. **A repository webhook** (or a GitHub App) on each repository in
    `REPO_ALLOWLIST`, pointed at that URL, content type `application/json`,
    secret equal to `GITHUB_WEBHOOK_SECRET`, subscribed to *Issues*,
-   *Pull requests*, *Pull request reviews* and *Check suites*. The service
-   never calls the GitHub API, so the webhook needs no token; it only needs to
-   be delivered.
+   *Pull requests*, *Pull request reviews*, *Pull request review comments*
+   and *Check suites*. Review comments carry Devin Review's inline findings
+   (the per-kind counts on the dashboard); without them only the review's
+   total arrives. The service never calls the GitHub API, so the webhook
+   needs no token; it only needs to be delivered.
 
 3. **A Devin service user**, org-scoped, holding `UseDevinSessions` (create)
    and `ViewOrgSessions` (get, list); the same token is used for the
@@ -233,8 +235,19 @@ dismiss on GitHub with a reason, or raise a follow-up issue — is the
 reviewer's call. A new commit keeps the old head's review for audit and starts
 a fresh request; nothing from an earlier head counts. Provider errors are
 stored on that head, retried up to `REVIEW_MAX_ATTEMPTS` times
-`REVIEW_POLL_SECONDS` apart on idle worker ticks, then shown as *unavailable*
+`REVIEW_POLL_SECONDS` apart on idle worker ticks (a permanent error such as
+a missing permission is not retried at all), then shown as *unavailable*
 under Needs attention; they never stop the worker or touch another run.
+
+The mode is read at two different moments, and changing it mid-history shows
+the difference. The *verified* count and each task row are recomputed from
+stored checks and reviews under the mode in force **now**. Speed samples and
+daily throughput come from the durable `verified` event, which is written once
+when a head first satisfied the gate under the mode in force **then** (the
+event records that mode). Tightening the mode leaves earlier samples in place;
+loosening it does not backfill samples for heads that would now count. Pick
+the mode per environment before it carries data, and treat a change as a new
+series.
 
 The gate is a second reader, not a second approver: a PR that is checks-green
 and review-clear still needs a maintainer to approve and merge it. See D-033.

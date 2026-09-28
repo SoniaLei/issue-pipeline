@@ -39,6 +39,7 @@ from app.devin_client import (
     DevinClient,
     DevinError,
     map_status,
+    PullRequestReview,
     SessionInsights,
     SessionSnapshot,
 )
@@ -494,11 +495,13 @@ class Worker:
         A run is due when GitHub owns it (``pr_open``/``awaiting_review``),
         its head has no review row or one whose API status is not terminal,
         and the last read is older than the poll interval. When no review
-        exists for the head one is requested, once: the request is recorded on
-        the row, so a second worker or a restart does not ask again. Reads
-        that keep failing stop after ``review_max_attempts`` and leave the
-        head ``unavailable`` with the error, which the dashboard shows and
-        which never counts as a pass (D-033).
+        exists for the head one is requested, once: the head is claimed in the
+        store before the request is sent, so a second worker or a restart
+        does not ask again. Reads that keep failing stop after
+        ``review_max_attempts``, and a permanent error (``retryable`` false,
+        e.g. a missing permission) stops on the first; either leaves the head
+        ``unavailable`` with the error, which the dashboard shows and which
+        never counts as a pass (D-033).
         """
         if self.settings.review_gate_mode == "off":
             return False
@@ -528,31 +531,15 @@ class Worker:
         previous_status = current["status"] if current is not None else None
         attempts = int(current["attempts"]) if current is not None else 0
         requested = current is not None and current["requested_at"] is not None
-        fields: dict[str, Any] = {"status_at": now_iso(), "last_error": None}
+        fields: dict[str, Any] = {
+            "status_at": now_iso(),
+            "last_error": None,
+            "retryable": 1,
+        }
         try:
             review = self.devin.get_pr_review(pr_url, head)
             if review is None and not requested:
-                review = self.devin.request_pr_review(pr_url)
-                fields["requested_at"] = now_iso()
-                if review.commit_sha and review.commit_sha != head:
-                    # Devin reviews whatever GitHub's latest commit is. If that
-                    # is not the head this run knows, GitHub has moved on and
-                    # the synchronize delivery will bring the new head, whose
-                    # row this is; the head asked about gets no review.
-                    self._record_review(
-                        run,
-                        review.commit_sha,
-                        previous=None,
-                        status=review.status,
-                        requested_at=fields["requested_at"],
-                        status_at=fields["status_at"],
-                    )
-                    fields["status"] = "skipped"
-                    fields["last_error"] = (
-                        f"Devin reviewed newer commit {review.commit_sha[:10]};"
-                        " waiting for GitHub to report that head"
-                    )
-                    review = None
+                review = self._request_review(run, fields)
             if review is not None:
                 fields["status"] = review.status
                 fields["attempts"] = 0
@@ -571,11 +558,65 @@ class Worker:
             attempts += 1
             fields["attempts"] = attempts
             fields["last_error"] = str(exc)
-            if not exc.retryable or attempts >= self.settings.review_max_attempts:
+            if not exc.retryable:
+                fields["status"] = "unavailable"
+                fields["retryable"] = 0
+            elif attempts >= self.settings.review_max_attempts:
                 fields["status"] = "unavailable"
             elif previous_status is not None:
                 fields["status"] = previous_status
         self._record_review(run, head, previous=previous_status, **fields)
+
+    def _request_review(
+        self, run: sqlite3.Row, fields: dict[str, Any]
+    ) -> PullRequestReview | None:
+        """Ask Devin for a review of the run's head, once across workers.
+
+        The head is claimed in the store first; a worker that loses the claim
+        makes no request and reads again next tick. A request that fails
+        gives the claim back, so the next read (GET first, which finds any
+        review Devin did accept) may ask again. Returns the review for this
+        head, or None when none is available yet.
+        """
+        run_id = str(run["id"])
+        head = str(run["head_sha"])
+        pr_url = str(run["pr_url"])
+        requested_at = now_iso()
+        claimed = self.store.claim_review_request(
+            run_id=run_id,
+            head_sha=head,
+            env=str(run["env"]),
+            pr_url=pr_url,
+            requested_at=requested_at,
+        )
+        if not claimed:
+            return None
+        try:
+            review = self.devin.request_pr_review(pr_url)
+        except DevinError:
+            self.store.release_review_request(run_id, head)
+            raise
+        fields["requested_at"] = requested_at
+        if review.commit_sha and review.commit_sha != head:
+            # Devin reviews whatever GitHub's latest commit is. If that is not
+            # the head this run knows, GitHub has moved on and the synchronize
+            # delivery will bring the new head, whose row this is; the head
+            # asked about gets no review.
+            self._record_review(
+                run,
+                review.commit_sha,
+                previous=None,
+                status=review.status,
+                requested_at=requested_at,
+                status_at=fields["status_at"],
+            )
+            fields["status"] = "skipped"
+            fields["last_error"] = (
+                f"Devin reviewed newer commit {review.commit_sha[:10]};"
+                " waiting for GitHub to report that head"
+            )
+            return None
+        return review
 
     def _record_review(
         self,

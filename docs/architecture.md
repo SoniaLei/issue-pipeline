@@ -200,8 +200,9 @@ push code and cannot merge — D-005 says the pipeline must not merge, and this
 makes it unable to. Devin pushes its own branch under its own GitHub
 authentication.
 
-Events subscribed: `issues`, `pull_request`, `pull_request_review` and
-`check_suite`. Check suites are recorded per head SHA and folded into a
+Events subscribed: `issues`, `pull_request`, `pull_request_review`,
+`pull_request_review_comment` (the Devin bot's inline findings, counted per
+kind) and `check_suite`. Check suites are recorded per head SHA and folded into a
 per-run `checks_state`; they never drive a transition (D-011), only the
 dashboard's *verified* count (D-030).
 

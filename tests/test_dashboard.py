@@ -468,6 +468,9 @@ def test_dashboard_endpoints(
     assert "Simulation" in page.text
     assert "Live" in page.text
     assert 'const DEFAULT_ENV = "sim";' in page.text
+    # The per-state summary counts PRs; that count must not be drawn as a
+    # finding count on the pill.
+    assert "findings: null, findings_by_kind: {} }), ` ×${n} `" in page.text
 
     default = client.get("/api/dashboard").json()
     assert default["env"] == "sim"

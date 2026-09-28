@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS pr_reviews (
     requested_at    TEXT,                    -- when this worker asked for it
     status_at       TEXT,                    -- last API read
     attempts        INTEGER NOT NULL DEFAULT 0,  -- failed API calls in a row
+    retryable       INTEGER NOT NULL DEFAULT 1,  -- 0: last error was permanent
     last_error      TEXT,
     findings        INTEGER,                 -- from the bot's GitHub review summary
     findings_by_kind TEXT NOT NULL DEFAULT '{{}}',  -- JSON kind -> count
@@ -845,11 +846,40 @@ class Store:
             (*fields.values(), run_id, head_sha),
         )
 
+    def claim_review_request(
+        self, *, run_id: str, head_sha: str, env: str, pr_url: str, requested_at: str
+    ) -> bool:
+        """Mark this head as requested, in its own transaction, before the
+        request leaves the process. Returns False when another worker already
+        holds the claim, so exactly one review is asked for per head."""
+        with self.transaction() as conn:
+            self.upsert_review(
+                conn, run_id=run_id, head_sha=head_sha, env=env, pr_url=pr_url
+            )
+            cursor = conn.execute(
+                "UPDATE pr_reviews SET requested_at = ?"
+                " WHERE run_id = ? AND head_sha = ? AND requested_at IS NULL",
+                (requested_at, run_id, head_sha),
+            )
+            return cursor.rowcount == 1
+
+    def release_review_request(self, run_id: str, head_sha: str) -> None:
+        """Undo a claim whose request failed before Devin accepted it, so the
+        next read may ask again."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE pr_reviews SET requested_at = NULL"
+                " WHERE run_id = ? AND head_sha = ?",
+                (run_id, head_sha),
+            )
+
     def review_candidates(self, env: str) -> list[sqlite3.Row]:
         """Runs whose current PR head still needs a review-gate read: GitHub
         owns the run (pr_open / awaiting_review) and the head has no row, or a
         row whose API status is not terminal, and GitHub has not already
-        delivered the bot's verdict for it. Oldest read first."""
+        delivered the bot's verdict for it. Heads left ``unavailable`` by a
+        permanent error (``retryable = 0``) are not read again. Oldest read
+        first."""
         return list(
             self._conn.execute(
                 """
@@ -867,7 +897,9 @@ class Store:
                   AND runs.pr_url IS NOT NULL AND runs.head_sha IS NOT NULL
                   AND pr_reviews.findings IS NULL
                   AND (pr_reviews.status IS NULL
-                       OR pr_reviews.status IN ('pending', 'running', 'unavailable'))
+                       OR pr_reviews.status IN ('pending', 'running')
+                       OR (pr_reviews.status = 'unavailable'
+                           AND pr_reviews.retryable = 1))
                 ORDER BY pr_reviews.status_at IS NOT NULL, pr_reviews.status_at
                 """,
                 (env,),

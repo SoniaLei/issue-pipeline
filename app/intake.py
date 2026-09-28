@@ -725,7 +725,11 @@ class Intake:
             run_id=run_id,
             task_id=task_id,
             kind="verified",
-            detail={"head_sha": head_sha, "review_gate": gate_state(review, mode)},
+            detail={
+                "head_sha": head_sha,
+                "review_gate": gate_state(review, mode),
+                "mode": mode,
+            },
         )
 
     # --------------------------------------------------------------------- checks

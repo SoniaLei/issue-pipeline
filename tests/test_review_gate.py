@@ -257,13 +257,35 @@ class Flaky(SimulatedDevinClient):
         super().__init__(script=script)
         self.broken = broken
         self.error = DevinError("pr-reviews returned 503", retryable=True)
+        self.reads = 0
 
     def get_pr_review(
         self, pr_url: str, commit_sha: str | None = None
     ) -> PullRequestReview | None:
+        self.reads += 1
         if pr_url == self.broken:
             raise self.error
         return super().get_pr_review(pr_url, commit_sha)
+
+
+class Lagging(SimulatedDevinClient):
+    """Accepts review requests but never shows them on a read, the way the
+    API looks to a second worker before the first request has landed."""
+
+    def __init__(self, script: list[dict[str, Any]]) -> None:
+        super().__init__(script=script)
+        self.request_error: DevinError | None = None
+
+    def get_pr_review(
+        self, pr_url: str, commit_sha: str | None = None
+    ) -> PullRequestReview | None:
+        super().get_pr_review(pr_url, commit_sha)
+        return None
+
+    def request_pr_review(self, pr_url: str) -> PullRequestReview:
+        if self.request_error is not None:
+            raise self.request_error
+        return super().request_pr_review(pr_url)
 
 
 def test_provider_errors_are_recorded_and_give_up_after_the_budget(
@@ -314,7 +336,62 @@ def test_a_non_retryable_error_is_unavailable_at_once(
     assert row is not None
     assert row["status"] == "unavailable"
     assert row["attempts"] == 1
+    assert row["retryable"] == 0
     assert _events(store, run_id) == ["unavailable"]
+
+    # A permission problem does not get better by asking again: the head is
+    # left alone until GitHub delivers a verdict or a new commit arrives.
+    reads = devin.reads
+    for _ in range(quick.review_max_attempts + 2):
+        assert not worker.refresh_review_gate()
+    assert devin.reads == reads
+    (task,) = build_dashboard(store, "sim")["tasks"]
+    assert task["review"]["state"] == "unavailable"
+
+
+def test_two_workers_ask_for_one_review_between_them(
+    store: Store, quick: Settings
+) -> None:
+    devin = Lagging(load_script("simulated_session_events.json"))
+    first = Worker(store, quick, devin, FakeSlackTransport(), owner="w1")
+    second = Worker(store, quick, devin, FakeSlackTransport(), owner="w2")
+    run_id = run_to_pr(Intake(store, quick), first, store)
+
+    # Both see no review for the head; the claim decides who asks.
+    assert first.refresh_review_gate()
+    assert second.refresh_review_gate()
+    assert devin.review_requests == [(PR_URL, HEAD)]
+    row = store.review_for_head(run_id, HEAD)
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["requested_at"] is not None
+
+    # The claim itself is first-writer-wins on the row.
+    assert not store.claim_review_request(
+        run_id=run_id, head_sha=HEAD, env="sim", pr_url=PR_URL, requested_at="x"
+    )
+
+
+def test_a_failed_request_gives_the_claim_back(store: Store, quick: Settings) -> None:
+    devin = Lagging(load_script("simulated_session_events.json"))
+    devin.request_error = DevinError("pr-reviews returned 502", retryable=True)
+    worker = Worker(store, quick, devin, FakeSlackTransport(), owner="w")
+    run_id = run_to_pr(Intake(store, quick), worker, store)
+
+    worker.tick()
+    row = store.review_for_head(run_id, HEAD)
+    assert row is not None
+    assert row["requested_at"] is None
+    assert "502" in str(row["last_error"])
+    assert devin.review_requests == []
+
+    devin.request_error = None
+    worker.tick()
+    assert devin.review_requests == [(PR_URL, HEAD)]
+    row = store.review_for_head(run_id, HEAD)
+    assert row is not None
+    assert row["requested_at"] is not None
+    assert row["status"] == "pending"
 
 
 def test_one_broken_review_does_not_stop_another_run(
