@@ -26,6 +26,11 @@ Two properties of the provider drive the design:
   is set at creation and is the only ceiling that actually holds.
 * `finished` is a *detail* under the `running` status, not a status of its own.
   Reading only `status` never observes a session completing.
+
+The analytics surface (Session Insights, daily consumption, organization PR
+and session metrics) is read through the same client. What it returns is
+the provider's account of its own work — cost, size, what went wrong in its
+view — and is stored and shown as such, never as the outcome of a run.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from __future__ import annotations
 import itertools
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 import httpx
@@ -59,6 +65,61 @@ class SessionSnapshot:
     acus_consumed: float | None = None
     structured_output: dict[str, Any] | None = None
     tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SessionInsights:
+    """Devin's own analysis of one session.
+
+    ``analysis`` is the provider's AI-generated review (issues, action items,
+    skill usage, suggested prompt), present only once the provider has run it;
+    ``analysis_status`` says where that stands. Everything is kept verbatim.
+    """
+
+    session_id: str
+    status: str
+    status_detail: str | None = None
+    acus_consumed: float | None = None
+    session_size: str | None = None
+    category: str | None = None
+    subcategory: str | None = None
+    origin: str | None = None
+    service_user_id: str | None = None
+    num_user_messages: int | None = None
+    num_devin_messages: int | None = None
+    analysis_status: str | None = None
+    analysis: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class DailyConsumption:
+    """Billing-grade ACU usage for one session, one row per billing day.
+
+    Billing days start at midnight Pacific (08:00 UTC); ``by_date`` keeps the
+    provider's day boundary as an ISO timestamp rather than re-bucketing it.
+    """
+
+    total_acus: float
+    by_date: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProviderMetrics:
+    """Organization-level counts for one window and one set of identities.
+
+    These count what Devin saw its sessions do, including sessions this
+    service never tracked. They exist to be compared with the store, not to
+    replace it.
+    """
+
+    prs_created: int
+    prs_opened: int
+    prs_merged: int
+    prs_closed: int
+    sessions_created: int
+    sessions_with_merged_prs: int
+    avg_acus_per_session: float | None
+    sessions_by_size: dict[str, int] = field(default_factory=dict)
 
 
 # Suspension details that mean the organization has a problem, not the task.
@@ -139,6 +200,20 @@ class DevinClient(Protocol):
 
     def send_message(self, session_id: str, message: str) -> None: ...
 
+    def get_session_insights(self, session_id: str) -> SessionInsights: ...
+
+    def request_session_insights(self, session_id: str) -> str: ...
+
+    def get_session_consumption(self, session_id: str) -> DailyConsumption: ...
+
+    def get_provider_metrics(
+        self,
+        *,
+        service_user_ids: list[str],
+        time_after: datetime,
+        time_before: datetime,
+    ) -> ProviderMetrics: ...
+
 
 class DevinError(RuntimeError):
     """A provider call failed in a way the caller must decide about."""
@@ -166,6 +241,58 @@ def _parse_session(data: dict[str, Any]) -> SessionSnapshot:
     )
 
 
+def _parse_insights(data: dict[str, Any]) -> SessionInsights:
+    def _int(value: Any) -> int | None:
+        return int(value) if value is not None else None
+
+    return SessionInsights(
+        session_id=str(data.get("session_id") or data.get("devin_id") or ""),
+        status=str(data.get("status") or "new"),
+        status_detail=data.get("status_detail"),
+        acus_consumed=data.get("acus_consumed"),
+        session_size=data.get("session_size"),
+        category=data.get("category"),
+        subcategory=data.get("subcategory"),
+        origin=data.get("origin"),
+        service_user_id=data.get("service_user_id"),
+        num_user_messages=_int(data.get("num_user_messages")),
+        num_devin_messages=_int(data.get("num_devin_messages")),
+        analysis_status=data.get("analysis_status"),
+        analysis=data.get("analysis"),
+    )
+
+
+def _parse_consumption(data: dict[str, Any]) -> DailyConsumption:
+    rows = []
+    for row in data.get("consumption_by_date") or []:
+        day = row.get("date")
+        if isinstance(day, (int, float)):
+            day = datetime.fromtimestamp(day, tz=timezone.utc).isoformat()
+        rows.append((str(day), float(row.get("acus") or 0.0)))
+    return DailyConsumption(
+        total_acus=float(data.get("total_acus") or 0.0), by_date=tuple(rows)
+    )
+
+
+def _parse_metrics(prs: dict[str, Any], sessions: dict[str, Any]) -> ProviderMetrics:
+    avg = sessions.get("avg_acus_per_session")
+    return ProviderMetrics(
+        prs_created=int(prs.get("prs_created_count") or 0),
+        prs_opened=int(prs.get("prs_opened_count") or 0),
+        prs_merged=int(prs.get("prs_merged_count") or 0),
+        prs_closed=int(prs.get("prs_closed_count") or 0),
+        sessions_created=int(sessions.get("sessions_created_count") or 0),
+        sessions_with_merged_prs=int(
+            sessions.get("sessions_with_merged_prs_count") or 0
+        ),
+        avg_acus_per_session=float(avg) if avg is not None else None,
+        sessions_by_size={
+            str(k): int(v)
+            for k, v in (sessions.get("sessions_created_by_size") or {}).items()
+        },
+    )
+
+
 class LiveDevinClient:
     """The v3 organization API.
 
@@ -176,12 +303,19 @@ class LiveDevinClient:
     get                 ``GET    /sessions/{devin_id}``
     list                ``GET    /sessions``
     message             ``POST   /sessions/{devin_id}/messages``
+    insights            ``GET    /sessions/{devin_id}/insights``
+    generate insights   ``POST   /sessions/{devin_id}/insights/generate``
+    consumption         ``GET    /consumption/daily/sessions/{id}``
+    PR metrics          ``GET    /metrics/prs``
+    session metrics     ``GET    /metrics/sessions``
     ==================  ==========================================
 
     Authentication is a dedicated service user holding ``UseDevinSessions``
     (create) and ``ViewOrgSessions`` (get, list), not an individual's token: an
     unattended pipeline keyed to one person's account stops working the moment
-    their access changes.
+    their access changes. The organization-level analytics endpoints answer to
+    the same token; the ``/v3/enterprise`` variants need ``ViewAccountMetrics``
+    and are not used.
     """
 
     def __init__(
@@ -191,9 +325,14 @@ class LiveDevinClient:
         org_id: str,
         token: str,
         timeout: float = 30.0,
+        analytics_timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._base = f"{base_url.rstrip('/')}/v3/organizations/{org_id}"
+        # Analytics reads share the worker thread with run processing, so
+        # they get a short leash: a slow insights endpoint costs a tick, not
+        # a run.
+        self._analytics_timeout = analytics_timeout
         self._client = httpx.Client(
             timeout=timeout,
             transport=transport,
@@ -279,6 +418,43 @@ class LiveDevinClient:
             "POST", f"/sessions/{session_id}/messages", json={"message": message}
         )
 
+    def _analytics(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        return self._request(method, path, timeout=self._analytics_timeout, **kwargs)
+
+    def get_session_insights(self, session_id: str) -> SessionInsights:
+        return _parse_insights(
+            self._analytics("GET", f"/sessions/{session_id}/insights")
+        )
+
+    def request_session_insights(self, session_id: str) -> str:
+        data = self._analytics("POST", f"/sessions/{session_id}/insights/generate")
+        return str(data.get("status") or "requested")
+
+    def get_session_consumption(self, session_id: str) -> DailyConsumption:
+        return _parse_consumption(
+            self._analytics("GET", f"/consumption/daily/sessions/{session_id}")
+        )
+
+    def get_provider_metrics(
+        self,
+        *,
+        service_user_ids: list[str],
+        time_after: datetime,
+        time_before: datetime,
+    ) -> ProviderMetrics:
+        params: dict[str, Any] = {
+            "service_user_ids": service_user_ids,
+            "time_after": int(time_after.timestamp()),
+            "time_before": int(time_before.timestamp()),
+        }
+        return _parse_metrics(
+            self._analytics("GET", "/metrics/prs", params=params),
+            self._analytics("GET", "/metrics/sessions", params=params),
+        )
+
+
+SIM_SERVICE_USER = "service-user-sim"
+
 
 @dataclass
 class _SimSession:
@@ -288,6 +464,8 @@ class _SimSession:
     script: list[dict[str, Any]]
     position: int = 0
     messages: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    insights_requested: bool = False
 
 
 class SimulatedDevinClient:
@@ -337,11 +515,7 @@ class SimulatedDevinClient:
         return self._snapshot(session, advance=False)
 
     def get_session(self, session_id: str) -> SessionSnapshot:
-        try:
-            session = self._sessions[session_id]
-        except KeyError as exc:
-            raise DevinError(f"unknown session {session_id}", retryable=False) from exc
-        return self._snapshot(session, advance=True)
+        return self._snapshot(self._get(session_id), advance=True)
 
     def find_session_by_tag(self, tag: str) -> SessionSnapshot | None:
         for session in self._sessions.values():
@@ -351,6 +525,90 @@ class SimulatedDevinClient:
 
     def send_message(self, session_id: str, message: str) -> None:
         self._sessions[session_id].messages.append(message)
+
+    def get_session_insights(self, session_id: str) -> SessionInsights:
+        session = self._get(session_id)
+        step = session.script[session.position]
+        finished = step["status"] == "exit" or step.get("status_detail") == "finished"
+        given = step.get("insights") or {}
+        # As with the provider: analysis exists only for a completed session.
+        analysis = given.get("analysis") if finished else None
+        return SessionInsights(
+            session_id=session.session_id,
+            status=step["status"],
+            status_detail=step.get("status_detail"),
+            acus_consumed=step.get("acus_consumed"),
+            session_size=given.get("session_size", "s"),
+            category=given.get("category", "bug_fixing"),
+            subcategory=given.get("subcategory"),
+            origin="api",
+            service_user_id=SIM_SERVICE_USER,
+            num_user_messages=1 + len(session.messages),
+            num_devin_messages=session.position + 1,
+            analysis_status="completed" if analysis is not None else None,
+            analysis=analysis,
+        )
+
+    def request_session_insights(self, session_id: str) -> str:
+        session = self._get(session_id)
+        status = "already_exists" if session.insights_requested else "started"
+        session.insights_requested = True
+        return status
+
+    def get_session_consumption(self, session_id: str) -> DailyConsumption:
+        session = self._get(session_id)
+        acus = float(session.script[session.position].get("acus_consumed") or 0.0)
+        if acus == 0.0:
+            return DailyConsumption(total_acus=0.0)
+        day = session.created_at.replace(hour=8, minute=0, second=0, microsecond=0)
+        return DailyConsumption(total_acus=acus, by_date=((day.isoformat(), acus),))
+
+    def get_provider_metrics(
+        self,
+        *,
+        service_user_ids: list[str],
+        time_after: datetime,
+        time_before: datetime,
+    ) -> ProviderMetrics:
+        if SIM_SERVICE_USER not in service_user_ids:
+            return ProviderMetrics(0, 0, 0, 0, 0, 0, None)
+        sessions = [
+            s
+            for s in self._sessions.values()
+            if time_after <= s.created_at <= time_before
+        ]
+        prs_by_session = {
+            s.session_id: [
+                pr
+                for pr in s.script[s.position].get("pull_requests") or []
+                if pr.get("pr_url")
+            ]
+            for s in sessions
+        }
+        prs = [pr for group in prs_by_session.values() for pr in group]
+        acus = [
+            float(s.script[s.position].get("acus_consumed") or 0.0) for s in sessions
+        ]
+        return ProviderMetrics(
+            prs_created=len(prs),
+            prs_opened=len([pr for pr in prs if pr.get("pr_state") == "open"]),
+            prs_merged=len([pr for pr in prs if pr.get("pr_state") == "merged"]),
+            prs_closed=len([pr for pr in prs if pr.get("pr_state") == "closed"]),
+            sessions_created=len(sessions),
+            sessions_with_merged_prs=sum(
+                1
+                for group in prs_by_session.values()
+                if any(pr.get("pr_state") == "merged" for pr in group)
+            ),
+            avg_acus_per_session=(sum(acus) / len(acus)) if acus else None,
+            sessions_by_size={"s": len(sessions)} if sessions else {},
+        )
+
+    def _get(self, session_id: str) -> _SimSession:
+        try:
+            return self._sessions[session_id]
+        except KeyError as exc:
+            raise DevinError(f"unknown session {session_id}", retryable=False) from exc
 
     def _snapshot(self, session: _SimSession, *, advance: bool) -> SessionSnapshot:
         if advance and session.position < len(session.script) - 1:

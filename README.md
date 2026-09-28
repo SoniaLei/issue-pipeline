@@ -192,6 +192,50 @@ It only knows about runs *this service* tracked. Sessions started by the Devin
 Automations are not in its store, so until the service is hosted the Live page
 is empty by construction.
 
+### Devin analytics: cost, efficiency and a cross-check
+
+Beside GitHub's facts the dashboard shows what Devin says about the same runs,
+read by the worker from the organization analytics endpoints and stored per
+environment (`session_insights`, `provider_metrics`). Everything from this
+source is labelled **Devin analytics** / **provider** on the page; none of it
+changes a run's state or outcome.
+
+**Cost & efficiency** — total ACUs, ACUs per PR opened / verified / merged,
+median and p90 per run, spend on terminal runs that produced no PR, the
+session-size distribution (XS–XL, with the L+XL share as the provider's own
+"this ran long" signal), categories, and the action items and skill usage from
+Devin's session analysis. Each ACU figure names its source: `billing` (daily
+consumption, billing-grade, published at Pacific midnight and often hours
+late), `session` (the insights total) or `poll` (the last snapshot the worker
+saw). A session the provider has not priced yet is counted under *awaiting
+cost* and shown as *pending* — never as zero, and never in a ratio: ACUs per PR
+is `—` until at least one session is priced. Sample counts sit next to every
+ratio.
+
+**Provider cross-check** in Integration health — Devin's `metrics/sessions` and
+`metrics/prs` counts for the pipeline's service user, over a window covering
+every run, beside the pipeline's own counts from GitHub. Equal counts read
+`ok`; any difference reads `drift` with the per-line delta. GitHub stays
+authoritative: a gap is reported, not reconciled. The counts are only requested
+once a session has reported which service user it ran as, so a human's
+sessions in the same org are never counted as pipeline work.
+
+**Devin's account** in the timeline drawer — per run: ACUs and source, daily
+consumption, size, category, message counts, analysis status, and the analysis
+itself (issues, action items by type, good and bad skill uses, suggested
+prompt). Analysis is requested once for finished sessions the provider did not
+analyse on its own.
+
+Analytics never compete with runs: the worker makes one analytics read (a
+single session, or the org counts) only on a tick that had no run to advance,
+with a shorter per-request timeout than session calls. It re-reads a run when
+its state or session status moves and otherwise every
+`INSIGHTS_REFRESH_SECONDS`, and keeps reading a terminal run for
+`INSIGHTS_SETTLE_SECONDS` so late billing and analysis land — after that the
+run is left as it stands, analysed or not. A failed read is stored as
+`last_error` beside the last good figures and their window, and shown on the
+page. `ANALYTICS_ENABLED=false` switches all of it off.
+
 ## Configuration
 
 Everything is environment configuration; nothing is derived from issue or PR
@@ -203,6 +247,13 @@ The two that decide whether anything happens at all:
   any other repository is acknowledged and dropped.
 - `MAINTAINER_ALLOWLIST` — GitHub logins whose `devin-ready` label is treated
   as authorization to spend. Nobody else's is.
+
+Analytics: `ANALYTICS_ENABLED` (default `true`), `INSIGHTS_REFRESH_SECONDS`
+(600), `INSIGHTS_SETTLE_SECONDS` (86400), `METRICS_REFRESH_SECONDS` (300). The
+same `DEVIN_API_TOKEN` is used; the organization-level analytics endpoints
+answered to the service user's existing `UseDevinSessions` + `ViewOrgSessions`
+when probed, and the `/v3/enterprise` variants (which need
+`ViewAccountMetrics`) are not used.
 
 ## Testing
 
