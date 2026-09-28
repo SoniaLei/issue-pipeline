@@ -152,3 +152,23 @@ def test_events_for_other_repositories_are_dropped(
     assert not result.accepted
     assert result.reason == "repository not allowlisted"
     assert store.list_tasks() == []
+
+
+def test_later_events_by_a_maintainer_do_not_adopt_an_untrusted_label(
+    intake: Intake, store: Store
+) -> None:
+    rejected = deliver(intake, "issues", "issue_labeled_untrusted.json")
+    assert not rejected.accepted
+    for action, label in (("edited", None), ("labeled", "bug"), ("reopened", None)):
+        payload = load_fixture("issue_labeled.json")
+        payload["action"] = action
+        if label is None:
+            payload.pop("label", None)
+        else:
+            payload["label"] = {"name": label}
+        result = intake.handle(
+            delivery_id=next_delivery_id(), event="issues", payload=payload
+        )
+        assert "queued" not in result.reason, action
+        run = store.active_run_for_task(int(rejected.task_id or 0))
+        assert run is None or run["state"] == State.AWAITING_APPROVAL.value, action

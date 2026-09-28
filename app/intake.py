@@ -208,11 +208,17 @@ class Intake:
 
         approved = self.settings.approval_label in labels
         sender = str((payload.get("sender") or {}).get("login", ""))
+        added = str((payload.get("label") or {}).get("name", ""))
+        # Only the event that applies the label (or opens the issue with it)
+        # carries the actor who put it there (D-001).
+        authorizing = action == "opened" or (
+            action == "labeled" and added == self.settings.approval_label
+        )
 
         if action in {"opened", "reopened", "edited", "labeled", "unlabeled", "closed"}:
             if action == "closed":
                 return self._maybe_cancel(conn, task_id, repo, "issue closed", sender)
-            if approved:
+            if approved and authorizing:
                 # `opened` with the label already present is treated exactly
                 # like a label event: the authorization question is the same
                 # one, and answering it differently is how a public repository
