@@ -76,6 +76,9 @@ def build_report(store: Store) -> dict[str, Any]:
                 "state": str(row["state"]),
                 "attempts": int(row["attempts"]),
                 "last_error": row["last_error"],
+                "threaded": row["thread_ts"] is not None,
+                "reaction": row["reaction"],
+                "reaction_error": row["reaction_error"],
             }
             for row in store.notifications_for_task(task_id)
         ]
@@ -124,9 +127,15 @@ def render_text(report: dict[str, Any]) -> str:
                 f" acus={run['acus_consumed']:.1f} {pr}"
             )
         for note in task["notifications"]:
+            placement = " in-thread" if note["threaded"] else ""
+            reaction = ""
+            if note["reaction"]:
+                reaction = f" reaction=:{note['reaction']}:"
+                if note["reaction_error"]:
+                    reaction += f" (failed: {note['reaction_error']})"
             lines.append(
                 f"  note {note['kind']} -> {note['destination']} {note['state']}"
-                f" attempts={note['attempts']}"
+                f" attempts={note['attempts']}{placement}{reaction}"
             )
         lines.append("")
     return "\n".join(lines)

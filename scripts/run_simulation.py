@@ -24,8 +24,11 @@ http://127.0.0.1:8000/dashboard afterwards, so the page can be looked at with
 real (simulated) data behind it.
 
 `--live-slack` posts those same messages to the real channel behind
-SLACK_WEBHOOK_ENGINEERING_UPDATES. Devin stays simulated either way, so the
-notification path can be proven against a real destination without an ACU.
+SLACK_WEBHOOK_ENGINEERING_UPDATES. `--live-slack-bot` posts them with the bot
+token in SLACK_BOT_TOKEN to the channel id in SLACK_CHANNEL_ENGINEERING_UPDATES,
+so the PR thread and its reactions can be seen for real (D-036). Devin stays
+simulated either way, so the notification path can be proven against a real
+destination without an ACU.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from app.intake import Intake  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.reporting import build_report, render_text  # noqa: E402
 from app.slack_client import (  # noqa: E402
+    BotSlackTransport,
     FakeSlackTransport,
     LiveSlackTransport,
     SlackTransport,
@@ -95,6 +99,26 @@ def destinations(live: bool) -> dict[str, str]:
     }
 
 
+def channels() -> dict[str, str]:
+    """Resolve channel ids by logical key for the bot transport."""
+    engineering = os.environ.get("SLACK_CHANNEL_ENGINEERING_UPDATES", "")
+    if not engineering:
+        raise SystemExit("SLACK_CHANNEL_ENGINEERING_UPDATES is not set")
+    return {
+        "engineering-updates": engineering,
+        "automation-alerts": os.environ.get(
+            "SLACK_CHANNEL_AUTOMATION_ALERTS", engineering
+        ),
+    }
+
+
+def bot_transport() -> BotSlackTransport:
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        raise SystemExit("SLACK_BOT_TOKEN is not set")
+    return BotSlackTransport(token)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the simulated pipeline.")
     parser.add_argument(
@@ -103,25 +127,39 @@ def main() -> None:
         help="post to the real channel behind SLACK_WEBHOOK_ENGINEERING_UPDATES",
     )
     parser.add_argument(
+        "--live-slack-bot",
+        action="store_true",
+        help="post with SLACK_BOT_TOKEN to SLACK_CHANNEL_ENGINEERING_UPDATES"
+        " (threads + reactions)",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="serve /dashboard on 127.0.0.1:8000 over the simulated data afterwards",
     )
     args = parser.parse_args()
+    if args.live_slack and args.live_slack_bot:
+        parser.error("--live-slack and --live-slack-bot are exclusive")
 
     settings = Settings(
         github_webhook_secret="simulation",
         repo_allowlist=frozenset({REPO.lower()}),
         maintainer_allowlist=frozenset({"sonialei"}),
         database_path=":memory:",
+        slack_transport="bot" if args.live_slack_bot else "webhook",
         slack_destinations=destinations(args.live_slack),
+        slack_channels=channels() if args.live_slack_bot else {},
         review_poll_seconds=0,
     )
     store = Store(settings.database_path)
     intake = Intake(store, settings)
-    slack: SlackTransport = (
-        LiveSlackTransport() if args.live_slack else FakeSlackTransport()
-    )
+    slack: SlackTransport
+    if args.live_slack_bot:
+        slack = bot_transport()
+    elif args.live_slack:
+        slack = LiveSlackTransport()
+    else:
+        slack = FakeSlackTransport()
     with open(FIXTURES / "simulated_session_events.json", encoding="utf-8") as handle:
         script = json.load(handle)
     worker = Worker(
@@ -200,9 +238,13 @@ def main() -> None:
     print(render_text(build_report(store)))
     if isinstance(slack, FakeSlackTransport):
         print("Slack messages that would have been sent:")
-        for _, payload in slack.sent:
+        for (_, payload), thread_ts in zip(slack.sent, slack.thread_of, strict=True):
             body = str(payload["blocks"][0]["text"]["text"])
-            print("     " + body.replace("\n", "\n     "))
+            where = "  (in PR thread)" if thread_ts else ""
+            print("     " + body.replace("\n", "\n     ") + where)
+        if slack.reactions:
+            names = " ".join(f":{name}:" for _, _, name in slack.reactions)
+            print(f"     reactions on the PR opened post: {names}")
 
     print()
     print_dashboard(store)

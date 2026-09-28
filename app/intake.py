@@ -65,6 +65,9 @@ OPEN_ACTIONS = frozenset(
 # `synchronize` and `edited` update the record without announcing anything: a
 # message per commit is how a channel gets muted.
 NOTIFYING_OPEN_ACTIONS = frozenset({"opened", "reopened", "ready_for_review"})
+# Human review outcomes worth a line in the PR's thread. A bare comment is
+# conversation, not a verdict.
+HUMAN_REVIEW_OUTCOMES = frozenset({"approved", "changes_requested"})
 
 
 def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
@@ -272,6 +275,32 @@ class Intake:
                 return IntakeResult(
                     True, "run queued", task_id=task_id, run_id=str(existing["id"])
                 )
+            if existing["approval_revoked_at"]:
+                # Approval was withdrawn mid-flight and an authorized maintainer
+                # has put the label back. The session was never stopped, so
+                # nothing restarts; the run simply stands approved again.
+                self.store.update_run(
+                    conn,
+                    str(existing["id"]),
+                    approved_by=sender,
+                    approved_at=now_iso(),
+                    approval_revoked_by=None,
+                    approval_revoked_at=None,
+                )
+                self.store.record_event(
+                    conn,
+                    run_id=str(existing["id"]),
+                    task_id=task_id,
+                    kind="approval",
+                    reason="reinstated",
+                    detail={"by": sender, "action": action},
+                )
+                return IntakeResult(
+                    True,
+                    "approval reinstated",
+                    task_id=task_id,
+                    run_id=str(existing["id"]),
+                )
             # A redelivered label event, or a second label application while a
             # run is in flight. Neither is a new authorization.
             return IntakeResult(
@@ -321,11 +350,12 @@ class Intake:
             )
             return IntakeResult(True, "run cancelled", task_id=task_id, run_id=run_id)
 
+        revoked_at = now_iso()
         self.store.update_run(
             conn,
             run_id,
             approval_revoked_by=sender,
-            approval_revoked_at=now_iso(),
+            approval_revoked_at=revoked_at,
         )
         self._notify(
             conn,
@@ -333,7 +363,7 @@ class Intake:
             run_id=run_id,
             kind=Kind.NEEDS_HUMAN,
             reason="approval_revoked",
-            revision=run_id,
+            revision=f"{run_id}:{revoked_at}",
         )
         return IntakeResult(
             True,
@@ -606,11 +636,21 @@ class Intake:
             kind="review",
             reason=review_state,
             detail={
-                "reviewer": str((review.get("user") or {}).get("login") or ""),
+                "reviewer": reviewer,
                 "url": review.get("html_url"),
                 "commit": review.get("commit_id"),
             },
         )
+        if action == "submitted" and review_state in HUMAN_REVIEW_OUTCOMES:
+            self._notify(
+                conn,
+                task_id=int(run["task_id"]),
+                run_id=str(run["id"]),
+                kind=Kind.HUMAN_REVIEW,
+                reason=review_state,
+                revision=str(review.get("id") or review.get("commit_id") or ""),
+                detail=f"by {reviewer}" if reviewer else None,
+            )
         return IntakeResult(
             True,
             f"review {action} recorded",
@@ -655,6 +695,17 @@ class Intake:
             },
         )
         if commit == run["head_sha"]:
+            if findings > 0:
+                self._notify(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    kind=Kind.REVIEW_FINDINGS,
+                    reason=None,
+                    revision=commit,
+                    detail=f"{findings} finding{'s' if findings != 1 else ''}"
+                    f" on {commit[:10]}",
+                )
             self._record_verified_if_due(conn, run_id, task_id, commit)
         return IntakeResult(
             True, "Devin Review verdict recorded", task_id=task_id, run_id=run_id
@@ -731,6 +782,14 @@ class Intake:
                 "mode": mode,
             },
         )
+        self._notify(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            kind=Kind.VERIFIED,
+            reason=None,
+            revision=head_sha,
+        )
 
     # --------------------------------------------------------------------- checks
 
@@ -739,10 +798,11 @@ class Intake:
     ) -> IntakeResult:
         """Observe check suites for a tracked head.
 
-        Observation only: the derived verdict feeds the report and the
-        dashboard. It moves no state and sends no message — D-011 keeps
-        check-derived notifications out of v1, and this records what a
-        notification would later be based on.
+        The derived verdict feeds the report and the dashboard and moves no
+        state. The only message it produces is on the head's transition into
+        *failed* (D-036): one per head, never one per suite, and never for
+        pending or passed — passing is announced by *verified*, which also
+        needs the review gate.
         """
         suite = payload.get("check_suite") or {}
         head_sha = str(suite.get("head_sha") or "")
@@ -803,6 +863,8 @@ class Intake:
                 self._record_verified_if_due(
                     conn, run_id, int(run["task_id"]), head_sha
                 )
+            elif after == "failed" and before != "failed":
+                self._notify_checks_failed(conn, run, head_sha)
         return IntakeResult(
             True,
             f"check suite {action} recorded",
@@ -840,6 +902,26 @@ class Intake:
         )
         if after == "passed":
             self._record_verified_if_due(conn, run_id, task_id, head_sha)
+        elif after == "failed":
+            run = self.store.get_run(run_id)
+            if run is not None:
+                self._notify_checks_failed(conn, run, head_sha)
+
+    def _notify_checks_failed(
+        self, conn: sqlite3.Connection, run: sqlite3.Row, head_sha: str
+    ) -> None:
+        if run["head_sha"] != head_sha:
+            # A failure on a superseded head is history, not news.
+            return
+        self._notify(
+            conn,
+            task_id=int(run["task_id"]),
+            run_id=str(run["id"]),
+            kind=Kind.CHECKS_FAILED,
+            reason=None,
+            revision=head_sha,
+            detail=f"on {head_sha[:10]}",
+        )
 
     # --------------------------------------------------------------- notifications
 

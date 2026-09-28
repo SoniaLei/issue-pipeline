@@ -31,6 +31,41 @@ class Kind(str, Enum):
     NEEDS_HUMAN = "needs_human"
     PR_MERGED = "pr_merged"
     PR_CLOSED = "pr_closed"
+    CHECKS_FAILED = "checks_failed"
+    REVIEW_FINDINGS = "review_findings"
+    HUMAN_REVIEW = "human_review"
+
+
+# Everything after the PR exists is a follow-up on the run's "PR opened"
+# message: a thread reply, plus a reaction on the anchor so the channel reads
+# the PR's fate without opening the thread. The anchor itself and the states
+# before a PR exists stay top-level.
+_ANCHOR_REACTIONS: dict[Kind, str] = {
+    Kind.READY_FOR_REVIEW: "eyes",
+    Kind.VERIFIED: "large_green_circle",
+    Kind.PR_MERGED: "white_check_mark",
+    Kind.PR_CLOSED: "no_entry_sign",
+    Kind.CHECKS_FAILED: "red_circle",
+    Kind.REVIEW_FINDINGS: "mag",
+    Kind.NEEDS_HUMAN: "warning",
+}
+
+_HUMAN_REVIEW_REACTIONS = {
+    "approved": "thumbsup",
+    "changes_requested": "pencil2",
+}
+
+
+def anchor_reaction(kind: Kind, reason: str | None) -> str | None:
+    """Emoji name to add to the run's anchor for this kind, or None."""
+    if kind is Kind.HUMAN_REVIEW:
+        return _HUMAN_REVIEW_REACTIONS.get(reason or "")
+    return _ANCHOR_REACTIONS.get(kind)
+
+
+def is_follow_up(kind: Kind) -> bool:
+    """Whether a kind belongs in the anchor's thread rather than top-level."""
+    return kind is not Kind.PR_OPENED
 
 
 # Reasons carried by needs_human. `capacity` is owned by whoever runs the
@@ -75,7 +110,9 @@ _KIND_EMOJI = {
     Kind.READY_FOR_REVIEW: ":eyes:",
     Kind.VERIFIED: ":large_green_circle:",
     Kind.PR_MERGED: ":white_check_mark:",
-    Kind.PR_CLOSED: ":x:",
+    Kind.PR_CLOSED: ":no_entry_sign:",
+    Kind.CHECKS_FAILED: ":red_circle:",
+    Kind.REVIEW_FINDINGS: ":mag:",
 }
 
 _CHECKS_EMOJI = {
@@ -90,6 +127,8 @@ def _emoji(kind: Kind, reason: str | None) -> str:
         # An operator problem and a stuck session both need a human, but not
         # the same human.
         return ":rotating_light:" if destination_is_operator(reason) else ":warning:"
+    if kind is Kind.HUMAN_REVIEW:
+        return ":thumbsup:" if reason == "approved" else ":pencil2:"
     return _KIND_EMOJI.get(kind, ":bell:")
 
 
@@ -193,6 +232,20 @@ def _headline(
         return f"PR merged: {title}", "none — merged, not deployed"
     if kind is Kind.PR_CLOSED:
         return f"PR closed without merging: {title}", "decide whether to re-run"
+    if kind is Kind.CHECKS_FAILED:
+        return (
+            f"Checks failed on latest head: {title}",
+            "open the failing check on GitHub — a new push re-evaluates",
+        )
+    if kind is Kind.REVIEW_FINDINGS:
+        return (
+            f"Devin Review found issues: {title}",
+            "read the review on the PR; fix or dismiss before merging",
+        )
+    if kind is Kind.HUMAN_REVIEW:
+        if reason == "approved":
+            return f"PR approved by a reviewer: {title}", "merge when checks allow"
+        return f"Reviewer requested changes: {title}", "address the review"
     return _needs_human_headline(title, reason)
 
 

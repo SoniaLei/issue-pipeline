@@ -577,7 +577,10 @@ async function openTimeline(taskId) {
   for (const n of t.notifications) {
     const at = n.sent_at || n.at;
     items.push([at, el("li", { class: n.state === "failed" ? "bad" : "note" }, [el("time", { text: fmtTime(at), datetime: at }),
-      `Slack ${n.kind} → ${n.destination}: ${n.state} (${n.attempts} attempt${n.attempts === 1 ? "" : "s"})`, n.last_error ? ` · ${n.last_error}` : ""])]);
+      `Slack ${n.kind} → ${n.destination}: ${n.state} (${n.attempts} attempt${n.attempts === 1 ? "" : "s"})`,
+      n.threaded ? " · in PR thread" : "",
+      n.reaction ? (n.reaction_error ? ` · reaction :${n.reaction}: failed: ${n.reaction_error}` : ` · reacted :${n.reaction}:`) : "",
+      n.last_error ? ` · ${n.last_error}` : ""])]);
   }
   // Lexicographic on the ISO string: Date() would drop the microseconds that
   // separate a Slack send from the next event.

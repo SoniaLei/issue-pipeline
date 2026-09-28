@@ -107,9 +107,16 @@ class Settings:
     devin_secret_ids: tuple[str, ...] = ()
 
     slack_mode: str = "fake"
-    # Logical destination key -> secret webhook URL. A destination is only ever
-    # chosen by key, never by anything a user can write.
+    # webhook: incoming-webhook URLs, top-level messages only.
+    # bot: chat.postMessage with a bot token; PR-lifecycle updates thread under
+    # and react to the run's "PR opened" post.
+    slack_transport: str = "webhook"
+    slack_bot_token: str = ""
+    # Logical destination key -> secret webhook URL (webhook transport) or
+    # channel ID (bot transport). A destination is only ever chosen by key,
+    # never by anything a user can write.
     slack_destinations: dict[str, str] = field(default_factory=dict)
+    slack_channels: dict[str, str] = field(default_factory=dict)
     repo_destinations: dict[str, str] = field(default_factory=dict)
     default_destination: str = "engineering-updates"
     operator_destination: str = "automation-alerts"
@@ -167,6 +174,38 @@ class Settings:
         except KeyError as exc:
             raise ConfigError(f"no webhook URL configured for {destination!r}") from exc
 
+    def slack_target_for(self, destination: str) -> str:
+        """What the transport posts to for a logical destination."""
+        if self.slack_transport == "bot":
+            try:
+                return self.slack_channels[destination]
+            except KeyError as exc:
+                raise ConfigError(
+                    f"no Slack channel configured for {destination!r}"
+                ) from exc
+        return self.webhook_url_for(destination)
+
+
+def _choice(name: str, default: str, allowed: frozenset[str]) -> str:
+    value = os.environ.get(name, default).lower()
+    if value not in allowed:
+        options = ", ".join(repr(option) for option in sorted(allowed))
+        raise ConfigError(f"{name} must be one of {options}")
+    return value
+
+
+def _check_slack_live(settings: Settings) -> None:
+    if settings.slack_mode != "live":
+        return
+    if settings.slack_transport == "bot":
+        if not (settings.slack_bot_token and settings.slack_channels):
+            raise ConfigError(
+                "SLACK_MODE=live with SLACK_TRANSPORT=bot requires"
+                " SLACK_BOT_TOKEN and SLACK_CHANNELS"
+            )
+    elif not settings.slack_destinations:
+        raise ConfigError("SLACK_MODE=live requires SLACK_DESTINATIONS")
+
 
 def load_settings() -> Settings:
     """Build settings from the environment, failing loudly on bad input."""
@@ -174,17 +213,16 @@ def load_settings() -> Settings:
     if not secret:
         raise ConfigError("GITHUB_WEBHOOK_SECRET is required")
 
-    devin_mode = os.environ.get("DEVIN_MODE", "sim").lower()
-    if devin_mode not in {"sim", "live"}:
-        raise ConfigError("DEVIN_MODE must be 'sim' or 'live'")
-    slack_mode = os.environ.get("SLACK_MODE", "fake").lower()
-    if slack_mode not in {"fake", "live"}:
-        raise ConfigError("SLACK_MODE must be 'fake' or 'live'")
-    review_gate_mode = os.environ.get(
-        "REVIEW_GATE_MODE", DEFAULT_REVIEW_GATE_MODE
-    ).lower()
-    if review_gate_mode not in {"off", "advisory", "required"}:
-        raise ConfigError("REVIEW_GATE_MODE must be 'off', 'advisory' or 'required'")
+    devin_mode = _choice("DEVIN_MODE", "sim", frozenset({"sim", "live"}))
+    slack_mode = _choice("SLACK_MODE", "fake", frozenset({"fake", "live"}))
+    slack_transport = _choice(
+        "SLACK_TRANSPORT", "webhook", frozenset({"webhook", "bot"})
+    )
+    review_gate_mode = _choice(
+        "REVIEW_GATE_MODE",
+        DEFAULT_REVIEW_GATE_MODE,
+        frozenset({"off", "advisory", "required"}),
+    )
 
     settings = Settings(
         github_webhook_secret=secret,
@@ -205,7 +243,10 @@ def load_settings() -> Settings:
         devin_playbook_id=os.environ.get("DEVIN_PLAYBOOK_ID", ""),
         devin_secret_ids=tuple(_split(os.environ.get("DEVIN_SECRET_IDS", ""))),
         slack_mode=slack_mode,
+        slack_transport=slack_transport,
+        slack_bot_token=os.environ.get("SLACK_BOT_TOKEN", ""),
         slack_destinations=_parse_map(os.environ.get("SLACK_DESTINATIONS", "")),
+        slack_channels=_parse_map(os.environ.get("SLACK_CHANNELS", "")),
         repo_destinations=_parse_map(os.environ.get("REPO_DESTINATIONS", "")),
         default_destination=os.environ.get(
             "DEFAULT_DESTINATION", "engineering-updates"
@@ -248,6 +289,5 @@ def load_settings() -> Settings:
         settings.devin_org_id and settings.devin_api_token
     ):
         raise ConfigError("DEVIN_MODE=live requires DEVIN_ORG_ID and DEVIN_API_TOKEN")
-    if slack_mode == "live" and not settings.slack_destinations:
-        raise ConfigError("SLACK_MODE=live requires SLACK_DESTINATIONS")
+    _check_slack_live(settings)
     return settings

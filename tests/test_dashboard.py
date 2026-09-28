@@ -150,7 +150,11 @@ def test_checks_passing_on_the_current_head_verifies(
     assert [e["kind"] for e in store.events_for_run(run_id)][-1] == "verified"
     # The state machine is untouched: verification is a report-time fact.
     assert run["state"] == State.PR_OPEN.value
-    assert [row["kind"] for row in store.all_notifications()] == ["pr_opened"]
+    # Verification is announced once, in the PR's thread; checks alone were not.
+    assert [row["kind"] for row in store.all_notifications()] == [
+        "pr_opened",
+        "verified",
+    ]
 
 
 def test_a_failing_suite_fails_the_head_whatever_else_passed(

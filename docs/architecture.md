@@ -604,16 +604,24 @@ pipeline does not call `remediate` and nothing they propose merges on its own.
 
 ### Transport
 
-A Slack app with Incoming Webhooks enabled, one secret webhook URL per
-destination channel.
+Two transports, chosen by `SLACK_TRANSPORT`:
 
-An incoming webhook is bound to the channel it was authorized for, and a payload
-cannot redirect it. That property is a security feature here, and the design
-leans on it: each allowlisted repository maps to an approved **destination key**,
-and only the key resolves to a secret URL. A destination is never derived from
-issue or PR content — untrusted text from a public repository must not be able
-to influence where a message goes, and cannot name a channel that is not already
-in the configuration.
+- **`webhook`** — a Slack app with Incoming Webhooks enabled, one secret
+  webhook URL per destination (`SLACK_DESTINATIONS`). Top-level messages only:
+  a webhook returns no message id, so it can neither thread nor react.
+- **`bot`** — the same app installed with a bot token (`SLACK_BOT_TOKEN`,
+  scopes `chat:write` and `reactions:write`), one channel id per destination
+  (`SLACK_CHANNELS`). `chat.postMessage` returns the message `ts`, which
+  enables the threaded lifecycle below (D-036). The bot must be invited to
+  each channel.
+
+In both, each allowlisted repository maps to an approved **destination key**,
+and only the key resolves to a URL or channel id. A destination is never
+derived from issue or PR content — untrusted text from a public repository
+must not be able to influence where a message goes, and cannot name a channel
+that is not already in the configuration. With webhooks Slack enforces this
+(the URL is bound to its channel); with the bot the configuration map is the
+only resolver and there is no code path from payload to channel.
 
 Suggested destination keys: `engineering-updates` and `automation-alerts`. These
 are logical routes in configuration, not channels to create or post to without
@@ -626,12 +634,55 @@ explicit setting.
 
 | Event | Message | Delivery rule |
 | --- | --- | --- |
-| Tracked PR opened | PR opened, draft state, current checks | Immediately, even with checks pending |
+| Tracked PR opened | PR opened, draft state, current checks | Immediately, even with checks pending. **Anchor** for everything below |
 | Draft → ready | Ready-for-review intent | Must not imply CI passed |
-| Verification passed | Verified, ready for human review | Requires latest-head checks and evidence; **gated off in v1**, see D-011 |
+| Checks fail on the current head | Failed, next action | Once per head, on the first `failed` derivation; superseded heads are silent (D-036 amends D-011) |
+| Devin Review finds issues | Finding count, next action | Once per head, from the bot's review on GitHub |
+| Verification passed | Verified, ready for human review | Checks passed and review gate satisfied on the current head, once per head |
+| Human review submitted | Approved / changes requested, by whom | Once per review id; comments alone are not announced |
 | Run blocks or fails | Reason and required action | On state transition only, never per poll |
 | PR merged | Merged, merge SHA, issue reference | Requires GitHub `merged=true` |
 | PR closed unmerged | Closed without merge | Distinct from success |
+
+### Threads and reactions (D-036)
+
+A channel that receives every lifecycle event as a separate line is unread.
+With the bot transport the run's *PR opened* message is its **anchor**: the
+worker stores the channel and `ts` Slack returned on the outbox row, and every
+later message for the same run and destination is posted as a reply in that
+thread (`thread_ts`) and adds one reaction to the anchor. The channel reads one
+line per PR whose emoji tell its fate; the thread holds the record.
+
+| Follow-up | Reaction on the anchor |
+| --- | --- |
+| Ready for review | :eyes: |
+| Checks failed | :red_circle: |
+| Devin Review findings | :mag: |
+| Verified | :large_green_circle: |
+| Human approved / changes requested | :thumbsup: / :pencil2: |
+| Needs human | :warning: |
+| Merged | :white_check_mark: |
+| Closed unmerged | :no_entry_sign: |
+
+Rules, in order:
+
+1. **Anchor pending → follow-up waits.** If the *PR opened* row is still
+   `pending` (retrying), follow-ups for that run are left in the outbox until
+   it is sent, so the thread is never started by its second message.
+2. **No usable anchor → top-level.** Webhook transport, an anchor that failed
+   for good, or rows from before anchors existed: the follow-up is sent as an
+   ordinary message rather than lost. Messages before a PR exists (session
+   started, needs-human while running) are always top-level.
+3. **Reaction is best effort, once.** It runs after the reply is recorded as
+   sent; a failure (`missing_scope`, channel access) is stored on the reply's
+   row and shown in the timeline, not retried — the reply already carries the
+   information. `already_reacted` is success.
+4. **Slack holds no state GitHub does not.** The anchor is a place to put
+   words. No run transition, verification or dashboard fact reads it, and a
+   lost anchor changes nothing but message placement.
+
+Suppression fingerprints (below) are unchanged: threading decides *where* a
+message goes, fingerprints decide *whether* it goes at all.
 
 "Ready for review" is a draft-status change and says nothing about quality.
 Missing checks are reported as `unknown`, never as passed. These two are the
@@ -697,9 +748,12 @@ Two independence properties:
 ### Connection checklist
 
 1. Agree workspace and exact channels with the owner.
-2. Create or reuse an approved Slack app, enable Incoming Webhooks.
-3. Authorize a webhook per destination.
-4. Store URLs as secrets; configure repository → destination routing.
+2. Create or reuse an approved Slack app. Webhook transport: enable Incoming
+   Webhooks. Bot transport: add bot scopes `chat:write` and `reactions:write`,
+   install to the workspace, invite the bot to each channel.
+3. Authorize a webhook per destination, or note each channel's id (`C…`).
+4. Store the webhook URLs or the bot token as secrets; configure
+   repository → destination routing and destination → URL/channel.
 5. Verify formatting against a local fake endpoint first.
 6. Send a live test only after the owner authorizes that specific destination.
 7. Confirm delivery and error reporting without exposing the URLs.
@@ -820,6 +874,9 @@ CREATE TABLE outbox (
     run_id         TEXT REFERENCES runs(id),
     kind           TEXT NOT NULL,            -- pr_opened | ready_for_review | verified
                                              -- | needs_human | pr_merged | pr_closed
+                                             -- | checks_failed | review_findings
+                                             -- | human_review (reason: approved
+                                             --   | changes_requested)
                                              -- needs_human carries a reason:
                                              -- blocked | no_output | expired | failed
                                              -- | capacity | acu_limit | scope
@@ -836,7 +893,15 @@ CREATE TABLE outbox (
     last_response  TEXT,                     -- Slack response, never the URL
     last_error     TEXT,
     created_at     TEXT NOT NULL,
-    sent_at        TEXT
+    sent_at        TEXT,
+    -- Bot transport only (D-036). The pr_opened row's channel and ts make it
+    -- the run's anchor; follow-ups record the thread they joined and the
+    -- reaction they added to it. NULL under the webhook transport.
+    slack_channel  TEXT,
+    slack_ts       TEXT,
+    thread_ts      TEXT,
+    reaction       TEXT,
+    reaction_error TEXT
 );
 CREATE INDEX idx_outbox_pending ON outbox(state, next_attempt_at);
 ```
