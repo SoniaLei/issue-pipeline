@@ -36,7 +36,13 @@ from app.slack_client import FakeSlackTransport
 from app.states import State
 from app.store import Store
 from app.worker import Worker
-from tests.conftest import deliver, load_script
+from tests.conftest import (
+    deliver,
+    load_fixture,
+    load_script,
+    next_delivery_id,
+    substitute_run_id,
+)
 
 
 def queued(intake: Intake) -> str:
@@ -252,6 +258,53 @@ def test_more_than_one_pr_is_recorded_rather_than_forked(
     assert run is not None
     assert run["pr_url"].endswith("/pull/1")
     assert "pull/2" in str(run["extra_pr_urls"])
+
+
+def test_a_poll_never_moves_a_run_github_already_put_at_pr_open(
+    intake: Intake, store: Store, worker: Worker
+) -> None:
+    """The PR webhook lands between the worker claiming the run and recording
+    the poll. The poll still says `running/working` with no PR attached yet."""
+    run_id = queued(intake)
+    worker.advance_one()  # queued -> starting
+    worker.advance_one()  # starting -> running
+    assert _run(store, run_id)["state"] == State.RUNNING.value
+
+    payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+    intake.handle(delivery_id=next_delivery_id(), event="pull_request", payload=payload)
+    assert _run(store, run_id)["state"] == State.PR_OPEN.value
+
+    stale_poll = SessionSnapshot(
+        session_id="devin-sim-0001",
+        url="https://app.devin.ai/sessions/devin-sim-0001",
+        status="running",
+        status_detail="working",
+        acus_consumed=3.5,
+    )
+    with store.transaction() as conn:
+        worker._record_snapshot(conn, run_id, stale_poll)
+
+    run = _run(store, run_id)
+    assert run["state"] == State.PR_OPEN.value
+    assert run["failure_reason"] is None
+    assert run["acus_consumed"] == pytest.approx(3.5)
+    assert run["pr_number"] == 91
+
+
+def test_one_failing_run_does_not_stop_the_worker(
+    intake: Intake, store: Store, worker: Worker
+) -> None:
+    run_id = queued(intake)
+
+    def boom(run: sqlite3.Row) -> None:
+        raise RuntimeError("provider returned garbage")
+
+    worker._advance = boom  # type: ignore[method-assign]
+    assert worker.advance_one() is True
+    # The row is released, untouched, for the next tick.
+    run = _run(store, run_id)
+    assert run["state"] == State.QUEUED.value
+    assert run["lease_owner"] is None
 
 
 def test_snapshot_mapping_is_explicit() -> None:

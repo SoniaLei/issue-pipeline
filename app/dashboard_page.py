@@ -29,7 +29,8 @@ import json
 from functools import cache
 from pathlib import Path
 
-_PAGE_PATH = Path(__file__).with_name("static") / "dashboard.html"
+STATIC_DIR = Path(__file__).with_name("static")
+_PAGE_PATH = STATIC_DIR / "dashboard.html"
 
 
 @cache

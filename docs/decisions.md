@@ -627,3 +627,96 @@ even while the API keeps answering.
 **Revisit when** the service is hosted and has live runs: the metrics only
 describe runs this service tracked, so Automation-started sessions are not in
 them by construction.
+
+---
+
+## D-031 — Repository runtime knowledge lives in skills committed to the target repository
+
+**Status**: accepted (maintainer decision)
+
+**Decision.** How to stand up and test a *target* repository — interpreter and
+toolchain versions, isolated config, which hosts a dependency install reaches,
+fixture and permission gotchas — is captured as a skill file committed to that
+repository under `.agents/skills/<name>/SKILL.md`. The first one is
+`superset-local-runtime-testing` on `SoniaLei/superset-cognition-demo`
+(https://github.com/SoniaLei/superset-cognition-demo/pull/5), written from the
+run that verified PR #3 there. Sessions started by this pipeline read it from
+the checkout as a quick starter for reproduction and regression testing.
+
+**Why the target repository, not the service.** The pipeline is
+repository-agnostic: the prompt (D-020) carries the task, the playbook carries
+the invariant contract, and neither should know that Superset wants Python 3.11,
+npm 11 and `cdn.sheetjs.com` allowlisted. That knowledge changes with the
+target's code, so it is versioned, reviewed and merged next to that code by the
+people who own it. Adding a second repository to `REPO_ALLOWLIST` means adding
+a skill there, with no change here.
+
+**Why a file, not the prompt.** The live run on issue #2 lost most of its time
+to environment setup, not to the fix. A skill turns that into a read at the start
+of the next session instead of a rediscovery, and each run can improve it via an
+ordinary PR that a maintainer reviews like any other doc change.
+
+**What it is not.** A skill is guidance, not a gate: it does not authorize
+work, grant network access or replace the checks. Network allowlisting for the
+hosts it names is still configured on the session/automation side.
+
+**Revisit when** more than one target repository is tracked, to decide whether
+a shared skill format or a pipeline-side index of per-repo skills is worth it.
+
+---
+
+## D-032 — Devin analytics are provider testimony: shown beside GitHub's facts, never in place of them
+
+**Decision.** The worker reads Devin's organization analytics — per-session
+insights and daily consumption, and organization session/PR counts scoped to
+the pipeline's service user — into `session_insights` and `provider_metrics`,
+keyed by `env`. The dashboard shows them as a **Cost & efficiency** layer, as
+*Devin's account* in each run's timeline, and as a **provider cross-check** in
+Integration health. Nothing read from these endpoints drives a state
+transition, a notification, or an outcome count. PR opened, verified and merged
+stay GitHub's; a disagreement between Devin's counts and the pipeline's is shown
+as *drift* with the delta, and is not reconciled by either side.
+
+**Why beside, not instead.** The provider's PR count is its view of what its
+sessions created, which is not the same question as "does a pull request exist
+on GitHub for this run". Both can be right and still differ — a session opened a
+PR the service never correlated, a session was started outside the pipeline
+under the same service user, a PR was counted at a different lifecycle point.
+Folding the two into one number hides exactly the failures the dashboard exists
+to show. The rule is the one already applied to structured output (D-022) and
+provider status (D-026): the provider's account is stored verbatim and labelled
+as such.
+
+**Why three ACU figures and a source label.** The poll's `acus_consumed` is a
+running snapshot; the insights total is the provider's post-hoc figure; daily
+consumption is billing-grade and lands at Pacific midnight, often hours after
+the session finished. In the live run on issue #6 the consumption endpoint was
+empty for a session that had been working for many hours. Treating an absent
+figure as zero would make ACUs-per-PR fall over time as sessions finish and
+their costs have not been published yet — the opposite of the truth. So the
+dashboard prefers billing, then insights, then poll, names which one it is
+showing, counts unpriced sessions under *awaiting cost*, and leaves every ratio
+as unknown until at least one session is priced.
+
+**Why the org counts are scoped by observed service users.** `metrics/prs` and
+`metrics/sessions` cover the whole organization unless filtered. Filtering by
+the service-user IDs that sessions *reported* — not a configured ID — means the
+cross-check can never accidentally count a human's sessions, and is simply not
+attempted until the pipeline has seen at least one of its own.
+
+**Why the worker reads it, one session per tick.** The analytics endpoints are
+rate-limited and the webhook path performs no external calls. Reading them
+after the run's own work each tick keeps analytics behind pipeline progress and
+behind Slack delivery; a failure is recorded on the row and logged, never raised
+into the loop. A run keeps being re-read for a settle window after its terminal
+state so late billing and analysis can land, then stops.
+
+**What it is not.** Not a spend control — `max_acu_limit` remains the only one
+(D-018). Not verification — a session's size or analysis says nothing about
+whether the fix is right. Not a feedback loop yet: the action items and skill
+usage are displayed as a backlog for D-031 skills, and no agent acts on them.
+
+**Revisit when** live runs have settled through a few billing days, to confirm
+the consumption lag and whether `billing` supersedes `session` totals in
+practice; and when a separate review agent (deferred) needs these figures as
+input.

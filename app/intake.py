@@ -382,7 +382,7 @@ class Intake:
 
         if action in OPEN_ACTIONS:
             return self._pull_request_open(
-                conn, action, state, fields, task_id, run_id, head_sha
+                conn, repo, action, state, fields, task_id, run_id, head_sha
             )
         if action == "closed":
             return self._pull_request_closed(
@@ -397,6 +397,7 @@ class Intake:
     def _pull_request_open(
         self,
         conn: sqlite3.Connection,
+        repo: str,
         action: str,
         state: State,
         fields: dict[str, Any],
@@ -433,6 +434,8 @@ class Intake:
                 "draft": bool(fields["pr_draft"]),
             },
         )
+        if head_sha:
+            self._adopt_head_checks(conn, repo, run_id, task_id, head_sha)
 
         if action in NOTIFYING_OPEN_ACTIONS:
             self._notify(
@@ -581,13 +584,27 @@ class Intake:
         head_sha = str(suite.get("head_sha") or "")
         if not suite or not head_sha:
             return IntakeResult(False, "no check_suite in payload")
-        runs = self.store.runs_with_head(repo, head_sha)
-        if not runs:
-            return IntakeResult(False, "check suite for an untracked head")
 
         app = (suite.get("app") or {}).get("slug") or (suite.get("app") or {}).get(
             "name"
         )
+        # Kept per head regardless of whether a run tracks it yet: the suites
+        # for a commit are usually requested before the PR carrying it opens.
+        self.store.record_head_check_suite(
+            conn,
+            repo=repo,
+            head_sha=head_sha,
+            suite_id=str(suite.get("id") or ""),
+            app=str(app) if app else None,
+            status=str(suite.get("status") or "queued"),
+            conclusion=suite.get("conclusion"),
+            url=suite.get("html_url") or suite.get("url"),
+        )
+
+        runs = self.store.runs_with_head(repo, head_sha)
+        if not runs:
+            return IntakeResult(False, "check suite for an untracked head")
+
         for run in runs:
             run_id = str(run["id"])
             before = derive_checks_state(self.store.checks_for_head(run_id, head_sha))
@@ -632,6 +649,43 @@ class Intake:
             task_id=int(runs[0]["task_id"]),
             run_id=str(runs[0]["id"]),
         )
+
+    def _adopt_head_checks(
+        self,
+        conn: sqlite3.Connection,
+        repo: str,
+        run_id: str,
+        task_id: int,
+        head_sha: str,
+    ) -> None:
+        if self.store.checks_for_head(run_id, head_sha):
+            # Suites for this head already flow to the run directly.
+            return
+        adopted = self.store.adopt_head_checks(
+            conn, run_id=run_id, repo=repo, head_sha=head_sha
+        )
+        if adopted == 0:
+            return
+        after = derive_checks_state(self.store.checks_for_head(run_id, head_sha))
+        self.store.update_run(
+            conn, run_id, checks_state=after, checks_head_sha=head_sha
+        )
+        self.store.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="checks",
+            reason=after,
+            detail={"head_sha": head_sha, "suites_adopted": adopted},
+        )
+        if after == "passed":
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind="verified",
+                detail={"head_sha": head_sha},
+            )
 
     # --------------------------------------------------------------- notifications
 

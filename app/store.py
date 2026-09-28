@@ -166,6 +166,22 @@ CREATE TABLE IF NOT EXISTS checks (
     PRIMARY KEY (run_id, head_sha, suite_id)
 );
 
+-- Check suites keyed by repository head, whether or not a run tracks that
+-- head yet. GitHub reports suites for a pushed commit before the pull request
+-- that carries it is opened; a run that only learns about suites after its PR
+-- exists would see the first completed one arrive alone and call it a pass.
+CREATE TABLE IF NOT EXISTS head_checks (
+    repo        TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    suite_id    TEXT NOT NULL,
+    app         TEXT,
+    status      TEXT NOT NULL,
+    conclusion  TEXT,
+    url         TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (repo, head_sha, suite_id)
+);
+
 -- Liveness of the processes that are supposed to be running. A dashboard
 -- that cannot tell "nothing happened" from "nobody is looking" is useless.
 CREATE TABLE IF NOT EXISTS heartbeats (
@@ -173,6 +189,49 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     owner       TEXT,
     at          TEXT NOT NULL,
     detail      TEXT
+);
+
+-- Devin's account of one run's session: cost, size, and its own analysis of
+-- what went well or badly. Kept in its own table because it is provider
+-- testimony, refreshed on a schedule, and none of it changes a run's state.
+CREATE TABLE IF NOT EXISTS session_insights (
+    run_id              TEXT PRIMARY KEY REFERENCES runs(id),
+    session_id          TEXT NOT NULL,
+    env                 TEXT NOT NULL,
+    fetched_at          TEXT NOT NULL,
+    fetch_count         INTEGER NOT NULL DEFAULT 1,
+    run_state           TEXT,                -- run state at fetch, drives refresh
+    session_status      TEXT,
+    session_status_detail TEXT,
+    acus_consumed       REAL,                -- session's running total
+    billed_acus         REAL,                -- daily consumption, billing-grade
+    consumption         TEXT NOT NULL DEFAULT '[]',   -- JSON [[day, acus], ...]
+    session_size        TEXT,                -- xs | s | m | l | xl
+    category            TEXT,
+    subcategory         TEXT,
+    origin              TEXT,
+    service_user_id     TEXT,
+    num_user_messages   INTEGER,
+    num_devin_messages  INTEGER,
+    analysis_status     TEXT,                -- started | completed | failed
+    analysis            TEXT,                -- JSON, verbatim
+    generate_requested_at TEXT,
+    settled             INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT
+);
+
+-- The latest organization-level counts Devin reports for the pipeline's own
+-- service user, kept per environment so the drift check against the store
+-- compares like with like.
+CREATE TABLE IF NOT EXISTS provider_metrics (
+    env                 TEXT PRIMARY KEY,
+    attempted_at        TEXT NOT NULL,       -- last read, successful or not
+    fetched_at          TEXT,                -- last successful read; window,
+    window_after        TEXT,                -- ids and metrics below belong
+    window_before       TEXT,                -- to it and move together
+    service_user_ids    TEXT,                -- JSON list
+    metrics             TEXT,                -- JSON, verbatim
+    last_error          TEXT
 );
 """.format(active=", ".join(f"'{value}'" for value in sorted(s.value for s in ACTIVE)))
 
@@ -504,6 +563,59 @@ class Store:
             (run_id, head_sha, suite_id, app, status, conclusion, url, now_iso()),
         )
 
+    def record_head_check_suite(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        repo: str,
+        head_sha: str,
+        suite_id: str,
+        app: str | None,
+        status: str,
+        conclusion: str | None,
+        url: str | None,
+        retention: timedelta = timedelta(days=14),
+    ) -> None:
+        conn.execute(
+            "DELETE FROM head_checks WHERE updated_at < ?",
+            ((utcnow() - retention).isoformat(),),
+        )
+        conn.execute(
+            """
+            INSERT INTO head_checks
+                (repo, head_sha, suite_id, app, status, conclusion, url, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (repo, head_sha, suite_id) DO UPDATE SET
+                app = excluded.app,
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                url = excluded.url,
+                updated_at = excluded.updated_at
+            """,
+            (repo, head_sha, suite_id, app, status, conclusion, url, now_iso()),
+        )
+
+    def adopt_head_checks(
+        self, conn: sqlite3.Connection, *, run_id: str, repo: str, head_sha: str
+    ) -> int:
+        """Copy every suite already seen for this head onto the run."""
+        cursor = conn.execute(
+            """
+            INSERT INTO checks
+                (run_id, head_sha, suite_id, app, status, conclusion, url, updated_at)
+            SELECT ?, head_sha, suite_id, app, status, conclusion, url, updated_at
+            FROM head_checks WHERE repo = ? AND head_sha = ?
+            ON CONFLICT (run_id, head_sha, suite_id) DO UPDATE SET
+                app = excluded.app,
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                url = excluded.url,
+                updated_at = excluded.updated_at
+            """,
+            (run_id, repo, head_sha),
+        )
+        return int(cursor.rowcount or 0)
+
     def checks_for_head(self, run_id: str, head_sha: str) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(
@@ -541,6 +653,140 @@ class Store:
         return list(
             self._conn.execute("SELECT * FROM heartbeats ORDER BY component").fetchall()
         )
+
+    # ------------------------------------------------------------------ analytics
+
+    def insights_candidates(
+        self, env: str, refresh_before: datetime
+    ) -> list[sqlite3.Row]:
+        """Runs whose provider analysis is missing, stale, or behind the run.
+
+        A run is refreshed when it has never been read, when its state or the
+        session's status moved since the last read, or when the last read is
+        older than the refresh interval; a settled row is never refreshed.
+        """
+        return list(
+            self._conn.execute(
+                """
+                SELECT runs.*, tasks.repo AS task_repo, tasks.issue_number,
+                       tasks.issue_title, tasks.issue_state,
+                       si.fetched_at AS insights_fetched_at
+                FROM runs JOIN tasks ON tasks.id = runs.task_id
+                LEFT JOIN session_insights si ON si.run_id = runs.id
+                WHERE runs.env = ? AND runs.session_id IS NOT NULL
+                  AND (si.run_id IS NULL
+                       OR (si.settled = 0
+                           AND (si.run_state IS NOT runs.state
+                                OR si.session_status IS NOT runs.session_status
+                                OR si.session_status_detail
+                                   IS NOT runs.session_status_detail
+                                OR si.fetched_at < ?)))
+                ORDER BY si.fetched_at IS NOT NULL, si.fetched_at, runs.created_at
+                """,
+                (env, refresh_before.isoformat()),
+            ).fetchall()
+        )
+
+    def upsert_session_insights(
+        self, conn: sqlite3.Connection, run_id: str, **fields: Any
+    ) -> None:
+        existing = conn.execute(
+            "SELECT fetch_count FROM session_insights WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        fields["fetched_at"] = now_iso()
+        if existing is None:
+            columns = ["run_id", *fields]
+            conn.execute(
+                f"INSERT INTO session_insights ({', '.join(columns)})"
+                f" VALUES ({', '.join('?' for _ in columns)})",
+                (run_id, *fields.values()),
+            )
+            return
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        conn.execute(
+            f"UPDATE session_insights SET {assignments},"
+            " fetch_count = fetch_count + 1 WHERE run_id = ?",
+            (*fields.values(), run_id),
+        )
+
+    def insights_for_run(self, run_id: str) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = self._conn.execute(
+            "SELECT * FROM session_insights WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return row
+
+    def insights_for_env(self, env: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM session_insights WHERE env = ? ORDER BY fetched_at",
+                (env,),
+            ).fetchall()
+        )
+
+    def save_provider_metrics(
+        self,
+        env: str,
+        *,
+        window_after: datetime,
+        window_before: datetime,
+        service_user_ids: list[str],
+        metrics: dict[str, Any] | None,
+        error: str | None = None,
+    ) -> None:
+        ok = metrics is not None
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_metrics
+                    (env, attempted_at, fetched_at, window_after, window_before,
+                     service_user_ids, metrics, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (env) DO UPDATE SET
+                    attempted_at = excluded.attempted_at,
+                    -- A failed refresh keeps the last good numbers together
+                    -- with the window and identities they were read for.
+                    fetched_at = COALESCE(
+                        excluded.fetched_at, provider_metrics.fetched_at),
+                    window_after = COALESCE(
+                        excluded.window_after, provider_metrics.window_after),
+                    window_before = COALESCE(
+                        excluded.window_before, provider_metrics.window_before),
+                    service_user_ids = COALESCE(
+                        excluded.service_user_ids, provider_metrics.service_user_ids),
+                    metrics = COALESCE(excluded.metrics, provider_metrics.metrics),
+                    last_error = excluded.last_error
+                """,
+                (
+                    env,
+                    now_iso(),
+                    now_iso() if ok else None,
+                    window_after.isoformat() if ok else None,
+                    window_before.isoformat() if ok else None,
+                    json.dumps(service_user_ids) if ok else None,
+                    json.dumps(metrics) if ok else None,
+                    error,
+                ),
+            )
+
+    def provider_metrics(self, env: str) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = self._conn.execute(
+            "SELECT * FROM provider_metrics WHERE env = ?", (env,)
+        ).fetchone()
+        return row
+
+    def service_user_ids(self, env: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT service_user_id FROM session_insights"
+            " WHERE env = ? AND service_user_id IS NOT NULL ORDER BY 1",
+            (env,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def earliest_run_created_at(self, env: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT MIN(created_at) AS at FROM runs WHERE env = ?", (env,)
+        ).fetchone()
+        return str(row["at"]) if row and row["at"] else None
 
     # ------------------------------------------------------------------ overview
 

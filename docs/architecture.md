@@ -341,6 +341,10 @@ Devin field.
 | Delete | `DELETE /v3/organizations/{org_id}/sessions/{devin_id}` |
 | Org daily consumption | `GET /v3/organizations/{org_id}/consumption/daily` |
 | Session daily consumption | `GET /v3/organizations/{org_id}/consumption/daily/sessions/{session_id}` |
+| Session insights | `GET /v3/organizations/{org_id}/sessions/{devin_id}/insights` |
+| Request insights | `POST /v3/organizations/{org_id}/sessions/{devin_id}/insights/generate` |
+| Org session counts | `GET /v3/organizations/{org_id}/metrics/sessions?service_user_ids=…` |
+| Org PR counts | `GET /v3/organizations/{org_id}/metrics/prs?service_user_ids=…` |
 
 Authentication is a **dedicated service user**, not an individual's personal
 token — the pipeline outlives any one person's account, and a credential that
@@ -353,6 +357,31 @@ midnight PST, so they are the source for a pipeline-wide spend view.
 `acus_consumed` from the session poll is the per-run figure used in the report
 and for tuning the ceiling (§13); summing it across runs will not agree with
 the invoice, and the endpoint is the one that does.
+
+### Analytics: read beside the run, never applied to it
+
+The last four endpoints are the *analytics* read. The worker, after advancing
+work and draining the outbox, reads at most one session's insights and daily
+consumption per tick into `session_insights`, and on a schedule reads the
+organization's session and PR counts — scoped to the service-user IDs the
+insights reported, so a human's sessions in the same organization are never
+counted — into `provider_metrics`. Both tables are keyed by `env`.
+
+Nothing read here drives a transition or a notification. It is displayed as
+Devin's account of the run: what it cost, how large the provider judged the
+session, what the provider's analysis recommends (`action_items` typed
+`machine_setup | repo_config | knowledge | prompt_improvement`, `skill_usage`)
+and, in Integration health, whether the provider's counts agree with what
+GitHub told this service. A disagreement is shown as drift, not reconciled
+(D-032). A failed read stores `last_error` beside the previous good figures and
+is surfaced on the page; it never touches the run.
+
+Three ACU figures exist for one session and are never mixed silently: the
+poll's `acus_consumed` (a running snapshot), the insights total (the
+provider's post-hoc figure) and daily consumption (billing-grade, published at
+Pacific midnight, often hours late). The dashboard prefers billing, then
+insights, then poll, and names which one it is showing. A session with no
+figure is *pending*, not zero.
 
 ### There is no documented stop endpoint
 
@@ -395,6 +424,13 @@ in every prompt. The prompt then carries only what varies per run: repository,
 issue snapshot, baseline revision, run ID, branch name, PR marker, acceptance
 criteria and allowed scope. Keeping the invariant part in a playbook means it is
 versioned in one place and the prompt diff between two runs is the task.
+
+Repository-specific knowledge — how to stand up the target application, which
+hosts it fetches from, which fixtures a reproduction needs — lives in **skills
+committed to the target repository** under `.agents/skills/`, not in this
+service. A session picks them up from the checkout it is working in, so the
+pipeline stays repository-agnostic and each repository's runtime knowledge is
+versioned and reviewed where it applies (D-031).
 
 ### Structured output
 
@@ -725,6 +761,48 @@ CREATE INDEX idx_outbox_pending ON outbox(state, next_attempt_at);
 `dedupe_key` is the reason a task cannot be announced twice: the insert is part
 of the same transaction as the transition, and a second attempt violates the
 unique constraint and is discarded.
+
+```sql
+-- Devin's account of a session, one row per run, refreshed in place.
+-- Nothing here is applied to runs; it is displayed beside them.
+CREATE TABLE session_insights (
+    run_id              TEXT PRIMARY KEY REFERENCES runs(id),
+    session_id          TEXT NOT NULL,
+    env                 TEXT NOT NULL,
+    fetched_at          TEXT NOT NULL,
+    fetch_count         INTEGER NOT NULL DEFAULT 1,
+    run_state           TEXT,                     -- run state at the last read
+    session_status      TEXT,                     -- provider status at the last read
+    session_status_detail TEXT,
+    acus_consumed       REAL,                     -- insights total (provider)
+    billed_acus         REAL,                     -- daily consumption total (billing)
+    consumption         TEXT NOT NULL DEFAULT '[]', -- [[date, acus], ...]
+    session_size        TEXT,                     -- xs | s | m | l | xl
+    category            TEXT,
+    subcategory         TEXT,
+    origin              TEXT,
+    service_user_id     TEXT,                     -- scopes provider_metrics
+    num_user_messages   INTEGER,
+    num_devin_messages  INTEGER,
+    analysis_status     TEXT,                     -- not_started | pending | completed | failed
+    analysis            TEXT,                     -- provider analysis JSON, verbatim
+    generate_requested_at TEXT,                   -- insights generation asked for once
+    settled             INTEGER NOT NULL DEFAULT 0, -- past the settle window, no more reads
+    last_error          TEXT
+);
+
+-- Organization counts from Devin for the pipeline's service user(s), one row
+-- per env. A failed refresh keeps the last good metrics and records the error.
+CREATE TABLE provider_metrics (
+    env                 TEXT PRIMARY KEY,
+    fetched_at          TEXT NOT NULL,
+    window_after        TEXT NOT NULL,
+    window_before       TEXT NOT NULL,
+    service_user_ids    TEXT NOT NULL,            -- JSON list, observed not configured
+    metrics             TEXT,                     -- ProviderMetrics JSON
+    last_error          TEXT
+);
+```
 
 ## 11. Recovery rules
 

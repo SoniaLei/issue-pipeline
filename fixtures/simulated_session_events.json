@@ -26,6 +26,54 @@
         "pr_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91",
         "pr_state": "open"
       }
-    ]
+    ],
+    "insights": {
+      "session_size": "s",
+      "category": "bug_fixing",
+      "subcategory": "frontend",
+      "analysis": {
+        "issues": [
+          {
+            "id": "i1",
+            "title": "Superset dev setup took several attempts",
+            "issue": "npm install and the Flask app took three tries before the regression test could run.",
+            "impact": "About a third of the session's ACUs went to environment setup rather than the fix.",
+            "label": "machine_setup"
+          }
+        ],
+        "timeline": [],
+        "action_items": [
+          {
+            "type": "repo_config",
+            "action_item": "Add a superset-local-runtime skill step that pre-builds the frontend so sessions skip the first install.",
+            "issue_id": "i1"
+          },
+          {
+            "type": "knowledge",
+            "action_item": "Record that dashboard unit tests live under tests/unit_tests/dashboards and run without a database.",
+            "issue_id": null
+          }
+        ],
+        "suggested_prompt": null,
+        "note_usage": null,
+        "skill_usage": {
+          "good_usages": [
+            {
+              "skill_name": "superset-local-runtime",
+              "reason": "Followed the documented pytest invocation instead of discovering it.",
+              "repo_origin": "SoniaLei/superset-cognition-demo",
+              "skill_rel_path": ".agents/skills/superset-local-runtime/SKILL.md"
+            }
+          ],
+          "bad_usages": []
+        },
+        "classification": {
+          "category": "bug_fixing",
+          "confidence": 0.92,
+          "tools_and_frameworks": ["pytest", "react"],
+          "programming_languages": ["python", "typescript"]
+        }
+      }
+    }
   }
 ]
