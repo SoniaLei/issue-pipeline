@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-"""HTTP surface: the GitHub webhook, health, and the task report.
+"""HTTP surface: the GitHub webhook, health, the task report and the dashboard.
 
 The handler does verification, deduplication and a transaction, and nothing
 else. Session creation and Slack delivery belong to the worker, because a
@@ -25,17 +25,21 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Header, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from app.config import load_settings, Settings
+from app.dashboard import build_dashboard, build_timeline, ENVIRONMENTS
 from app.intake import Intake, verify_signature
 from app.reporting import build_report, render_text
 from app.store import Store
 
 logger = logging.getLogger(__name__)
+
+DASHBOARD_HTML = Path(__file__).with_name("static") / "dashboard.html"
 
 
 def create_app(settings: Settings | None = None, store: Store | None = None) -> FastAPI:
@@ -99,7 +103,33 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     def report_text() -> str:
         return render_text(build_report(backing))
 
+    mount_dashboard(app, backing, default_env=resolved.env)
     return app
+
+
+def mount_dashboard(app: FastAPI, backing: Store, *, default_env: str) -> None:
+    """Progress dashboard: one HTML page and the two JSON views behind it."""
+
+    @app.get("/api/dashboard")
+    def dashboard_data(env: str = Query(default=default_env)) -> Response:
+        # One environment per response, chosen explicitly. There is no "all".
+        if env not in ENVIRONMENTS:
+            return JSONResponse(
+                {"detail": f"env must be one of {list(ENVIRONMENTS)}"},
+                status_code=400,
+            )
+        return JSONResponse(build_dashboard(backing, env))
+
+    @app.get("/api/dashboard/runs/{run_id}")
+    def dashboard_run(run_id: str) -> Response:
+        timeline = build_timeline(backing, run_id)
+        if timeline is None:
+            return JSONResponse({"detail": "unknown run"}, status_code=404)
+        return JSONResponse(timeline)
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard_page() -> str:
+        return DASHBOARD_HTML.read_text(encoding="utf-8")
 
 
 def get_app() -> FastAPI:  # pragma: no cover - uvicorn entry point

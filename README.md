@@ -54,6 +54,7 @@ Build-order steps 1–4, which is everything that needs no credential:
 | 6. Live Devin adapter | implemented, needs a service-user token |
 | 7. Reconciliation loop | partial — poll and tag-based orphan recovery |
 | 8. Report endpoint | done |
+| 9. Progress dashboard, run timelines, check-suite verification | done |
 
 The whole pipeline runs end to end with `DEVIN_MODE=sim` and
 `SLACK_MODE=fake`, spending nothing and calling nobody.
@@ -72,6 +73,30 @@ python -m app.worker                             # worker, separate shell
 ```
 
 Or `docker compose up --build`, which runs both against a shared volume.
+
+### Dashboard
+
+`GET /dashboard` serves a single-page progress view backed by
+`GET /api/dashboard?env=live|sim` and `GET /api/dashboard/runs/<run_id>`.
+It shows current workload, results, median time to review-ready, daily
+throughput, runs needing attention, integration health and a task table;
+clicking a row opens that run's timeline (issue, session and PR links, every
+state change, test evidence, error reason, human review outcome).
+
+Every figure is computed for exactly one environment. The Live / Simulation
+switch is explicit, there is no "all", and a `generated_at` timestamp is shown
+so stale data is recognisable. Outcome definitions:
+
+- **PR opened** — a tracked PR exists; checks may still be pending.
+- **Verified** — a `check_suite` completed with `success` on the commit the PR
+  currently points at (`checks_head_sha == head_sha`). Results for an older
+  head are kept in the timeline but never count.
+- **Merged** — GitHub delivered `pull_request.closed` with `merged: true`.
+- **Blocked / failed** — the run stopped on its own; the reason and the next
+  action are shown.
+
+The GitHub App must subscribe to `check_suite` events for verification to
+work; without them runs stay at `pr_open`.
 
 ### A full simulated run
 

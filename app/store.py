@@ -134,6 +134,19 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (state, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    id          INTEGER PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES runs(id),
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,   -- state|session|pr|head|checks|review|notification
+    from_value  TEXT,
+    to_value    TEXT,
+    detail      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS run_events_run ON run_events (run_id, id);
 """.format(active=", ".join(f"'{value}'" for value in sorted(s.value for s in ACTIVE)))
 
 
@@ -323,6 +336,14 @@ class Store:
                 now_iso(),
             ),
         )
+        self.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="state",
+            to_value=state.value,
+            detail=approved_by,
+        )
         return run_id
 
     def get_run(self, run_id: str) -> sqlite3.Row | None:
@@ -352,14 +373,122 @@ class Store:
         )
 
     def update_run(self, conn: sqlite3.Connection, run_id: str, **fields: Any) -> None:
+        """Apply field changes and journal the ones the timeline cares about.
+
+        Events are derived from the before/after rows rather than declared by
+        callers, so a transition cannot happen without leaving a trace.
+        """
         if not fields:
             return
+        before = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         fields["updated_at"] = now_iso()
         assignments = ", ".join(f"{name} = ?" for name in fields)
         conn.execute(
             f"UPDATE runs SET {assignments} WHERE id = ?",
             (*fields.values(), run_id),
         )
+        if before is not None:
+            self._journal_changes(conn, before, fields)
+
+    def _journal_changes(
+        self, conn: sqlite3.Connection, before: sqlite3.Row, fields: dict[str, Any]
+    ) -> None:
+        run_id = str(before["id"])
+        task_id = int(before["task_id"])
+
+        def changed(column: str) -> bool:
+            return column in fields and fields[column] != before[column]
+
+        # (event kind, column, column holding the detail, record when cleared).
+        # `head` is skipped when `pr` fires for the same update, and `reason`
+        # when `state` does, so one change produces one event.
+        tracked: list[tuple[str, str, str | None, bool]] = [
+            ("state", "state", "failure_reason", True),
+            ("reason", "failure_reason", None, False),
+            ("session", "session_id", "session_url", False),
+            ("pr", "pr_url", "head_sha", False),
+            ("head", "head_sha", None, False),
+            ("checks", "checks_state", "checks_head_sha", True),
+            ("review", "review_state", None, False),
+            ("evidence", "structured_output", "structured_output", False),
+            ("approval", "approval_revoked_by", None, False),
+        ]
+        shadowed = {
+            "reason": changed("state"),
+            "head": changed("pr_url") and bool(fields["pr_url"]),
+        }
+        for kind, column, detail_column, when_cleared in tracked:
+            if shadowed.get(kind) or not changed(column):
+                continue
+            if not when_cleared and not fields[column]:
+                continue
+            detail = None
+            if detail_column is not None:
+                detail = fields.get(detail_column, before[detail_column])
+            self.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind=kind,
+                from_value=before[column],
+                to_value=fields[column],
+                detail=None if detail is None else str(detail),
+            )
+
+    # --------------------------------------------------------------------- events
+
+    def record_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        task_id: int,
+        kind: str,
+        from_value: str | None = None,
+        to_value: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO run_events (run_id, task_id, at, kind, from_value, to_value,
+                                    detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, task_id, now_iso(), kind, from_value, to_value, detail),
+        )
+
+    def events_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM run_events WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+        )
+
+    def state_events(self, env: str) -> list[sqlite3.Row]:
+        """Every state transition for runs in one environment."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT run_events.* FROM run_events
+                JOIN runs ON runs.id = run_events.run_id
+                WHERE run_events.kind = 'state' AND runs.env = ?
+                ORDER BY run_events.id
+                """,
+                (env,),
+            ).fetchall()
+        )
+
+    def latest_delivery_at(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT MAX(received_at) AS at FROM deliveries"
+        ).fetchone()
+        return str(row["at"]) if row and row["at"] else None
+
+    def latest_session_poll_at(self, env: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT MAX(session_polled_at) AS at FROM runs WHERE env = ?", (env,)
+        ).fetchone()
+        return str(row["at"]) if row and row["at"] else None
 
     def find_run_by_branch(self, repo: str, branch: str) -> sqlite3.Row | None:
         return self._conn.execute(
@@ -386,6 +515,17 @@ class Store:
             WHERE tasks.repo = ? AND runs.id = ?
             """,
             (repo, run_id),
+        ).fetchone()
+
+    def find_run_by_pr(self, repo: str, pr_number: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """
+            SELECT runs.* FROM runs
+            JOIN tasks ON tasks.id = runs.task_id
+            WHERE tasks.repo = ? AND runs.pr_number = ?
+            ORDER BY runs.created_at DESC LIMIT 1
+            """,
+            (repo, pr_number),
         ).fetchone()
 
     def count_active_runs(self, repo: str) -> int:
@@ -526,6 +666,7 @@ class Store:
                 """,
                 (now_iso(), response[:500], outbox_id),
             )
+            self._journal_notification(conn, outbox_id, "sent", None)
 
     def mark_notification_retry(
         self, outbox_id: int, error: str, retry_after_seconds: float
@@ -540,6 +681,7 @@ class Store:
                 """,
                 (error[:500], next_at, outbox_id),
             )
+            self._journal_notification(conn, outbox_id, "retry", error)
 
     def mark_notification_failed(self, outbox_id: int, error: str) -> None:
         with self.transaction() as conn:
@@ -551,6 +693,52 @@ class Store:
                 """,
                 (error[:500], outbox_id),
             )
+            self._journal_notification(conn, outbox_id, "failed", error)
+
+    def _journal_notification(
+        self, conn: sqlite3.Connection, outbox_id: int, outcome: str, error: str | None
+    ) -> None:
+        row = conn.execute(
+            "SELECT run_id, task_id, kind, destination FROM outbox WHERE id = ?",
+            (outbox_id,),
+        ).fetchone()
+        if row is None or row["run_id"] is None:
+            return
+        self.record_event(
+            conn,
+            run_id=str(row["run_id"]),
+            task_id=int(row["task_id"]),
+            kind="notification",
+            from_value=f"{row['kind']}→{row['destination']}",
+            to_value=outcome,
+            detail=error[:200] if error else None,
+        )
+
+    def notifications_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM outbox WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+        )
+
+    def failed_notifications(self, env: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """
+                SELECT outbox.* FROM outbox
+                JOIN runs ON runs.id = outbox.run_id
+                WHERE outbox.state = 'failed' AND runs.env = ?
+                ORDER BY outbox.id DESC
+                """,
+                (env,),
+            ).fetchall()
+        )
+
+    def latest_notification_sent_at(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT MAX(sent_at) AS at FROM outbox WHERE state = 'sent'"
+        ).fetchone()
+        return str(row["at"]) if row and row["at"] else None
 
     def notifications_for_task(self, task_id: int) -> list[sqlite3.Row]:
         return list(

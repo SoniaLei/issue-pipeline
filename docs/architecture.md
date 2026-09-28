@@ -197,7 +197,7 @@ makes it unable to. Devin pushes its own branch under its own GitHub
 authentication.
 
 Events subscribed: `issues`, `pull_request`, `pull_request_review`, and
-`check_suite` / `status` once verification lands.
+`check_suite` (D-030).
 
 ### Request path
 

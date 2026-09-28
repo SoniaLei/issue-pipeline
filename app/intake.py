@@ -35,7 +35,9 @@ from app.prompts import extract_marker
 from app.states import check_transition, PRE_EXECUTION, State
 from app.store import now_iso, Store
 
-SUPPORTED_EVENTS = frozenset({"issues", "pull_request", "pull_request_review", "ping"})
+SUPPORTED_EVENTS = frozenset(
+    {"issues", "pull_request", "pull_request_review", "check_suite", "ping"}
+)
 OPEN_ACTIONS = frozenset(
     {"opened", "reopened", "ready_for_review", "synchronize", "edited"}
 )
@@ -100,6 +102,8 @@ class Intake:
                 result = self._handle_issue(conn, repo, str(action), payload)
             elif event == "pull_request":
                 result = self._handle_pull_request(conn, repo, str(action), payload)
+            elif event == "check_suite":
+                result = self._handle_check_suite(conn, repo, str(action), payload)
             else:
                 result = self._handle_review(conn, repo, str(action), payload)
 
@@ -494,6 +498,76 @@ class Intake:
             f"review {action} recorded",
             task_id=int(run["task_id"]),
             run_id=str(run["id"]),
+        )
+
+    # --------------------------------------------------------------------- checks
+
+    def _handle_check_suite(
+        self, conn: sqlite3.Connection, repo: str, action: str, payload: dict[str, Any]
+    ) -> IntakeResult:
+        """Record a check result against the head it ran on.
+
+        "Verified" means the suite completed successfully on the commit the PR
+        currently points at. A result for an older head is recorded for the
+        timeline but never promotes the run, and a missing result stays
+        `unknown` rather than being read as a pass.
+        """
+        suite = payload.get("check_suite") or {}
+        if not suite:
+            return IntakeResult(False, "no check_suite in payload")
+        head_sha = str(suite.get("head_sha") or "")
+        run = None
+        for pull in suite.get("pull_requests") or []:
+            run = self.store.find_run_by_pr(repo, int(pull["number"]))
+            if run is not None:
+                break
+        if run is None:
+            return IntakeResult(False, "check suite for an untracked PR")
+
+        task_id = int(run["task_id"])
+        run_id = str(run["id"])
+        state = State(str(run["state"]))
+        if str(suite.get("status") or "") != "completed":
+            verdict = "pending"
+        else:
+            verdict = str(suite.get("conclusion") or "unknown")
+
+        if run["head_sha"] and head_sha and head_sha != str(run["head_sha"]):
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind="checks",
+                to_value=verdict,
+                detail=f"stale head {head_sha[:7]}",
+            )
+            return IntakeResult(
+                True,
+                "check suite for a superseded head",
+                task_id=task_id,
+                run_id=run_id,
+            )
+
+        fields: dict[str, Any] = {"checks_state": verdict, "checks_head_sha": head_sha}
+        if verdict == "success" and state is State.PR_OPEN and not run["pr_draft"]:
+            check_transition(state, State.AWAITING_REVIEW)
+            fields["state"] = State.AWAITING_REVIEW.value
+        elif verdict not in {"success", "pending"} and state is State.AWAITING_REVIEW:
+            check_transition(state, State.PR_OPEN)
+            fields["state"] = State.PR_OPEN.value
+        self.store.update_run(conn, run_id, **fields)
+
+        if fields.get("state") == State.AWAITING_REVIEW.value:
+            self._notify(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                kind=Kind.VERIFIED,
+                reason=None,
+                revision=head_sha,
+            )
+        return IntakeResult(
+            True, f"check suite {verdict}", task_id=task_id, run_id=run_id
         )
 
     # --------------------------------------------------------------- notifications

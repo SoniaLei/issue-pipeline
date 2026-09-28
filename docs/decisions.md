@@ -394,7 +394,7 @@ Two mapping traps worth naming:
 
 ## D-011 — Check and status evaluation is out of v1
 
-**Status**: accepted
+**Status**: superseded by D-030
 
 Deriving "review-ready" from checks means handling which checks are required,
 re-runs, in-progress suites, and pull requests from forks. Each is a source of
@@ -406,6 +406,48 @@ detection is a later milestone once the surrounding machinery is stable.
 
 **Revisit** after the pipeline has run on real issues for long enough to know
 which checks matter.
+
+---
+
+## D-030 — "Verified" is a completed check suite on the current head
+
+**Status**: accepted
+
+The progress dashboard needs a defensible "verified" count, which D-011
+declined to provide. The narrowest rule that is still honest:
+
+- `check_suite.completed` with `conclusion: success`, whose `head_sha` equals
+  the run's current `head_sha`, promotes `pr_open` → `awaiting_review` and
+  sends the `verified` notification once.
+- A result for any other head is journaled to the run timeline and otherwise
+  ignored; a push (`synchronize`) resets `checks_state` so the run drops back to
+  "PR opened" until a suite runs on the new head.
+- A non-success completed suite on a verified run returns it to `pr_open`.
+- Nothing is inferred: no suite delivered means `unknown`, not passed.
+
+Which checks are *required* is still not modelled; the suite conclusion is
+taken as GitHub reports it. That is the remaining gap from D-011, and the
+dashboard wording ("check suite succeeded on the current head") is kept
+literal so the number is not read as more than it is.
+
+**Consequence**: the GitHub App subscribes to `check_suite` and needs
+Checks: Read (D-027 already lists it).
+
+---
+
+## D-031 — Runs keep an event journal; the dashboard never reconstructs
+
+**Status**: accepted
+
+A timeline rebuilt from the current row loses everything that was overwritten:
+the head that was superseded, the check result that no longer counts, the
+reason a run was queued before it started. `run_events` is appended inside the
+same transaction as the change it records, by `Store.update_run`, so it cannot
+disagree with the run and needs no separate writer to remember to call it.
+
+Every dashboard figure is computed for one `env` at a time. There is no
+combined view, by construction rather than by filter: a simulated run can
+never appear in a live count because no code path asks for both.
 
 ---
 
@@ -508,7 +550,7 @@ Requested permissions, least-privilege for v1:
 | Issues | Read & write | intake and label state; write only if the issue comment in Q-020 lands |
 | Pull requests | Read | correlation, draft state, merge state |
 | Contents | Read | baseline revision and setup files |
-| Checks / Commit statuses | Read | unused in v1, needed when D-011 lands |
+| Checks / Commit statuses | Read | check_suite verification (D-030) |
 | Metadata | Read | mandatory |
 
 No Contents write and no merge permission. D-005 says the pipeline must not

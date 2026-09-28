@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>issue-pipeline · progress</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1318; --panel:#171d25; --line:#262e39; --fg:#e6e9ee; --muted:#8d99a8;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#58a6ff; --sim:#b083f0; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:16px; padding:14px 24px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .seg button { background:none; border:0; color:var(--muted); padding:6px 14px; cursor:pointer; font:inherit; }
+  .seg button.on { background:var(--panel); color:var(--fg); font-weight:600; }
+  .seg button.on[data-env="sim"] { color:var(--sim); }
+  .fresh { margin-left:auto; color:var(--muted); font-size:12px; }
+  .fresh b { color:var(--fg); font-weight:500; }
+  .banner { padding:8px 24px; font-size:12px; color:var(--sim); background:#1c1626; border-bottom:1px solid var(--line); display:none; }
+  body[data-env="sim"] .banner { display:block; }
+  main { padding:20px 24px 60px; max-width:1400px; margin:0 auto; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:22px 0 10px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card h3 { margin:0 0 8px; font-size:12px; color:var(--muted); font-weight:500; }
+  .kv { display:flex; justify-content:space-between; padding:3px 0; }
+  .kv b { font-weight:600; font-variant-numeric:tabular-nums; }
+  .big { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .sub { color:var(--muted); font-size:12px; }
+  .def { color:var(--muted); font-size:11px; margin-top:6px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-weight:500; }
+  tbody tr { cursor:pointer; }
+  tbody tr:hover { background:#1d2530; }
+  tr:last-child td { border-bottom:0; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; border:1px solid var(--line); color:var(--muted); }
+  .pill.ok { color:var(--ok); border-color:var(--ok); }
+  .pill.warn { color:var(--warn); border-color:var(--warn); }
+  .pill.bad { color:var(--bad); border-color:var(--bad); }
+  .pill.info { color:var(--info); border-color:var(--info); }
+  a { color:var(--info); text-decoration:none; } a:hover { text-decoration:underline; }
+  .muted { color:var(--muted); }
+  .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+  .empty { color:var(--muted); padding:14px; background:var(--panel); border:1px solid var(--line); border-radius:8px; }
+  .bars { display:flex; gap:6px; align-items:flex-end; height:70px; margin-top:8px; }
+  .bar { flex:1; display:flex; flex-direction:column; justify-content:flex-end; gap:2px; min-width:18px; }
+  .bar div { border-radius:2px 2px 0 0; }
+  .bar .v { background:var(--info); } .bar .m { background:var(--ok); }
+  .bar span { font-size:10px; color:var(--muted); text-align:center; }
+  /* drawer */
+  #drawer { position:fixed; top:0; right:0; width:min(640px, 100vw); height:100vh; background:var(--panel); border-left:1px solid var(--line); transform:translateX(100%); transition:transform .18s; overflow:auto; z-index:3; padding:20px 24px; }
+  #drawer.open { transform:none; }
+  #drawer .close { float:right; background:none; border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  .tl { list-style:none; padding:0; margin:0; border-left:2px solid var(--line); }
+  .tl li { position:relative; padding:0 0 12px 16px; }
+  .tl li::before { content:""; position:absolute; left:-6px; top:5px; width:10px; height:10px; border-radius:50%; background:var(--muted); }
+  .tl li.state::before { background:var(--info); }
+  .tl li.bad::before { background:var(--bad); }
+  .tl li.ok::before { background:var(--ok); }
+  .tl time { color:var(--muted); font-size:11px; display:block; }
+  .section { margin-top:18px; }
+  #shade { position:fixed; inset:0; background:rgba(0,0,0,.4); display:none; z-index:2; }
+  #shade.open { display:block; }
+</style>
+</head>
+<body data-env="live">
+<header>
+  <h1>issue-pipeline</h1>
+  <div class="seg" id="envSwitch">
+    <button data-env="live" class="on">Live</button>
+    <button data-env="sim">Simulation</button>
+  </div>
+  <span class="fresh">Data as of <b id="freshAt">—</b> <span id="freshAge"></span> · <a href="#" id="refresh">refresh</a></span>
+</header>
+<div class="banner">Simulation environment. These numbers come from the simulated Devin client and fake Slack transport and are never mixed into live metrics.</div>
+
+<main>
+  <h2>Overview</h2>
+  <div class="grid">
+    <div class="card"><h3>Current workload</h3><div id="workload"></div></div>
+    <div class="card"><h3>Results</h3><div id="results"></div>
+      <div class="def">PR opened = change exists, checks may be pending · Verified = checks pass on current head · Merged = GitHub confirmed.</div></div>
+    <div class="card"><h3>Speed</h3><div class="big" id="speed">—</div><div class="sub" id="speedSub">median approval → review-ready</div></div>
+    <div class="card"><h3>Throughput (per day)</h3><div id="throughput"></div></div>
+    <div class="card"><h3>Integration health</h3><div id="health"></div></div>
+  </div>
+
+  <h2>Needs attention</h2>
+  <div id="attention"></div>
+
+  <h2>Tasks</h2>
+  <div id="tasks"></div>
+</main>
+
+<div id="shade"></div>
+<aside id="drawer"><button class="close" id="closeDrawer">close</button><div id="drawerBody"></div></aside>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  let env = new URLSearchParams(location.search).get('env') === 'sim' ? 'sim' : 'live';
+  let generatedAt = null;
+
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const link = (url, text) => url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(text ?? url)}</a>` : '<span class="muted">—</span>';
+  const fmtDur = (s) => {
+    if (s == null) return '—';
+    s = Math.max(0, Math.round(s));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+    if (d) return `${d}d ${h % 24}h`;
+    if (h) return `${h}h ${m % 60}m`;
+    return `${m}m`;
+  };
+  const fmtTs = (ts) => ts ? new Date(ts).toLocaleString() : '—';
+  const ago = (ts) => ts ? fmtDur((Date.now() - new Date(ts)) / 1000) + ' ago' : 'never';
+
+  const STATE_CLASS = { merged:'ok', awaiting_review:'ok', pr_open:'info', running:'info', starting:'info',
+    queued:'', awaiting_approval:'', session_blocked:'warn', no_output:'bad', expired:'bad', failed:'bad',
+    closed_unmerged:'warn', cancelled:'' };
+  const pill = (text, cls) => `<span class="pill ${cls || ''}">${esc(text)}</span>`;
+  const statePill = (s) => pill(s.replace(/_/g, ' '), STATE_CLASS[s]);
+
+  function checksPill(t) {
+    if (t.verified) return pill('verified', 'ok');
+    const c = t.checks;
+    if (c === 'success') return pill('passed (stale head)', 'warn');
+    if (c === 'failure' || c === 'timed_out' || c === 'cancelled' || c === 'action_required') return pill(c, 'bad');
+    if (c === 'pending' || c === 'stale') return pill(c, 'warn');
+    return pill('unknown', '');
+  }
+  const slackPill = (s) => pill(s.summary, s.summary === 'sent' ? 'ok' : s.summary === 'failed' ? 'bad' : s.summary === 'pending' ? 'warn' : '');
+
+  function kv(pairs) { return pairs.map(([k, v]) => `<div class="kv"><span>${esc(k)}</span><b>${v}</b></div>`).join(''); }
+
+  function renderOverview(d) {
+    const w = d.workload;
+    $('workload').innerHTML = kv([['Queued', w.queued], ['Running', w.running], ['Awaiting review', w.awaiting_review],
+      ['Blocked', `<span class="${w.blocked ? 'pill warn' : ''}">${w.blocked}</span>`], ['Failed', `<span class="${w.failed ? 'pill bad' : ''}">${w.failed}</span>`]]);
+    const r = d.results;
+    $('results').innerHTML = kv([['PRs opened', r.pr_opened], ['Verified', r.verified], ['Merged', r.merged], ['Closed unmerged', r.closed_unmerged]]);
+    const sp = d.speed;
+    $('speed').textContent = sp.median_seconds_to_review_ready == null ? '—' : fmtDur(sp.median_seconds_to_review_ready);
+    $('speedSub').textContent = `median approval → review-ready · n=${sp.sample_count}`;
+
+    const days = d.throughput.slice(-14);
+    if (!days.length) { $('throughput').innerHTML = '<div class="sub">no verified or merged PRs yet</div>'; }
+    else {
+      const max = Math.max(1, ...days.map(x => x.verified + x.merged));
+      $('throughput').innerHTML = '<div class="bars">' + days.map(x =>
+        `<div class="bar" title="${x.day}: ${x.verified} verified, ${x.merged} merged">
+           <div class="v" style="height:${(x.verified / max) * 54}px"></div>
+           <div class="m" style="height:${(x.merged / max) * 54}px"></div>
+           <span>${x.day.slice(5)}</span></div>`).join('') + '</div>' +
+        `<div class="sub" style="margin-top:6px"><span style="color:var(--info)">■</span> verified <span style="color:var(--ok)">■</span> merged · last ${days.length} day(s)</div>`;
+    }
+
+    const h = d.health;
+    const age = (a, warnAfter) => a == null ? 'never' : `<span class="${a > warnAfter ? 'pill warn' : ''}">${fmtDur(a)} ago</span>`;
+    $('health').innerHTML = kv([
+      ['Devin poll', age(h.devin.age_seconds, 600)],
+      ['GitHub webhook', age(h.github.age_seconds, 86400)],
+      ['Slack delivery', age(h.slack.age_seconds, 86400)],
+      ['Slack failures', `<span class="${h.slack.failed_count ? 'pill bad' : ''}">${h.slack.failed_count}</span>`],
+    ]) + (h.slack.failures.length ? `<div class="def">${h.slack.failures.slice(0, 3).map(f => esc(`${f.kind} → ${f.destination}: ${f.error || 'unknown error'}`)).join('<br>')}</div>` : '');
+  }
+
+  function renderAttention(items) {
+    if (!items.length) { $('attention').innerHTML = '<div class="empty">Nothing needs a human right now.</div>'; return; }
+    $('attention').innerHTML = `<table><thead><tr><th>Issue</th><th>Blocker</th><th>Task age</th><th>Next action</th></tr></thead><tbody>` +
+      items.map(a => `<tr data-run="${esc(a.run_id)}"><td>${link(a.issue.url, '#' + a.issue.number)} ${esc(a.issue.title)}</td>
+        <td>${pill(a.blocker, 'bad')} ${statePill(a.state)}</td><td>${fmtDur(a.age_seconds)}</td><td>${esc(a.next_action)}</td></tr>`).join('') + '</tbody></table>';
+  }
+
+  function renderTasks(rows) {
+    if (!rows.length) { $('tasks').innerHTML = `<div class="empty">No ${env} runs recorded yet.</div>`; return; }
+    $('tasks').innerHTML = `<table><thead><tr><th>Issue</th><th>State</th><th>Elapsed</th><th>Tests</th><th>PR</th><th>Slack</th><th>Last update</th></tr></thead><tbody>` +
+      rows.map(r => `<tr data-run="${esc(r.run_id)}">
+        <td>${link(r.issue.url, '#' + r.issue.number)} ${esc(r.issue.title)}<div class="sub mono">${esc(r.repo)} · run ${esc(r.run_id)}</div></td>
+        <td>${statePill(r.state)}${r.failure_reason ? `<div class="sub">${esc(r.failure_reason)}</div>` : ''}</td>
+        <td>${fmtDur(r.elapsed_seconds)}</td>
+        <td>${checksPill(r.tests)}${r.tests.tests_run ? `<div class="sub mono">${esc(r.tests.tests_run)}</div>` : ''}</td>
+        <td>${r.pr ? link(r.pr.url, '#' + r.pr.number) + (r.pr.draft ? ' <span class="sub">draft</span>' : '') : '<span class="muted">—</span>'}</td>
+        <td>${slackPill(r.slack)}</td>
+        <td title="${esc(r.last_update)}">${ago(r.last_update)}</td></tr>`).join('') + '</tbody></table>';
+  }
+
+  async function openRun(runId) {
+    const res = await fetch(`/api/dashboard/runs/${encodeURIComponent(runId)}`);
+    if (!res.ok) return;
+    const t = await res.json();
+    const evClass = (e) => e.kind === 'state' ? (['failed','no_output','expired','session_blocked'].includes(e.to) ? 'bad' : ['merged','awaiting_review'].includes(e.to) ? 'ok' : 'state')
+      : (e.kind === 'notification' && e.to === 'failed') || (e.kind === 'checks' && e.to === 'failure') ? 'bad' : '';
+    const evText = (e) => {
+      if (e.kind === 'state') return `state ${e.from ? esc(e.from) + ' → ' : ''}<b>${esc(e.to)}</b>${e.detail ? ` <span class="muted">(${esc(e.detail)})</span>` : ''}`;
+      if (e.kind === 'session') return `Devin session created ${e.detail ? link(e.detail, e.to) : esc(e.to)}`;
+      if (e.kind === 'pr') return `PR correlated ${link(e.to, e.to)}${e.detail ? ` <span class="mono muted">@${esc(e.detail).slice(0,7)}</span>` : ''}`;
+      if (e.kind === 'head') return `new head <span class="mono">${esc(e.to).slice(0,7)}</span> — checks reset`;
+      if (e.kind === 'checks') return `checks: <b>${esc(e.to ?? 'unknown')}</b>${e.detail ? ` <span class="muted">${/^[0-9a-f]{7,40}$/.test(e.detail) ? '@' + esc(e.detail).slice(0,7) : esc(e.detail)}</span>` : ''}`;
+      if (e.kind === 'review') return `human review: <b>${esc(e.to)}</b>`;
+      if (e.kind === 'evidence') return `session evidence: <span class="mono">${esc(e.detail)}</span>`;
+      if (e.kind === 'notification') return `Slack ${esc(e.from)}: <b>${esc(e.to)}</b>${e.detail ? ` <span class="muted">${esc(e.detail)}</span>` : ''}`;
+      if (e.kind === 'approval') return `approval <b>revoked</b> by ${esc(e.to)}`;
+      if (e.kind === 'reason') return `reason: ${esc(e.to)}`;
+      return `${esc(e.kind)} ${esc(e.to ?? '')}`;
+    };
+    $('drawerBody').innerHTML = `
+      <h2 style="margin-top:0">${link(t.links.issue, '#' + t.issue.number)} ${esc(t.issue.title)} ${pill(t.env, t.env === 'sim' ? 'warn' : 'ok')}</h2>
+      <div>${statePill(t.state)} · outcome <b>${esc(t.outcome)}</b> · elapsed ${fmtDur(t.elapsed_seconds)} · run <span class="mono">${esc(t.run_id)}</span></div>
+      <div class="section">${kv([
+        ['Issue', link(t.links.issue)], ['Devin session', link(t.links.session)], ['Pull request', link(t.links.pr)],
+        ...(t.links.extra_prs.length ? [['Other PRs', t.links.extra_prs.map(u => link(u)).join(', ')]] : []),
+        ['Approved by', esc(t.approval.approved_by || '—') + (t.approval.revoked_by ? ` <span class="pill bad">revoked by ${esc(t.approval.revoked_by)}</span>` : '')],
+        ['ACUs', t.session.acus_consumed == null ? '—' : `${t.session.acus_consumed} / ${t.session.max_acu_limit ?? '∞'}`],
+      ])}</div>
+      ${t.error.reason ? `<div class="section card" style="border-color:var(--bad)"><h3>Error / blocker</h3><div><b>${esc(t.error.reason)}</b></div><div class="sub">${esc(t.error.next_action || '')}</div></div>` : ''}
+      <div class="section card"><h3>Test evidence</h3>${kv([
+        ['CI checks', checksPill(t.tests) + (t.tests.checks_head_sha ? ` <span class="mono muted">@${esc(t.tests.checks_head_sha).slice(0,7)}</span>` : '')],
+        ['PR head', t.tests.head_sha ? `<span class="mono">${esc(t.tests.head_sha).slice(0,7)}</span>` : '—'],
+        ['Session says tests added', t.tests.tests_added == null ? '—' : String(t.tests.tests_added)],
+        ['Session says tests run', t.tests.tests_run ? `<span class="mono">${esc(t.tests.tests_run)}</span>` : '—'],
+        ['Session outcome', esc(t.tests.session_outcome || '—')],
+      ])}<div class="def">Session claims and CI results are shown separately; only CI on the current head counts as verified.</div></div>
+      <div class="section card"><h3>Human review</h3>${kv([['Outcome', pill(t.review.outcome, t.review.outcome === 'merged' || t.review.outcome === 'approved' ? 'ok' : t.review.outcome === 'changes_requested' || t.review.outcome === 'closed_unmerged' ? 'warn' : '')],
+        ['Merge SHA', t.pr && t.pr.merged_sha ? `<span class="mono">${esc(t.pr.merged_sha).slice(0,7)}</span>` : '—']])}</div>
+      <div class="section"><h2>Timeline</h2><ul class="tl">${t.events.map(e => `<li class="${evClass(e)}"><time>${fmtTs(e.at)}</time>${evText(e)}</li>`).join('') || '<li>no events recorded</li>'}</ul></div>
+      <div class="section"><h2>Slack notifications</h2>${t.notifications.length ? `<table><thead><tr><th>Kind</th><th>Destination</th><th>State</th><th>Attempts</th><th>Error</th></tr></thead><tbody>` +
+        t.notifications.map(n => `<tr><td>${esc(n.kind)}${n.reason ? ` <span class="sub">${esc(n.reason)}</span>` : ''}</td><td class="mono">${esc(n.destination)}</td><td>${pill(n.state, n.state === 'sent' ? 'ok' : n.state === 'failed' ? 'bad' : 'warn')}</td><td>${n.attempts}</td><td class="sub">${esc(n.last_error || '')}</td></tr>`).join('') + '</tbody></table>' : '<div class="sub">none queued</div>'}</div>`;
+    $('drawer').classList.add('open'); $('shade').classList.add('open');
+  }
+  function closeDrawer() { $('drawer').classList.remove('open'); $('shade').classList.remove('open'); }
+
+  async function load() {
+    document.body.dataset.env = env;
+    document.querySelectorAll('#envSwitch button').forEach(b => b.classList.toggle('on', b.dataset.env === env));
+    const res = await fetch(`/api/dashboard?env=${env}`);
+    const d = await res.json();
+    generatedAt = d.generated_at;
+    $('freshAt').textContent = fmtTs(d.generated_at);
+    renderOverview(d); renderAttention(d.attention); renderTasks(d.tasks);
+    history.replaceState(null, '', `?env=${env}`);
+  }
+  setInterval(() => { if (generatedAt) $('freshAge').textContent = `(${ago(generatedAt)})`; }, 1000);
+  setInterval(load, 30000);
+
+  $('envSwitch').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { env = b.dataset.env; load(); } });
+  $('refresh').addEventListener('click', (e) => { e.preventDefault(); load(); });
+  document.addEventListener('click', (e) => { const tr = e.target.closest('tr[data-run]'); if (tr && !e.target.closest('a')) openRun(tr.dataset.run); });
+  $('closeDrawer').addEventListener('click', closeDrawer); $('shade').addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+  load();
+})();
+</script>
+</body>
+</html>
