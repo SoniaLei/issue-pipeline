@@ -141,7 +141,16 @@ class Worker:
         self.store.heartbeat("worker", self.owner)
         advanced = self.advance_one()
         delivered = self.drain_outbox()
-        if self.settings.analytics_enabled and not advanced:
+        reviewed = False
+        if not advanced:
+            # The review gate reads and requests a provider review of the
+            # PR's current head. Like analytics it runs on an idle tick and a
+            # failing provider must not stop runs from advancing.
+            try:
+                reviewed = self.refresh_review_gate()
+            except Exception:
+                logger.exception("review gate refresh failed")
+        if self.settings.analytics_enabled and not advanced and not reviewed:
             # Analytics are observation, not control: they wait for an idle
             # tick so a slow provider endpoint delays no run, and a broken
             # one must never stop runs from advancing.
@@ -476,6 +485,130 @@ class Worker:
                 kind=kind, task=task, run=run, reason=reason, detail=detail
             ),
         )
+
+    # ---------------------------------------------------------------- review gate
+
+    def refresh_review_gate(self) -> bool:
+        """Make one pr-reviews read for a run whose current head is due.
+
+        A run is due when GitHub owns it (``pr_open``/``awaiting_review``),
+        its head has no review row or one whose API status is not terminal,
+        and the last read is older than the poll interval. When no review
+        exists for the head one is requested, once: the request is recorded on
+        the row, so a second worker or a restart does not ask again. Reads
+        that keep failing stop after ``review_max_attempts`` and leave the
+        head ``unavailable`` with the error, which the dashboard shows and
+        which never counts as a pass (D-033).
+        """
+        if self.settings.review_gate_mode == "off":
+            return False
+        now = utcnow()
+        for run in self.store.review_candidates(self.settings.env):
+            status_at = run["review_status_at"]
+            if status_at is not None:
+                read = datetime.fromisoformat(str(status_at))
+                if (now - read).total_seconds() < self.settings.review_poll_seconds:
+                    continue
+            given_up = (
+                run["review_status"] == "unavailable"
+                and int(run["review_attempts"] or 0)
+                >= self.settings.review_max_attempts
+            )
+            if given_up:
+                continue
+            self._refresh_review(run)
+            return True
+        return False
+
+    def _refresh_review(self, run: sqlite3.Row) -> None:
+        run_id = str(run["id"])
+        head = str(run["head_sha"])
+        pr_url = str(run["pr_url"])
+        current = self.store.review_for_head(run_id, head)
+        previous_status = current["status"] if current is not None else None
+        attempts = int(current["attempts"]) if current is not None else 0
+        requested = current is not None and current["requested_at"] is not None
+        fields: dict[str, Any] = {"status_at": now_iso(), "last_error": None}
+        try:
+            review = self.devin.get_pr_review(pr_url, head)
+            if review is None and not requested:
+                review = self.devin.request_pr_review(pr_url)
+                fields["requested_at"] = now_iso()
+                if review.commit_sha and review.commit_sha != head:
+                    # Devin reviews whatever GitHub's latest commit is. If that
+                    # is not the head this run knows, GitHub has moved on and
+                    # the synchronize delivery will bring the new head, whose
+                    # row this is; the head asked about gets no review.
+                    self._record_review(
+                        run,
+                        review.commit_sha,
+                        previous=None,
+                        status=review.status,
+                        requested_at=fields["requested_at"],
+                        status_at=fields["status_at"],
+                    )
+                    fields["status"] = "skipped"
+                    fields["last_error"] = (
+                        f"Devin reviewed newer commit {review.commit_sha[:10]};"
+                        " waiting for GitHub to report that head"
+                    )
+                    review = None
+            if review is not None:
+                fields["status"] = review.status
+                fields["attempts"] = 0
+            elif "status" not in fields:
+                # Requested earlier but not yet visible: still pending, and
+                # each empty read counts against the attempt budget.
+                attempts += 1
+                fields["attempts"] = attempts
+                if attempts >= self.settings.review_max_attempts:
+                    fields["status"] = "unavailable"
+                    fields["last_error"] = "requested review never appeared"
+                else:
+                    fields["status"] = "pending"
+        except DevinError as exc:
+            logger.warning("review gate read failed for %s: %s", run_id, exc)
+            attempts += 1
+            fields["attempts"] = attempts
+            fields["last_error"] = str(exc)
+            if not exc.retryable or attempts >= self.settings.review_max_attempts:
+                fields["status"] = "unavailable"
+            elif previous_status is not None:
+                fields["status"] = previous_status
+        self._record_review(run, head, previous=previous_status, **fields)
+
+    def _record_review(
+        self,
+        run: sqlite3.Row,
+        head: str,
+        *,
+        previous: str | None,
+        **fields: Any,
+    ) -> None:
+        run_id = str(run["id"])
+        status = fields.get("status")
+        with self.store.transaction() as conn:
+            self.store.upsert_review(
+                conn,
+                run_id=run_id,
+                head_sha=head,
+                env=str(run["env"]),
+                pr_url=str(run["pr_url"]),
+                **fields,
+            )
+            if status is not None and status != previous:
+                self.store.record_event(
+                    conn,
+                    run_id=run_id,
+                    task_id=int(run["task_id"]),
+                    kind="review_gate",
+                    reason=str(status),
+                    detail={
+                        "head_sha": head,
+                        "requested": "requested_at" in fields,
+                        "error": fields.get("last_error"),
+                    },
+                )
 
     # ------------------------------------------------------------------ analytics
 

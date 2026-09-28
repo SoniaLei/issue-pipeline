@@ -531,6 +531,7 @@ def test_cost_is_computed_from_billing_grade_figures_when_published(
 ) -> None:
     run_id = run_to_pr(intake, worker, store)
     send(intake, "check_suite", "check_suite_success.json", run_id)
+    send(intake, "pull_request_review", "devin_review_clean.json", run_id)
     send(intake, "pull_request", "pr_merged.json", run_id)
 
     cost = build_dashboard(store, "sim")["cost"]

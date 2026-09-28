@@ -133,12 +133,15 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
                 worker_stale_after_seconds=max(
                     60, int(settings.poll_interval_seconds * 10)
                 ),
+                review_gate_mode=settings.review_gate_mode,
             )
         )
 
     @app.get("/api/tasks/{task_id}/timeline")
     def api_timeline(task_id: int) -> Response:
-        timeline = build_timeline(store, task_id)
+        timeline = build_timeline(
+            store, task_id, review_gate_mode=settings.review_gate_mode
+        )
         if timeline is None:
             return JSONResponse({"detail": "unknown task"}, status_code=404)
         return JSONResponse(timeline)

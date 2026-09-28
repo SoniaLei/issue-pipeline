@@ -43,15 +43,28 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.config import DEFAULT_REVIEW_GATE_MODE
 from app.notifications import needs_human_text
+from app.review_gate import checks_passed, gate_state, is_verified as gate_verified
 from app.states import is_terminal, State
 from app.store import Store, utcnow
 
 DEFINITIONS: dict[str, str] = {
     "pr_opened": "A pull request exists on GitHub for the run. Checks may be pending.",
-    "verified": (
+    "checks_passed": (
         "Every check suite GitHub reported for the PR's current head commit "
         "completed successfully. A new commit resets this to unknown."
+    ),
+    "verified": (
+        "Checks passed on the current head and, when the review gate is "
+        "required, Devin Review of that same commit reported no findings on "
+        "GitHub. A new commit resets both."
+    ),
+    "review_gate": (
+        "Devin Review of the PR's current head. Progress (pending, running, "
+        "completed, errored, skipped, unavailable) is what the pr-reviews API "
+        "says; the verdict (clear or N findings) is the bot's review on GitHub "
+        "for that exact commit. Unknown, errored or unreviewed is never clear."
     ),
     "merged": "GitHub reported the pull request closed with merged=true.",
     "blocked": (
@@ -153,21 +166,56 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
-def is_verified(run: sqlite3.Row) -> bool:
-    """Checks passed on the head GitHub currently reports for the PR."""
-    return bool(
-        run["pr_number"] is not None
-        and run["head_sha"]
-        and run["checks_state"] == "passed"
-        and run["checks_head_sha"] == run["head_sha"]
-    )
+def is_verified(
+    run: sqlite3.Row,
+    review: sqlite3.Row | None = None,
+    mode: str = DEFAULT_REVIEW_GATE_MODE,
+) -> bool:
+    """Checks passed on the current head and the review gate satisfied for
+    it (D-033). ``review`` is the pr_reviews row for the run's current head."""
+    return gate_verified(run, review, mode)
 
 
-def bucket_for(run: sqlite3.Row) -> str:
+def bucket_for(run: sqlite3.Row, verified: bool) -> str:
     state = State(str(run["state"]))
-    if state is State.PR_OPEN and is_verified(run):
+    if state is State.PR_OPEN and verified:
         return "awaiting_review"
     return _BUCKET[state]
+
+
+def _review_view(
+    run: sqlite3.Row, review: sqlite3.Row | None, mode: str, now: datetime
+) -> dict[str, Any]:
+    """Where Devin Review stands for the run's current head.
+
+    ``state`` is the gate word (see ``review_gate.gate_state``); ``status`` is
+    the API's progress verbatim; ``findings`` is the count GitHub carries for
+    this exact commit. A row for an older head is not shown here: it belongs
+    to a commit that no longer exists on the PR.
+    """
+    head = run["head_sha"]
+    if review is not None and review["head_sha"] != head:
+        review = None
+    state = gate_state(review, mode)
+    read_at = review["status_at"] if review is not None else None
+    return {
+        "mode": mode,
+        "state": state,
+        "head_sha": head,
+        "status": review["status"] if review is not None else None,
+        "requested_at": review["requested_at"] if review is not None else None,
+        "status_at": read_at,
+        "age_seconds": _seconds_between(read_at, now.isoformat()) if read_at else None,
+        "attempts": int(review["attempts"]) if review is not None else 0,
+        "last_error": review["last_error"] if review is not None else None,
+        "findings": review["findings"] if review is not None else None,
+        "findings_by_kind": (
+            _json(review["findings_by_kind"]) or {} if review is not None else {}
+        ),
+        "review_url": review["review_url"] if review is not None else None,
+        "verdict_at": review["verdict_at"] if review is not None else None,
+        "satisfied": mode != "required" or state == "clear",
+    }
 
 
 def _checks_view(store: Store, run: sqlite3.Row) -> dict[str, Any]:
@@ -367,7 +415,11 @@ def _run_timing(
 
 
 def _attention(
-    run: sqlite3.Row, bucket: str, timing: dict[str, Any], slack: dict[str, Any]
+    run: sqlite3.Row,
+    bucket: str,
+    timing: dict[str, Any],
+    slack: dict[str, Any],
+    review: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Why a human should look, and what they should do."""
     reason: str | None = None
@@ -387,6 +439,29 @@ def _attention(
         reason = "checks_failed"
         blocker = "Checks failed on the current PR head"
         action = "read the failing check and reply in the session or fix by hand"
+    elif bucket == "pr_open" and review["state"] == "findings":
+        count = int(review["findings"] or 0)
+        reason = "review_findings"
+        blocker = (
+            f"Devin Review left {count} finding{'s' if count != 1 else ''} "
+            f"on the current PR head"
+        )
+        action = (
+            "read the review on GitHub; fix in the session (a new commit is "
+            "re-reviewed) or dismiss the finding with a reason"
+        )
+    elif (
+        bucket == "pr_open"
+        and review["mode"] == "required"
+        and review["state"] in {"errored", "cancelled", "skipped", "unavailable"}
+    ):
+        reason = f"review_{review['state']}"
+        blocker = f"Devin Review of the current head {review['state']}"
+        action = (
+            "operator: check the pr-reviews API and the Devin GitHub app on the "
+            "repo; push a new commit to request another review, or set "
+            "REVIEW_GATE_MODE=advisory to verify on checks alone"
+        )
     elif slack["status"] == "failed":
         reason = "slack_delivery"
         blocker = "A Slack notification could not be delivered"
@@ -401,9 +476,14 @@ def _attention(
     }
 
 
-def _run_view(store: Store, run: sqlite3.Row, now: datetime) -> dict[str, Any]:
+def _run_view(
+    store: Store, run: sqlite3.Row, now: datetime, mode: str
+) -> dict[str, Any]:
     events = store.events_for_run(str(run["id"]))
-    bucket = bucket_for(run)
+    review_row = store.review_for_head(str(run["id"]), run["head_sha"])
+    verified = is_verified(run, review_row, mode)
+    review = _review_view(run, review_row, mode, now)
+    bucket = bucket_for(run, verified)
     timing = _run_timing(run, events, now)
     slack = _slack_view(
         [
@@ -426,7 +506,9 @@ def _run_view(store: Store, run: sqlite3.Row, now: datetime) -> dict[str, Any]:
         },
         "state": str(run["state"]),
         "bucket": bucket,
-        "verified": is_verified(run),
+        "verified": verified,
+        "checks_passed": checks_passed(run),
+        "review": review,
         "failure_reason": run["failure_reason"],
         "approved_by": run["approved_by"],
         "approval_revoked_by": run["approval_revoked_by"],
@@ -453,7 +535,7 @@ def _run_view(store: Store, run: sqlite3.Row, now: datetime) -> dict[str, Any]:
         "insights": _insights_view(store, run),
         "slack": slack,
         "timing": timing,
-        "attention": _attention(run, bucket, timing, slack),
+        "attention": _attention(run, bucket, timing, slack, review),
         "last_update": run["updated_at"],
     }
 
@@ -721,11 +803,12 @@ def build_dashboard(
     *,
     now: datetime | None = None,
     worker_stale_after_seconds: int = 300,
+    review_gate_mode: str = DEFAULT_REVIEW_GATE_MODE,
 ) -> dict[str, Any]:
     """Everything the overview page shows, for one environment."""
     current = now or utcnow()
     rows = store.list_runs(env)
-    runs = [_run_view(store, row, current) for row in rows]
+    runs = [_run_view(store, row, current, review_gate_mode) for row in rows]
 
     workload = {bucket: 0 for bucket in WORKLOAD_BUCKETS}
     for run in runs:
@@ -734,6 +817,7 @@ def build_dashboard(
 
     results = {
         "pr_opened": sum(1 for r in runs if r["pr"]["number"] is not None),
+        "checks_passed": sum(1 for r in runs if r["checks_passed"]),
         "verified": sum(1 for r in runs if r["verified"]),
         "merged": sum(1 for r in runs if r["state"] == State.MERGED.value),
         "closed_unmerged": sum(
@@ -794,6 +878,7 @@ def build_dashboard(
 
     health = _health(store, env, runs, current, worker_stale_after_seconds)
     health["devin_analytics"] = _drift(store, env, runs, results)
+    last_call = store.last_review_call(env)
 
     return {
         "env": env,
@@ -801,6 +886,15 @@ def build_dashboard(
         "generated_at": current.isoformat(),
         "data_as_of": data_as_of,
         "definitions": DEFINITIONS,
+        "review_gate": {
+            "mode": review_gate_mode,
+            "states": _review_states(runs),
+            "last_call_at": (
+                str(last_call["status_at"])
+                if last_call is not None and last_call["status_at"]
+                else None
+            ),
+        },
         "workload": workload,
         "results": results,
         "speed": speed,
@@ -817,8 +911,22 @@ def build_dashboard(
     }
 
 
+def _review_states(runs: list[dict[str, Any]]) -> dict[str, int]:
+    """How many open PRs sit in each gate state (terminal runs excluded)."""
+    counts: dict[str, int] = defaultdict(int)
+    for run in runs:
+        if run["pr"]["number"] is None or is_terminal(State(str(run["state"]))):
+            continue
+        counts[str(run["review"]["state"])] += 1
+    return dict(counts)
+
+
 def build_timeline(
-    store: Store, task_id: int, *, now: datetime | None = None
+    store: Store,
+    task_id: int,
+    *,
+    now: datetime | None = None,
+    review_gate_mode: str = DEFAULT_REVIEW_GATE_MODE,
 ) -> dict[str, Any] | None:
     """One task's story: every run, every event, every message, in order."""
     task = store.get_task(task_id)
@@ -831,7 +939,7 @@ def build_timeline(
         str(run["id"]): run for run in store.list_runs() if run["task_id"] == task_id
     }
     runs = [
-        _run_view(store, run_rows[run_id], current)
+        _run_view(store, run_rows[run_id], current, review_gate_mode)
         for run_id in sorted(run_rows, key=lambda rid: str(run_rows[rid]["created_at"]))
     ]
     events = [
@@ -879,6 +987,22 @@ def build_timeline(
             "outcome": outcome,
             "merged_sha": latest["pr"]["merged_sha"],
             "merged_by": merged_by,
+            "devin_review": latest["review"],
+            "devin_review_history": [
+                {
+                    "head_sha": str(row["head_sha"]),
+                    "current": row["head_sha"] == latest["pr"]["head_sha"],
+                    "status": row["status"],
+                    "findings": row["findings"],
+                    "findings_by_kind": _json(row["findings_by_kind"]) or {},
+                    "review_url": row["review_url"],
+                    "requested_at": row["requested_at"],
+                    "status_at": row["status_at"],
+                    "verdict_at": row["verdict_at"],
+                    "last_error": row["last_error"],
+                }
+                for row in store.reviews_for_run(latest["run_id"])
+            ],
         }
     return {
         "task_id": task_id,

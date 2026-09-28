@@ -1,0 +1,42 @@
+{
+  "action": "created",
+  "pull_request": {
+    "number": 91,
+    "title": "fix(dashboard): keep native filter state across single-chart refresh",
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91",
+    "body": "Cause: the refresh path rebuilt filter state from defaults.\n\nFixes #4242\n\n<!-- automation-run: RUN_ID -->",
+    "head": {
+      "ref": "devin/issue-4242-RUN_ID",
+      "sha": "a1b2c3d4",
+      "repo": {
+        "full_name": "SoniaLei/superset-cognition-demo"
+      }
+    },
+    "base": {
+      "ref": "master",
+      "sha": "0501796837"
+    }
+  },
+  "repository": {
+    "full_name": "SoniaLei/superset-cognition-demo",
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo"
+  },
+  "sender": {
+    "login": "devin-ai-integration[bot]",
+    "type": "Bot"
+  },
+  "comment": {
+    "id": 6101,
+    "commit_id": "a1b2c3d4",
+    "path": "superset-frontend/src/dashboard/actions/nativeFilters.ts",
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91#discussion_r6101",
+    "user": {
+      "login": "devin-ai-integration[bot]",
+      "type": "Bot"
+    },
+    "body": "<!-- devin-review-comment {\"id\": \"SECURITY_pr-review-job-0000_0001\", \"file_path\": \"superset-frontend/src/dashboard/actions/nativeFilters.ts\", \"start_line\": 40, \"end_line\": 44, \"side\": \"RIGHT\", \"based_on_repo_rules\": false, \"kind\": \"security\"} -->\n\n\ud83d\udd34 **Filter value is interpolated into a query string unescaped**\n\nThe refresh path passes the raw filter value into the URL."
+  }
+}
