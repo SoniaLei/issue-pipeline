@@ -118,10 +118,10 @@ def test_failed_checks_post_once_per_head_with_a_cross(
     failed = _by_kind(store, "checks_failed")
     anchor = _by_kind(store, "pr_opened")
     assert failed["thread_ts"] == anchor["slack_ts"]
-    assert failed["reaction"] == "x"
+    assert failed["reaction"] == "red_circle"
     text = json.loads(str(failed["payload"]))["text"]
-    assert text.startswith(":x: Checks failed")
-    assert [name for _, _, name in slack.reactions] == ["x"]
+    assert text.startswith(":red_circle: Checks failed")
+    assert [name for _, _, name in slack.reactions] == ["red_circle"]
 
 
 def test_review_findings_and_verified_each_react_on_the_anchor(

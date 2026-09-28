@@ -898,8 +898,8 @@ message id and cannot thread or react.
 
 **Why.** A channel that gets one line per lifecycle event per PR is a channel
 people mute. One line per PR, whose reactions read as its history at a glance
-(:x: checks failed, :mag: findings, :large_green_circle: verified,
-:white_check_mark: merged), keeps the channel readable while the thread keeps
+(:red_circle: checks failed, :mag: findings, :large_green_circle: verified,
+:white_check_mark: merged, :no_entry_sign: closed unmerged), keeps the channel readable while the thread keeps
 the record.
 
 **What this changes about D-011.** Check-derived messages were kept out of v1

@@ -44,8 +44,8 @@ _ANCHOR_REACTIONS: dict[Kind, str] = {
     Kind.READY_FOR_REVIEW: "eyes",
     Kind.VERIFIED: "large_green_circle",
     Kind.PR_MERGED: "white_check_mark",
-    Kind.PR_CLOSED: "x",
-    Kind.CHECKS_FAILED: "x",
+    Kind.PR_CLOSED: "no_entry_sign",
+    Kind.CHECKS_FAILED: "red_circle",
     Kind.REVIEW_FINDINGS: "mag",
     Kind.NEEDS_HUMAN: "warning",
 }
@@ -110,8 +110,8 @@ _KIND_EMOJI = {
     Kind.READY_FOR_REVIEW: ":eyes:",
     Kind.VERIFIED: ":large_green_circle:",
     Kind.PR_MERGED: ":white_check_mark:",
-    Kind.PR_CLOSED: ":x:",
-    Kind.CHECKS_FAILED: ":x:",
+    Kind.PR_CLOSED: ":no_entry_sign:",
+    Kind.CHECKS_FAILED: ":red_circle:",
     Kind.REVIEW_FINDINGS: ":mag:",
 }
 

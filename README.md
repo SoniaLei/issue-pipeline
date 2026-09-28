@@ -172,7 +172,8 @@ the ones it can check are present:
      (`/invite @app`). The run's *PR opened* post becomes its anchor: checks
      failed, Devin Review findings, verified, human review, merged and
      closed arrive as replies in its thread, each adding a reaction to the
-     anchor (:x: :mag: :large_green_circle: :thumbsup: :white_check_mark:),
+     anchor (:red_circle: :mag: :large_green_circle: :thumbsup:
+     :white_check_mark: :no_entry_sign:),
      so the channel reads one line per PR. Follow-ups wait for a retrying
      anchor and fall back to top-level if it never delivered; a reaction
      that fails is shown in the run's timeline, never retried, and never

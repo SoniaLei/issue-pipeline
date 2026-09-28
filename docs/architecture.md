@@ -656,13 +656,13 @@ line per PR whose emoji tell its fate; the thread holds the record.
 | Follow-up | Reaction on the anchor |
 | --- | --- |
 | Ready for review | :eyes: |
-| Checks failed | :x: |
+| Checks failed | :red_circle: |
 | Devin Review findings | :mag: |
 | Verified | :large_green_circle: |
 | Human approved / changes requested | :thumbsup: / :pencil2: |
 | Needs human | :warning: |
 | Merged | :white_check_mark: |
-| Closed unmerged | :x: |
+| Closed unmerged | :no_entry_sign: |
 
 Rules, in order:
 

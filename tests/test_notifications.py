@@ -77,7 +77,7 @@ def test_status_is_readable_from_the_emoji_alone(intake: Intake, store: Store) -
     )
 
     assert merged["text"].startswith(":white_check_mark:")
-    assert closed["text"].startswith(":x:")
+    assert closed["text"].startswith(":no_entry_sign:")
     assert blocked["text"].startswith(":warning:")
     # An out-of-credits org is not a stuck session and should not look like one.
     assert operator["text"].startswith(":rotating_light:")
