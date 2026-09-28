@@ -14,26 +14,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Hooks are `repo: local` and installed from PyPI at pinned versions, so they
+# install without cloning hook repositories from GitHub.
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+  - repo: local
     hooks:
       - id: check-added-large-files
+        name: check for added large files
+        entry: check-added-large-files
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        stages: [pre-commit, pre-push, manual]
       - id: check-yaml
+        name: check yaml
+        entry: check-yaml
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        types: [yaml]
       - id: check-toml
+        name: check toml
+        entry: check-toml
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        types: [toml]
       - id: debug-statements
+        name: debug statements (python)
+        entry: debug-statement-hook
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        types: [python]
       - id: end-of-file-fixer
+        name: fix end of files
+        entry: end-of-file-fixer
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
       - id: trailing-whitespace
+        name: trim trailing whitespace
+        entry: trailing-whitespace-fixer
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        types: [text]
+        stages: [pre-commit, pre-push, manual]
       - id: detect-private-key
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.7
-    hooks:
+        name: detect private key
+        entry: detect-private-key
+        language: python
+        additional_dependencies: [pre-commit-hooks==5.0.0]
+        types: [text]
       - id: ruff
+        name: ruff
+        entry: ruff check --force-exclude
         args: [--fix, --show-fixes]
+        language: python
+        additional_dependencies: [ruff==0.9.7]
+        types_or: [python, pyi]
+        require_serial: true
       - id: ruff-format
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.15.0
-    hooks:
+        name: ruff-format
+        entry: ruff format --force-exclude
+        language: python
+        additional_dependencies: [ruff==0.9.7]
+        types_or: [python, pyi]
+        require_serial: true
       - id: mypy
+        name: mypy
+        entry: mypy
+        args: [--ignore-missing-imports]
+        language: python
+        additional_dependencies: [mypy==1.15.0, fastapi==0.115.6, httpx==0.28.1]
         files: ^(app|scripts)/
-        additional_dependencies: [fastapi==0.115.6, httpx==0.28.1]
+        types_or: [python, pyi]
+        require_serial: true
