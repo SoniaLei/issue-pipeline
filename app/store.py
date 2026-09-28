@@ -225,10 +225,11 @@ CREATE TABLE IF NOT EXISTS session_insights (
 -- compares like with like.
 CREATE TABLE IF NOT EXISTS provider_metrics (
     env                 TEXT PRIMARY KEY,
-    fetched_at          TEXT NOT NULL,
-    window_after        TEXT NOT NULL,
-    window_before       TEXT NOT NULL,
-    service_user_ids    TEXT NOT NULL,       -- JSON list
+    attempted_at        TEXT NOT NULL,       -- last read, successful or not
+    fetched_at          TEXT,                -- last successful read; window,
+    window_after        TEXT,                -- ids and metrics below belong
+    window_before       TEXT,                -- to it and move together
+    service_user_ids    TEXT,                -- JSON list
     metrics             TEXT,                -- JSON, verbatim
     last_error          TEXT
 );
@@ -732,29 +733,37 @@ class Store:
         metrics: dict[str, Any] | None,
         error: str | None = None,
     ) -> None:
+        ok = metrics is not None
         with self.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO provider_metrics
-                    (env, fetched_at, window_after, window_before,
+                    (env, attempted_at, fetched_at, window_after, window_before,
                      service_user_ids, metrics, last_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (env) DO UPDATE SET
-                    fetched_at = excluded.fetched_at,
-                    window_after = excluded.window_after,
-                    window_before = excluded.window_before,
-                    service_user_ids = excluded.service_user_ids,
-                    -- A failed refresh keeps the last good numbers and says so.
+                    attempted_at = excluded.attempted_at,
+                    -- A failed refresh keeps the last good numbers together
+                    -- with the window and identities they were read for.
+                    fetched_at = COALESCE(
+                        excluded.fetched_at, provider_metrics.fetched_at),
+                    window_after = COALESCE(
+                        excluded.window_after, provider_metrics.window_after),
+                    window_before = COALESCE(
+                        excluded.window_before, provider_metrics.window_before),
+                    service_user_ids = COALESCE(
+                        excluded.service_user_ids, provider_metrics.service_user_ids),
                     metrics = COALESCE(excluded.metrics, provider_metrics.metrics),
                     last_error = excluded.last_error
                 """,
                 (
                     env,
                     now_iso(),
-                    window_after.isoformat(),
-                    window_before.isoformat(),
-                    json.dumps(service_user_ids),
-                    json.dumps(metrics) if metrics is not None else None,
+                    now_iso() if ok else None,
+                    window_after.isoformat() if ok else None,
+                    window_before.isoformat() if ok else None,
+                    json.dumps(service_user_ids) if ok else None,
+                    json.dumps(metrics) if ok else None,
                     error,
                 ),
             )

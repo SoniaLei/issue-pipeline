@@ -226,12 +226,15 @@ itself (issues, action items by type, good and bad skill uses, suggested
 prompt). Analysis is requested once for finished sessions the provider did not
 analyse on its own.
 
-The worker reads at most one session per tick, re-reads a run when its state
-or session status moves and otherwise every `INSIGHTS_REFRESH_SECONDS`, and
-keeps reading a terminal run for `INSIGHTS_SETTLE_SECONDS` so late billing and
-analysis land. A failed read is stored as `last_error` beside the last good
-figures and shown on the page. `ANALYTICS_ENABLED=false` switches all of it
-off.
+Analytics never compete with runs: the worker makes one analytics read (a
+single session, or the org counts) only on a tick that had no run to advance,
+with a shorter per-request timeout than session calls. It re-reads a run when
+its state or session status moves and otherwise every
+`INSIGHTS_REFRESH_SECONDS`, and keeps reading a terminal run for
+`INSIGHTS_SETTLE_SECONDS` so late billing and analysis land — after that the
+run is left as it stands, analysed or not. A failed read is stored as
+`last_error` beside the last good figures and their window, and shown on the
+page. `ANALYTICS_ENABLED=false` switches all of it off.
 
 ## Configuration
 

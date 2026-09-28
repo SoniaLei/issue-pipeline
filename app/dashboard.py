@@ -543,9 +543,17 @@ def _cost(runs: list[dict[str, Any]]) -> dict[str, Any]:
     acus = [float(r["insights"]["cost"]["acus"]) for r in priced]
     total = sum(acus)
 
-    opened = [r for r in runs if r["pr"]["number"] is not None]
-    verified = [r for r in runs if r["verified"]]
-    merged = [r for r in runs if r["state"] == State.MERGED.value]
+    # Ratios are computed over priced runs only, so an unpriced PR neither
+    # reads as free nor dilutes the cost of the ones Devin has priced. The
+    # denominators say how many outcomes that covers, and how many it does not.
+    opened = [r for r in priced if r["pr"]["number"] is not None]
+    verified = [r for r in priced if r["verified"]]
+    merged = [r for r in priced if r["state"] == State.MERGED.value]
+    unpriced_with_pr = sum(
+        1
+        for r in with_session
+        if r["insights"]["cost"]["acus"] is None and r["pr"]["number"] is not None
+    )
     acus_without_pr = sum(
         float(r["insights"]["cost"]["acus"])
         for r in priced
@@ -598,15 +606,15 @@ def _cost(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "acus_total": total,
         "acus_median_per_run": statistics.median(acus) if acus else None,
         "acus_p90_per_run": _percentile(acus, 0.9) if acus else None,
-        # A ratio over unpriced sessions would read as "free"; it is unknown.
-        "acus_per_pr_opened": _ratio(total, len(opened)) if priced else None,
-        "acus_per_verified_pr": _ratio(total, len(verified)) if priced else None,
-        "acus_per_merged_pr": _ratio(total, len(merged)) if priced else None,
+        "acus_per_pr_opened": _ratio(total, len(opened)) if opened else None,
+        "acus_per_verified_pr": _ratio(total, len(verified)) if verified else None,
+        "acus_per_merged_pr": _ratio(total, len(merged)) if merged else None,
         "acus_without_pr": acus_without_pr,
         "denominators": {
             "pr_opened": len(opened),
             "verified": len(verified),
             "merged": len(merged),
+            "unpriced_with_pr": unpriced_with_pr,
         },
         "sources": dict(sources),
         "coverage": {
@@ -657,6 +665,7 @@ def _drift(
     if row is None:
         return {
             "status": "unavailable",
+            "attempted_at": None,
             "fetched_at": None,
             "window": None,
             "service_user_ids": [],
@@ -690,8 +699,13 @@ def _drift(
         status = "drift" if any(drift.values()) else "ok"
     return {
         "status": status,
-        "fetched_at": str(row["fetched_at"]),
-        "window": {"after": row["window_after"], "before": row["window_before"]},
+        "attempted_at": str(row["attempted_at"]),
+        "fetched_at": row["fetched_at"],
+        "window": (
+            {"after": row["window_after"], "before": row["window_before"]}
+            if row["fetched_at"]
+            else None
+        ),
         "service_user_ids": _json(row["service_user_ids"]) or [],
         "provider": provider,
         "pipeline": pipeline,

@@ -278,9 +278,9 @@ function renderCost(c, defs) {
   const n = (v, d) => v === null || v === undefined ? "—" : fmtAcu(v);
   $("cost").replaceChildren(
     stat("ACUs total", n(c.acus_total), cov.priced ? "" : "dim", `${cov.priced}/${cov.runs_with_session} sessions priced`),
-    stat("per PR opened", n(c.acus_per_pr_opened), "info", `${c.denominators.pr_opened} PR${c.denominators.pr_opened === 1 ? "" : "s"}`),
-    stat("per verified PR", n(c.acus_per_verified_pr), "ok", `${c.denominators.verified} verified`),
-    stat("per merged PR", n(c.acus_per_merged_pr), "ok", `${c.denominators.merged} merged`),
+    stat("per PR opened", n(c.acus_per_pr_opened), "info", `${c.denominators.pr_opened} priced PR${c.denominators.pr_opened === 1 ? "" : "s"}${c.denominators.unpriced_with_pr ? ` · ${c.denominators.unpriced_with_pr} unpriced` : ""}`),
+    stat("per verified PR", n(c.acus_per_verified_pr), "ok", `${c.denominators.verified} priced verified`),
+    stat("per merged PR", n(c.acus_per_merged_pr), "ok", `${c.denominators.merged} priced merged`),
     stat("median / run", n(c.acus_median_per_run), "", c.acus_p90_per_run !== null ? `p90 ${fmtAcu(c.acus_p90_per_run)}` : ""),
     stat("spent without a PR", n(c.acus_without_pr), c.acus_without_pr ? "warn" : "dim", "terminal runs, no PR"),
     stat("awaiting cost", cov.no_cost_yet, cov.no_cost_yet ? "warn" : "dim", "provider has not published"),
@@ -312,6 +312,7 @@ function renderCost(c, defs) {
     el("b", { text: "Provider figures. " }), defs.cost, " ", defs.session_size,
     src ? ` Sources: ${src}.` : "",
     c.fetched_at ? ` Last read from Devin ${ago(c.fetched_at)}.` : " No analytics read from Devin yet.",
+    c.denominators.unpriced_with_pr ? ` Ratios cover priced sessions only; ${c.denominators.unpriced_with_pr} PR${c.denominators.unpriced_with_pr === 1 ? " has" : "s have"} no provider cost yet.` : "",
     cov.priced && cov.priced < 5 ? " Fewer than 5 priced sessions: ratios are anecdotes, not rates." : "");
 }
 
@@ -330,7 +331,7 @@ function renderHealth(h, defs) {
     ...group("Devin analytics cross-check · GitHub stays authoritative"),
   ];
   if (a.status === "unavailable") {
-    rows.push(...dt("provider metrics", el("span", { class: "pill plain", text: "not read yet" })));
+    rows.push(...dt("provider metrics", el("span", { class: a.last_error ? "pill warn" : "pill plain", text: a.attempted_at ? `no successful read · last tried ${ago(a.attempted_at)}` : "not read yet" })));
     if (a.last_error) rows.push(...dt("last analytics error", el("span", { class: "small", text: a.last_error })));
   } else {
     const tone = a.status === "ok" ? "ok" : "warn";
@@ -347,7 +348,7 @@ function renderHealth(h, defs) {
     rows.push(...dt("provider window", el("span", { class: "small muted", text: `${fmtTime(a.window.after)} → ${fmtTime(a.window.before)} · service user ${a.service_user_ids.join(", ") || "—"} · read ${ago(a.fetched_at)}` })));
     if (a.provider.avg_acus_per_session !== null && a.provider.avg_acus_per_session !== undefined)
       rows.push(...dt("Devin avg ACU / session", el("span", { class: "mono", text: fmtAcu(a.provider.avg_acus_per_session) })));
-    if (a.last_error) rows.push(...dt("last analytics error", el("span", { class: "small", text: a.last_error })));
+    if (a.last_error) rows.push(...dt("last analytics error", el("span", { class: "small", text: `${a.last_error} (${ago(a.attempted_at)}; counts above are from the last successful read)` })));
   }
   rows.push(el("dd", { class: "def", style: "grid-column:1/-1;margin-top:2px", text: defs.drift }));
   $("health").replaceChildren(...rows);

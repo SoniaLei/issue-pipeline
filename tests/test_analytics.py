@@ -47,7 +47,7 @@ from app.slack_client import FakeSlackTransport
 from app.states import State
 from app.store import Store
 from app.worker import Worker
-from tests.conftest import deliver, load_script
+from tests.conftest import deliver, load_fixture, load_script, substitute_run_id
 from tests.test_dashboard import run_to_pr, send
 
 ORG = "org-test"
@@ -227,6 +227,43 @@ def test_an_analytics_timeout_is_retryable() -> None:
     assert excinfo.value.retryable is True
 
 
+def test_analytics_reads_get_a_shorter_timeout_than_session_calls() -> None:
+    timeouts: dict[str, float | None] = {}
+    prefix = f"/v3/organizations/{ORG}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix(prefix)
+        timeouts[path] = request.extensions["timeout"]["read"]
+        return httpx.Response(200, json={"items": [], "total_acus": 0})
+
+    client = LiveDevinClient(
+        base_url="https://api.example",
+        org_id=ORG,
+        token="cog_test",
+        timeout=30.0,
+        analytics_timeout=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    client.get_session_insights("devin-1")
+    client.get_session_consumption("devin-1")
+    client.request_session_insights("devin-1")
+    client.get_provider_metrics(
+        service_user_ids=["u"],
+        time_after=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        time_before=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    client.find_session_by_tag("x")
+
+    assert timeouts == {
+        "/sessions/devin-1/insights": 5.0,
+        "/consumption/daily/sessions/devin-1": 5.0,
+        "/sessions/devin-1/insights/generate": 5.0,
+        "/metrics/prs": 5.0,
+        "/metrics/sessions": 5.0,
+        "/sessions": 30.0,
+    }
+
+
 # --------------------------------------------------------------- worker + store
 
 
@@ -355,6 +392,121 @@ def test_a_failed_metrics_refresh_keeps_the_last_good_numbers(
     )
 
 
+def test_a_failed_metrics_refresh_keeps_the_window_the_numbers_were_read_for(
+    intake: Intake, worker: Worker, store: Store, devin: SimulatedDevinClient
+) -> None:
+    run_to_pr(intake, worker, store)
+    good = store.provider_metrics("sim")
+    assert good is not None
+
+    def fail(**kwargs: Any) -> Any:
+        raise DevinError("metrics returned 503", retryable=True)
+
+    devin.get_provider_metrics = fail  # type: ignore[method-assign]
+    later = datetime.now(timezone.utc) + timedelta(hours=6)
+    worker._refresh_metrics("sim", later)
+
+    row = store.provider_metrics("sim")
+    assert row is not None
+    # The good numbers keep the metadata they were read with...
+    assert row["fetched_at"] == good["fetched_at"]
+    assert row["window_before"] == good["window_before"]
+    assert row["service_user_ids"] == good["service_user_ids"]
+    # ...while the failed attempt is recorded on its own.
+    assert row["attempted_at"] > good["attempted_at"]
+    drift = build_dashboard(store, "sim")["health"]["devin_analytics"]
+    assert drift["fetched_at"] == good["fetched_at"]
+    assert drift["window"]["before"] == good["window_before"]
+    assert drift["attempted_at"] == row["attempted_at"]
+    assert drift["last_error"] == "metrics returned 503"
+
+
+def test_a_first_metrics_read_that_fails_has_no_window_to_show(
+    intake: Intake, store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    class NoMetrics(SimulatedDevinClient):
+        def get_provider_metrics(self, **kwargs: Any) -> Any:
+            raise DevinError("metrics returned 500", retryable=True)
+
+    devin = NoMetrics(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_to_pr(intake, worker, store)
+
+    row = store.provider_metrics("sim")
+    assert row is not None
+    assert row["metrics"] is None
+    assert row["fetched_at"] is None
+    drift = build_dashboard(store, "sim")["health"]["devin_analytics"]
+    assert drift["status"] == "unavailable"
+    assert drift["fetched_at"] is None
+    assert drift["window"] is None
+    assert drift["attempted_at"] is not None
+    assert drift["last_error"] == "metrics returned 500"
+
+
+class _Counting(SimulatedDevinClient):
+    """Records which provider analytics endpoints each call went to."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.calls: list[str] = []
+
+    def get_session_insights(self, session_id: str) -> SessionInsights:
+        self.calls.append("insights")
+        return super().get_session_insights(session_id)
+
+    def get_provider_metrics(self, **kwargs: Any) -> Any:
+        self.calls.append("metrics")
+        return super().get_provider_metrics(**kwargs)
+
+
+def test_analytics_wait_for_a_tick_with_no_run_to_advance(
+    intake: Intake, store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    """A slow analytics endpoint costs idle ticks, never a run's progress."""
+    devin = _Counting(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = str(deliver(intake, "issues", "issue_labeled.json").run_id)
+
+    ticks_with_a_run = 0
+    while _run(store, run_id)["state"] in {
+        State.QUEUED.value,
+        State.STARTING.value,
+        State.RUNNING.value,
+    }:
+        assert worker.tick() is True
+        ticks_with_a_run += 1
+        assert ticks_with_a_run < 20
+        assert devin.calls == [], "analytics ran on a tick that advanced a run"
+    assert ticks_with_a_run > 1
+
+    # The run is now waiting on GitHub, so ticks are idle and analytics get
+    # their turn, one endpoint per tick.
+    worker.tick()
+    assert devin.calls == ["insights"]
+    worker.tick()
+    assert devin.calls == ["insights", "metrics"]
+    worker.tick()
+    assert devin.calls == ["insights", "metrics"]
+
+
+def test_a_state_change_re_reads_the_org_counts_on_the_next_idle_tick(
+    intake: Intake, store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    devin = _Counting(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = run_to_pr(intake, worker, store)
+    for _ in range(3):
+        worker.tick()
+    devin.calls.clear()
+
+    send(intake, "check_suite", "check_suite_success.json", run_id)
+    send(intake, "pull_request", "pr_merged.json", run_id)
+    worker.tick()
+    worker.tick()
+    assert devin.calls == ["insights", "metrics"]
+
+
 def test_analytics_can_be_switched_off(
     intake: Intake, store: Store, settings: Settings, slack: FakeSlackTransport
 ) -> None:
@@ -388,7 +540,12 @@ def test_cost_is_computed_from_billing_grade_figures_when_published(
     assert cost["acus_per_merged_pr"] == pytest.approx(4.25)
     assert cost["acus_median_per_run"] == pytest.approx(4.25)
     assert cost["acus_without_pr"] == 0
-    assert cost["denominators"] == {"pr_opened": 1, "verified": 1, "merged": 1}
+    assert cost["denominators"] == {
+        "pr_opened": 1,
+        "verified": 1,
+        "merged": 1,
+        "unpriced_with_pr": 0,
+    }
     assert cost["sources"] == {"billing": 1}
     assert cost["coverage"]["priced"] == 1
     assert cost["coverage"]["no_cost_yet"] == 0
@@ -451,6 +608,160 @@ def test_a_session_with_no_figure_yet_is_pending_not_free(
         "analysis_pending": 0,
     }
     assert store.get_run(run_id) is not None
+
+
+def _second_run_with_pr(intake: Intake, worker: Worker, store: Store) -> str:
+    """A second run on another issue, driven to PR-open."""
+    issue = dict(load_fixture("issue_labeled.json")["issue"], number=4243)
+    result = deliver(intake, "issues", "issue_labeled.json", issue=issue)
+    run_id = str(result.run_id)
+    for _ in range(10):
+        worker.tick()
+    raw = json.dumps(load_fixture("pr_opened.json")).replace("4242", "4243")
+    fixture = json.loads(raw)
+    pr = dict(substitute_run_id(fixture, run_id)["pull_request"], number=99)
+    send(intake, "pull_request", "pr_opened.json", run_id, pull_request=pr)
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["state"] == State.PR_OPEN.value
+    assert run["pr_number"] == 99
+    return run_id
+
+
+def test_ratios_cover_priced_runs_only_when_pricing_is_partial(
+    intake: Intake, worker: Worker, store: Store
+) -> None:
+    """One priced PR and one unpriced PR: the ratio is the priced PR's cost
+    over one PR, not over two, and the caveat says what it leaves out."""
+    first = run_to_pr(intake, worker, store)
+    second = _second_run_with_pr(intake, worker, store)
+    for _ in range(3):
+        worker.tick()
+    assert _insights_row(store, second)["billed_acus"] is not None
+
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE session_insights SET billed_acus = NULL, acus_consumed = NULL"
+            " WHERE run_id = ?",
+            (second,),
+        )
+        conn.execute("UPDATE runs SET acus_consumed = NULL WHERE id = ?", (second,))
+
+    cost = build_dashboard(store, "sim")["cost"]
+    assert cost["coverage"]["priced"] == 1
+    assert cost["coverage"]["no_cost_yet"] == 1
+    assert cost["acus_total"] == pytest.approx(4.25)
+    assert cost["acus_per_pr_opened"] == pytest.approx(4.25)
+    assert cost["denominators"]["pr_opened"] == 1
+    assert cost["denominators"]["unpriced_with_pr"] == 1
+    # Neither PR is verified or merged, so those ratios are unknown, not 0.
+    assert cost["acus_per_verified_pr"] is None
+    assert cost["acus_per_merged_pr"] is None
+    assert store.get_run(first) is not None
+
+
+def test_a_ratio_whose_only_outcome_is_unpriced_is_unknown(
+    intake: Intake, worker: Worker, store: Store
+) -> None:
+    """The priced run has no PR and the run with the PR has no price: total
+    ACUs exist, but nothing can honestly be said per PR."""
+    first = run_to_pr(intake, worker, store)
+    second = _second_run_with_pr(intake, worker, store)
+    for _ in range(3):
+        worker.tick()
+
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE session_insights SET billed_acus = NULL, acus_consumed = NULL"
+            " WHERE run_id = ?",
+            (second,),
+        )
+        conn.execute("UPDATE runs SET acus_consumed = NULL WHERE id = ?", (second,))
+        conn.execute(
+            "UPDATE runs SET pr_number = NULL, pr_url = NULL WHERE id = ?", (first,)
+        )
+
+    cost = build_dashboard(store, "sim")["cost"]
+    assert cost["acus_total"] == pytest.approx(4.25)
+    assert cost["acus_per_pr_opened"] is None
+    assert cost["denominators"] == {
+        "pr_opened": 0,
+        "verified": 0,
+        "merged": 0,
+        "unpriced_with_pr": 1,
+    }
+
+
+@pytest.mark.parametrize("reported", [None, "not_started"])
+def test_generation_is_requested_once_for_an_unanalysed_finished_session(
+    intake: Intake,
+    store: Store,
+    settings: Settings,
+    slack: FakeSlackTransport,
+    reported: str | None,
+) -> None:
+    requests: list[str] = []
+
+    class Unanalysed(SimulatedDevinClient):
+        def get_session_insights(self, session_id: str) -> SessionInsights:
+            given = super().get_session_insights(session_id)
+            return dataclasses.replace(given, analysis_status=reported, analysis=None)
+
+        def request_session_insights(self, session_id: str) -> str:
+            requests.append(session_id)
+            return super().request_session_insights(session_id)
+
+    devin = Unanalysed(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = run_to_pr(intake, worker, store)
+    for _ in range(3):
+        worker.tick()
+    assert requests == ["devin-sim-0001"]
+    assert _insights_row(store, run_id)["generate_requested_at"] is not None
+
+    # State changes force re-reads; none of them asks again.
+    send(intake, "check_suite", "check_suite_success.json", run_id)
+    worker.refresh_analytics()
+    send(intake, "pull_request", "pr_merged.json", run_id)
+    worker.refresh_analytics()
+    assert requests == ["devin-sim-0001"]
+    assert build_dashboard(store, "sim")["cost"]["coverage"]["analysis_pending"] == 1
+
+
+def test_a_terminal_run_settles_at_the_deadline_even_if_never_analysed(
+    intake: Intake, store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    class Unanalysed(SimulatedDevinClient):
+        def get_session_insights(self, session_id: str) -> SessionInsights:
+            given = super().get_session_insights(session_id)
+            return dataclasses.replace(given, analysis_status="started", analysis=None)
+
+    quick = dataclasses.replace(settings, insights_settle_seconds=60)
+    devin = Unanalysed(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, quick, devin, slack, owner="test")
+    run_id = run_to_pr(intake, worker, store)
+    send(intake, "check_suite", "check_suite_success.json", run_id)
+    send(intake, "pull_request", "pr_merged.json", run_id)
+    worker.refresh_analytics()
+    row = _insights_row(store, run_id)
+    assert row["settled"] == 0
+    assert row["analysis_status"] == "started"
+
+    # Two minutes after the merge the deadline has passed: one last read
+    # marks the row settled, and nothing is asked of the provider afterwards.
+    with store.transaction() as conn:
+        ended = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        conn.execute("UPDATE runs SET updated_at = ? WHERE id = ?", (ended, run_id))
+    long_ago = datetime.now(timezone.utc) + timedelta(days=1)
+    worker._refresh_insights(_run(store, run_id), long_ago)
+    row = _insights_row(store, run_id)
+    assert row["settled"] == 1
+    assert row["analysis_status"] == "started"
+    assert store.insights_candidates("sim", long_ago) == []
+
+    insights = build_dashboard(store, "sim")["tasks"][0]["insights"]
+    assert insights["analysis"] is None
+    assert insights["analysis_status"] == "started"
 
 
 def test_drift_compares_devin_with_github_and_never_reconciles(

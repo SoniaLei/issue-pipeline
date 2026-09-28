@@ -125,6 +125,7 @@ class Worker:
         self.devin = devin
         self.slack = slack
         self.owner = owner or f"{socket.gethostname()}-{id(self)}"
+        self._metrics_dirty = False
 
     # ------------------------------------------------------------------ main loop
 
@@ -135,17 +136,18 @@ class Worker:
                 time.sleep(self.settings.poll_interval_seconds)
 
     def tick(self) -> bool:
-        """Advance at most one run, deliver due notifications, then read
-        analytics for at most one session."""
+        """Advance at most one run, deliver due notifications, and on a tick
+        with no run to advance, make one analytics read."""
         self.store.heartbeat("worker", self.owner)
         advanced = self.advance_one()
         delivered = self.drain_outbox()
-        if self.settings.analytics_enabled:
+        if self.settings.analytics_enabled and not advanced:
+            # Analytics are observation, not control: they wait for an idle
+            # tick so a slow provider endpoint delays no run, and a broken
+            # one must never stop runs from advancing.
             try:
                 self.refresh_analytics()
             except Exception:
-                # Analytics are observation, not control: a broken analytics
-                # endpoint must never stop runs from advancing.
                 logger.exception("analytics refresh failed")
         return advanced or delivered > 0
 
@@ -478,28 +480,34 @@ class Worker:
     # ------------------------------------------------------------------ analytics
 
     def refresh_analytics(self) -> bool:
-        """Read Devin's account of one session, and the org counts on schedule.
+        """Read Devin's account of one session, or the org counts when due.
 
         Everything read here is stored beside the run, never applied to it:
         the run's state comes from GitHub and the session poll, the numbers
-        here say what the run cost and what the provider thinks of it.
+        here say what the run cost and what the provider thinks of it. One
+        read per tick keeps the worker's time in analytics bounded by a few
+        short-timeout calls.
         """
         env = self.settings.env
         now = utcnow()
-        worked = False
         cutoff = now - timedelta(seconds=self.settings.insights_refresh_seconds)
         candidates = self.store.insights_candidates(env, cutoff)
         if candidates:
             self._refresh_insights(candidates[0], now)
-            worked = True
+            # A run moving is the moment the two sides can diverge, so the
+            # counts are re-read on the next idle tick as well as on the interval.
+            self._metrics_dirty = True
+            return True
         # Nothing to filter on until a session has said which identity it ran
         # as; unfiltered org numbers would count every human's session as
-        # pipeline work. A run moving is the moment the two sides can diverge,
-        # so the counts are re-read then as well as on the interval.
-        if self.store.service_user_ids(env) and (worked or self._metrics_due(env, now)):
+        # pipeline work.
+        if self.store.service_user_ids(env) and (
+            self._metrics_dirty or self._metrics_due(env, now)
+        ):
             self._refresh_metrics(env, now)
-            worked = True
-        return worked
+            self._metrics_dirty = False
+            return True
+        return False
 
     def _refresh_insights(self, run: sqlite3.Row, now: datetime) -> None:
         run_id = str(run["id"])
@@ -547,7 +555,7 @@ class Worker:
         finished = _session_finished(insights) or is_terminal(State(str(run["state"])))
         if (
             finished
-            and insights.analysis_status is None
+            and insights.analysis_status in {None, "not_started"}
             and (previous is None or previous["generate_requested_at"] is None)
         ):
             # Small sessions are not analysed unless asked; asking is free and
@@ -559,13 +567,14 @@ class Worker:
                 logger.warning("insights generate failed for %s: %s", run_id, exc)
                 fields["last_error"] = str(exc)
 
-        analysis_done = insights.analysis_status in {"completed", "failed"}
+        # The settle window is a deadline, not a wait for the provider: a
+        # terminal run stops being re-read once it has passed, whatever the
+        # analysis status ended up as. Whatever was read last stands.
         ended = datetime.fromisoformat(str(run["updated_at"]))
         if ended.tzinfo is None:  # pragma: no cover - defensive
             ended = ended.replace(tzinfo=timezone.utc)
         fields["settled"] = int(
             is_terminal(State(str(run["state"])))
-            and analysis_done
             and (now - ended).total_seconds() > self.settings.insights_settle_seconds
         )
 
@@ -596,8 +605,10 @@ class Worker:
         row = self.store.provider_metrics(env)
         if row is None:
             return True
-        fetched = datetime.fromisoformat(str(row["fetched_at"]))
-        return (now - fetched).total_seconds() >= self.settings.metrics_refresh_seconds
+        attempted = datetime.fromisoformat(str(row["attempted_at"]))
+        return (
+            now - attempted
+        ).total_seconds() >= self.settings.metrics_refresh_seconds
 
     def _refresh_metrics(self, env: str, now: datetime) -> None:
         ids = self.store.service_user_ids(env)

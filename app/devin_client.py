@@ -325,9 +325,14 @@ class LiveDevinClient:
         org_id: str,
         token: str,
         timeout: float = 30.0,
+        analytics_timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._base = f"{base_url.rstrip('/')}/v3/organizations/{org_id}"
+        # Analytics reads share the worker thread with run processing, so
+        # they get a short leash: a slow insights endpoint costs a tick, not
+        # a run.
+        self._analytics_timeout = analytics_timeout
         self._client = httpx.Client(
             timeout=timeout,
             transport=transport,
@@ -413,16 +418,21 @@ class LiveDevinClient:
             "POST", f"/sessions/{session_id}/messages", json={"message": message}
         )
 
+    def _analytics(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        return self._request(method, path, timeout=self._analytics_timeout, **kwargs)
+
     def get_session_insights(self, session_id: str) -> SessionInsights:
-        return _parse_insights(self._request("GET", f"/sessions/{session_id}/insights"))
+        return _parse_insights(
+            self._analytics("GET", f"/sessions/{session_id}/insights")
+        )
 
     def request_session_insights(self, session_id: str) -> str:
-        data = self._request("POST", f"/sessions/{session_id}/insights/generate")
+        data = self._analytics("POST", f"/sessions/{session_id}/insights/generate")
         return str(data.get("status") or "requested")
 
     def get_session_consumption(self, session_id: str) -> DailyConsumption:
         return _parse_consumption(
-            self._request("GET", f"/consumption/daily/sessions/{session_id}")
+            self._analytics("GET", f"/consumption/daily/sessions/{session_id}")
         )
 
     def get_provider_metrics(
@@ -438,8 +448,8 @@ class LiveDevinClient:
             "time_before": int(time_before.timestamp()),
         }
         return _parse_metrics(
-            self._request("GET", "/metrics/prs", params=params),
-            self._request("GET", "/metrics/sessions", params=params),
+            self._analytics("GET", "/metrics/prs", params=params),
+            self._analytics("GET", "/metrics/sessions", params=params),
         )
 
 
