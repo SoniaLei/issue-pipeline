@@ -1,0 +1,101 @@
+{
+  "repo_notes": [
+    {
+      "content": "issue-pipeline is a small standalone service (FastAPI + a worker loop + SQLite) that turns an authorized GitHub issue into a Devin session, correlates the resulting pull request, records GitHub's check suites, Devin Review verdict, human review and merge for the PR's exact current head, notifies Slack through an outbox, and reports all of it on a dashboard. It is not a Devin Automation; it is hosted by its operator and receives GitHub webhooks. Document it as an authority-boundary system: GitHub is the source of truth for issues, PRs, checks, reviews and merges; Devin is the delegated worker and a provider of testimony (structured output, analytics, review progress) that is stored verbatim and shown beside GitHub's facts, never in place of them; Slack is a notification surface. Nothing in this service merges, deploys or acts on review comments.",
+      "author": "maintainer"
+    },
+    {
+      "content": "README.md is the canonical operating guide, docs/architecture.md the intended design, docs/decisions.md the record of why (D-001 onward). This generated wiki is navigation and context for onboarding, Ask Devin and Devin sessions; when it and the docs disagree, the docs state intent and the code/wiki state what was built, and the gap is fixed by a reviewed PR. Do not present wiki text as the decision record. Runtime knowledge for a target repository (how to stand up and test it) lives in .agents/skills/ in that repository, not here (D-031).",
+      "author": "maintainer"
+    },
+    {
+      "content": "Code map: app/main.py (FastAPI app, webhook endpoint, dashboard and API routes), app/intake.py (signature verification, dedupe, maintainer gate, PR correlation, check_suite and review events), app/states.py (task state machine and legal transitions), app/worker.py (lease-based worker: session create/poll, review gate on idle ticks, analytics, outbox delivery), app/devin_client.py (LiveDevinClient and SimulatedDevinClient behind one interface, incl. pr-reviews and analytics), app/review_gate.py (Devin Review verdict parsing and gate state), app/store.py (SQLite schema and queries), app/notifications.py + app/slack_client.py (outbox, fingerprints, Slack transport), app/dashboard.py + app/static/dashboard.html (per-env report), app/config.py (environment settings), scripts/run_simulation.py (zero-ACU end-to-end run), scripts/run_live.sh (API + worker + tunnel), fixtures/ (GitHub webhook and simulated session payloads), tests/ (pytest).",
+      "author": "maintainer"
+    },
+    {
+      "content": "Security-relevant invariants to state explicitly on the relevant pages: spend is authorized only by an allowlisted maintainer applying the approval label (the actor is checked, not the label); webhook bodies are HMAC-verified over the raw bytes and deduplicated by delivery id; issue and PR content is never treated as an instruction; the ACU ceiling is set at session creation and is the only hard spend control; the Devin API token is a dedicated service user; simulated (env=sim) and live (env=live) data are never combined in one figure; verification (checks and Devin Review) is bound to the PR's exact current head and a new commit resets it.",
+      "author": "maintainer"
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "What issue-pipeline is and is not (a hosted service, not a Devin Automation), the end-to-end flow from labelled issue to merged PR, the three parties (GitHub, Devin, Slack) and which of them is authoritative for what. Point readers to README.md for running it and docs/decisions.md for why it is built this way."
+    },
+    {
+      "title": "Getting started",
+      "purpose": "Onboarding path for a new engineer: read order (this wiki, README, architecture, decisions), how to run the zero-ACU simulation and open the dashboard, how to run the test suite, lint and type checks, and how a live run is started and what it costs.",
+      "parent": "Overview"
+    },
+    {
+      "title": "Authority boundaries",
+      "purpose": "The rule that GitHub facts (issue, PR, head SHA, checks, reviews, merge) drive state and outcome counts while Devin's outputs (structured output, session status, analytics, review progress) are stored verbatim and displayed beside them. Where in the code each boundary is enforced and why automatic merge and acting on review comments are excluded.",
+      "parent": "Overview"
+    },
+    {
+      "title": "Task lifecycle",
+      "purpose": "The task/run state machine in app/states.py: states, legal transitions, who (webhook vs worker) is allowed to cause each, and the terminal states. Include the state diagram and the invariants that GitHub-owned states (pr_open, merged, closed) are never moved by a Devin poll."
+    },
+    {
+      "title": "Intake and authorization",
+      "purpose": "app/intake.py: signature verification over raw bytes, allowlisted repositories and event/action pairs, delivery dedupe, the maintainer gate on the approval label (actor checked, not label), revocation before and after execution, and which events are recorded as timeline evidence.",
+      "parent": "Task lifecycle"
+    },
+    {
+      "title": "Devin execution",
+      "purpose": "How the worker creates and polls Devin sessions: the client interface shared by LiveDevinClient and SimulatedDevinClient, session tags for orphan recovery, the structured-output schema, the ACU ceiling set at creation, status mapping, and why a finished session is not a fix.",
+      "parent": "Task lifecycle"
+    },
+    {
+      "title": "PR correlation and checks",
+      "purpose": "How a pull_request event is matched to a run (branch name, tag, session), how check suites are recorded per head SHA and folded into a per-run checks_state, and why verification is always a statement about the current head.",
+      "parent": "Task lifecycle"
+    },
+    {
+      "title": "Devin Review gate",
+      "purpose": "app/review_gate.py and the pr_reviews table: the worker asks Devin Review once per (PR, head) and reads its progress from the pr-reviews API; the verdict (clear or N findings, by kind) is the Devin bot's review on GitHub for that commit. Explain the three separate facts (provider progress, GitHub verdict, human review), the off/advisory/required modes, why old-head rows are kept but never count, and how provider errors are isolated (D-033).",
+      "parent": "Task lifecycle"
+    },
+    {
+      "title": "Human review and merge",
+      "purpose": "What the pipeline records from pull_request_review and pull_request.closed events, why merge stays with a maintainer and branch protection, and how Devin Review, checks and human approval are shown as separate facts on the dashboard."
+    },
+    {
+      "title": "Slack notifications",
+      "purpose": "app/notifications.py and app/slack_client.py: the outbox pattern, fingerprints and dedupe keys, per-repository destination routing, the fake vs live transport, retry and delivery-health reporting."
+    },
+    {
+      "title": "Dashboard and observability",
+      "purpose": "app/dashboard.py and app/static/dashboard.html: the per-environment report (live vs sim never combined), outcome definitions (PR opened, checks passed, verified, merged, blocked/failed), the task table, the run timeline drawer, review-gate presentation, integration health, and data freshness."
+    },
+    {
+      "title": "Devin analytics and cost",
+      "purpose": "Session insights, daily consumption and organization PR/session metrics read from the Devin API into session_insights and provider_metrics: what each ACU figure means, why unpriced sessions are pending rather than zero, and the provider-vs-GitHub cross-check that shows drift without reconciling it (D-032).",
+      "parent": "Dashboard and observability"
+    },
+    {
+      "title": "Storage schema",
+      "purpose": "The SQLite tables in app/store.py (tasks, runs, deliveries, run_events, checks, pr_reviews, outbox, heartbeats, session_insights, provider_metrics), their keys and the env column, and the leases used instead of locks."
+    },
+    {
+      "title": "Configuration and budget controls",
+      "purpose": "Every environment variable in .env.example grouped by concern (GitHub, Devin, Slack, budget, review gate, analytics), with defaults and consequences; the three spend limits and why the ACU ceiling is set at create time."
+    },
+    {
+      "title": "Security model",
+      "purpose": "Threat model for a public repository: who can cause spend, what content is never treated as an instruction, webhook authentication and replay handling, credential scope (service user, webhook secret, Slack webhooks), what the service cannot do (push, merge), and how Devin Review and periodic scans fit as additional readers rather than approvers."
+    },
+    {
+      "title": "Running and operating",
+      "purpose": "scripts/run_simulation.py, scripts/run_live.sh, Docker Compose, the webhook registration needed on the watched repository, recovery rules after downtime, and how to read Needs attention and Integration health when something is stuck."
+    },
+    {
+      "title": "Testing",
+      "purpose": "tests/ layout, fixtures/ payloads, the simulated Devin client as a first-class component, what the simulation run proves, and the lint/type/test commands CI runs."
+    },
+    {
+      "title": "Documentation and feedback loop",
+      "purpose": "How README.md, docs/architecture.md, docs/decisions.md, .agents/skills/ in target repositories and this wiki relate; the overnight scheduled sweep that compares code with docs and opens issues or PRs for review; and the rule that nothing generated or proposed takes effect without a human merging it (D-034, D-035)."
+    }
+  ]
+}
