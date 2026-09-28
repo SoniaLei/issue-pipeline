@@ -162,7 +162,7 @@
     const age = (a, warnAfter) => a == null ? 'never' : `<span class="${a > warnAfter ? 'pill warn' : ''}">${fmtDur(a)} ago</span>`;
     $('health').innerHTML = kv([
       ['Devin poll', age(h.devin.age_seconds, 600)],
-      ['GitHub webhook <span class="sub">(all envs)</span>', age(h.github.age_seconds, 86400)],
+      ['GitHub webhook (all envs)', age(h.github.age_seconds, 86400)],
       ['Slack delivery', age(h.slack.age_seconds, 86400)],
       ['Slack failures', `<span class="${h.slack.failed_count ? 'pill bad' : ''}">${h.slack.failed_count}</span>`],
     ]) + (h.slack.failures.length ? `<div class="def">${h.slack.failures.slice(0, 3).map(f => esc(`${f.kind} → ${f.destination}: ${f.error || 'unknown error'}`)).join('<br>')}</div>` : '');
