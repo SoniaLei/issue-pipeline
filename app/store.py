@@ -134,6 +134,46 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (state, next_attempt_at);
+
+-- Append-only history of what happened to a run: every state change, plus
+-- the observations (session, PR, checks, review) that a timeline needs.
+CREATE TABLE IF NOT EXISTS run_events (
+    id          INTEGER PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES runs(id),
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,             -- state|session|pr|checks|verified|review
+    from_state  TEXT,
+    to_state    TEXT,
+    reason      TEXT,
+    detail      TEXT                       -- JSON, kind-specific
+);
+
+CREATE INDEX IF NOT EXISTS run_events_run ON run_events (run_id, id);
+
+-- One row per check suite GitHub reported for a head SHA on a tracked run.
+-- Verification is derived from all suites on the *current* head, never
+-- from a single one.
+CREATE TABLE IF NOT EXISTS checks (
+    run_id      TEXT NOT NULL REFERENCES runs(id),
+    head_sha    TEXT NOT NULL,
+    suite_id    TEXT NOT NULL,
+    app         TEXT,
+    status      TEXT NOT NULL,             -- queued | in_progress | completed
+    conclusion  TEXT,                      -- success | failure | ... | NULL
+    url         TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, head_sha, suite_id)
+);
+
+-- Liveness of the processes that are supposed to be running. A dashboard
+-- that cannot tell "nothing happened" from "nobody is looking" is useless.
+CREATE TABLE IF NOT EXISTS heartbeats (
+    component   TEXT PRIMARY KEY,          -- worker | api
+    owner       TEXT,
+    at          TEXT NOT NULL,
+    detail      TEXT
+);
 """.format(active=", ".join(f"'{value}'" for value in sorted(s.value for s in ACTIVE)))
 
 
@@ -323,6 +363,14 @@ class Store:
                 now_iso(),
             ),
         )
+        self.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="state",
+            to_state=state.value,
+            detail={"approved_by": approved_by} if approved_by else None,
+        )
         return run_id
 
     def get_run(self, run_id: str) -> sqlite3.Row | None:
@@ -354,12 +402,183 @@ class Store:
     def update_run(self, conn: sqlite3.Connection, run_id: str, **fields: Any) -> None:
         if not fields:
             return
+        previous: sqlite3.Row | None = None
+        if "state" in fields:
+            previous = conn.execute(
+                "SELECT task_id, state FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
         fields["updated_at"] = now_iso()
         assignments = ", ".join(f"{name} = ?" for name in fields)
         conn.execute(
             f"UPDATE runs SET {assignments} WHERE id = ?",
             (*fields.values(), run_id),
         )
+        if previous is not None and previous["state"] != fields["state"]:
+            self.record_event(
+                conn,
+                run_id=run_id,
+                task_id=int(previous["task_id"]),
+                kind="state",
+                from_state=str(previous["state"]),
+                to_state=str(fields["state"]),
+                reason=fields.get("failure_reason"),
+            )
+
+    # --------------------------------------------------------------------- events
+
+    def record_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        task_id: int,
+        kind: str,
+        from_state: str | None = None,
+        to_state: str | None = None,
+        reason: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO run_events
+                (run_id, task_id, at, kind, from_state, to_state, reason, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                task_id,
+                now_iso(),
+                kind,
+                from_state,
+                to_state,
+                reason,
+                json.dumps(detail) if detail is not None else None,
+            ),
+        )
+
+    def events_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM run_events WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+        )
+
+    def events_for_task(self, task_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM run_events WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        )
+
+    def all_events(self) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute("SELECT * FROM run_events ORDER BY id").fetchall()
+        )
+
+    # --------------------------------------------------------------------- checks
+
+    def record_check_suite(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        head_sha: str,
+        suite_id: str,
+        app: str | None,
+        status: str,
+        conclusion: str | None,
+        url: str | None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO checks
+                (run_id, head_sha, suite_id, app, status, conclusion, url, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (run_id, head_sha, suite_id) DO UPDATE SET
+                app = excluded.app,
+                status = excluded.status,
+                conclusion = excluded.conclusion,
+                url = excluded.url,
+                updated_at = excluded.updated_at
+            """,
+            (run_id, head_sha, suite_id, app, status, conclusion, url, now_iso()),
+        )
+
+    def checks_for_head(self, run_id: str, head_sha: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM checks WHERE run_id = ? AND head_sha = ? ORDER BY app",
+                (run_id, head_sha),
+            ).fetchall()
+        )
+
+    def runs_with_head(self, repo: str, head_sha: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                """
+                SELECT runs.* FROM runs
+                JOIN tasks ON tasks.id = runs.task_id
+                WHERE tasks.repo = ? AND runs.head_sha = ?
+                """,
+                (repo, head_sha),
+            ).fetchall()
+        )
+
+    # ----------------------------------------------------------------- heartbeats
+
+    def heartbeat(self, component: str, owner: str, detail: str | None = None) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO heartbeats (component, owner, at, detail)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (component) DO UPDATE SET
+                owner = excluded.owner, at = excluded.at, detail = excluded.detail
+            """,
+            (component, owner, now_iso(), detail),
+        )
+
+    def heartbeats(self) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute("SELECT * FROM heartbeats ORDER BY component").fetchall()
+        )
+
+    # ------------------------------------------------------------------ overview
+
+    def list_runs(self, env: str | None = None) -> list[sqlite3.Row]:
+        """Every run joined to its task, optionally for one environment only.
+
+        The environment filter is here rather than in the caller so a report
+        cannot accidentally sum live and simulated runs together.
+        """
+        sql = """
+            SELECT runs.*, tasks.repo AS task_repo, tasks.issue_number,
+                   tasks.issue_title, tasks.issue_state
+            FROM runs JOIN tasks ON tasks.id = runs.task_id
+        """
+        params: tuple[Any, ...] = ()
+        if env is not None:
+            sql += " WHERE runs.env = ?"
+            params = (env,)
+        sql += " ORDER BY runs.updated_at DESC"
+        return list(self._conn.execute(sql, params).fetchall())
+
+    def count_runs_by_env(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT env, COUNT(*) AS n FROM runs GROUP BY env"
+        ).fetchall()
+        return {str(row["env"]): int(row["n"]) for row in rows}
+
+    def last_delivery_at(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT MAX(received_at) AS at FROM deliveries"
+        ).fetchone()
+        return str(row["at"]) if row and row["at"] else None
+
+    def last_poll_at(self, env: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT MAX(session_polled_at) AS at FROM runs WHERE env = ?", (env,)
+        ).fetchone()
+        return str(row["at"]) if row and row["at"] else None
 
     def find_run_by_branch(self, repo: str, branch: str) -> sqlite3.Row | None:
         return self._conn.execute(

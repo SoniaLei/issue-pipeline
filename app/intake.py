@@ -35,7 +35,16 @@ from app.prompts import extract_marker
 from app.states import check_transition, PRE_EXECUTION, State
 from app.store import now_iso, Store
 
-SUPPORTED_EVENTS = frozenset({"issues", "pull_request", "pull_request_review", "ping"})
+SUPPORTED_EVENTS = frozenset(
+    {"issues", "pull_request", "pull_request_review", "check_suite", "ping"}
+)
+
+# Check-suite conclusions that mean the head is not verified, whatever any
+# other suite says.
+FAILING_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"}
+)
+PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 OPEN_ACTIONS = frozenset(
     {"opened", "reopened", "ready_for_review", "synchronize", "edited"}
 )
@@ -54,6 +63,26 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
         return False
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(f"sha256={digest}", header)
+
+
+def derive_checks_state(suites: list[sqlite3.Row]) -> str:
+    """Fold every check suite reported for one head SHA into one verdict.
+
+    Absent suites are ``unknown``, never passed; one failing suite fails the
+    head regardless of the others; anything still running is ``pending``. This
+    is "every suite GitHub reported", not "the suites branch protection
+    requires" — that distinction needs a GitHub API read and is a later uplift.
+    """
+    if not suites:
+        return "unknown"
+    conclusions = [suite["conclusion"] for suite in suites]
+    if any(c in FAILING_CONCLUSIONS for c in conclusions):
+        return "failed"
+    if any(suite["status"] != "completed" for suite in suites):
+        return "pending"
+    if all(c in PASSING_CONCLUSIONS for c in conclusions):
+        return "passed"
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -100,6 +129,8 @@ class Intake:
                 result = self._handle_issue(conn, repo, str(action), payload)
             elif event == "pull_request":
                 result = self._handle_pull_request(conn, repo, str(action), payload)
+            elif event == "check_suite":
+                result = self._handle_check_suite(conn, repo, str(action), payload)
             else:
                 result = self._handle_review(conn, repo, str(action), payload)
 
@@ -389,6 +420,19 @@ class Intake:
             check_transition(state, State.PR_OPEN)
             fields["state"] = State.PR_OPEN.value
         self.store.update_run(conn, run_id, **fields)
+        self.store.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="pr",
+            reason=action,
+            detail={
+                "number": fields["pr_number"],
+                "url": fields["pr_url"],
+                "head_sha": head_sha,
+                "draft": bool(fields["pr_draft"]),
+            },
+        )
 
         if action in NOTIFYING_OPEN_ACTIONS:
             self._notify(
@@ -428,6 +472,20 @@ class Intake:
         if state is not target:
             check_transition(state, target)
         self.store.update_run(conn, run_id, **fields)
+        self.store.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="pr",
+            reason="merged" if merged else "closed",
+            detail={
+                "number": fields["pr_number"],
+                "url": fields["pr_url"],
+                "head_sha": head_sha,
+                "merged_sha": fields.get("merged_sha"),
+                "merged_by": str((pull.get("merged_by") or {}).get("login") or ""),
+            },
+        )
         self._notify(
             conn,
             task_id=task_id,
@@ -486,14 +544,93 @@ class Intake:
         run = self._correlate(repo, pull) if pull else None
         if run is None:
             return IntakeResult(False, "review for an untracked PR")
-        self.store.update_run(
-            conn, str(run["id"]), review_state=str(review.get("state") or "")
+        review_state = str(review.get("state") or "")
+        self.store.update_run(conn, str(run["id"]), review_state=review_state)
+        self.store.record_event(
+            conn,
+            run_id=str(run["id"]),
+            task_id=int(run["task_id"]),
+            kind="review",
+            reason=review_state,
+            detail={
+                "reviewer": str((review.get("user") or {}).get("login") or ""),
+                "url": review.get("html_url"),
+                "commit": review.get("commit_id"),
+            },
         )
         return IntakeResult(
             True,
             f"review {action} recorded",
             task_id=int(run["task_id"]),
             run_id=str(run["id"]),
+        )
+
+    # --------------------------------------------------------------------- checks
+
+    def _handle_check_suite(
+        self, conn: sqlite3.Connection, repo: str, action: str, payload: dict[str, Any]
+    ) -> IntakeResult:
+        """Observe check suites for a tracked head.
+
+        Observation only: the derived verdict feeds the report and the
+        dashboard. It moves no state and sends no message — D-011 keeps
+        check-derived notifications out of v1, and this records what a
+        notification would later be based on.
+        """
+        suite = payload.get("check_suite") or {}
+        head_sha = str(suite.get("head_sha") or "")
+        if not suite or not head_sha:
+            return IntakeResult(False, "no check_suite in payload")
+        runs = self.store.runs_with_head(repo, head_sha)
+        if not runs:
+            return IntakeResult(False, "check suite for an untracked head")
+
+        app = (suite.get("app") or {}).get("slug") or (suite.get("app") or {}).get(
+            "name"
+        )
+        for run in runs:
+            run_id = str(run["id"])
+            before = derive_checks_state(self.store.checks_for_head(run_id, head_sha))
+            self.store.record_check_suite(
+                conn,
+                run_id=run_id,
+                head_sha=head_sha,
+                suite_id=str(suite.get("id") or ""),
+                app=str(app) if app else None,
+                status=str(suite.get("status") or "queued"),
+                conclusion=suite.get("conclusion"),
+                url=suite.get("html_url") or suite.get("url"),
+            )
+            after = derive_checks_state(self.store.checks_for_head(run_id, head_sha))
+            self.store.update_run(
+                conn, run_id, checks_state=after, checks_head_sha=head_sha
+            )
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=int(run["task_id"]),
+                kind="checks",
+                reason=after,
+                detail={
+                    "app": app,
+                    "status": suite.get("status"),
+                    "conclusion": suite.get("conclusion"),
+                    "head_sha": head_sha,
+                },
+            )
+            if after == "passed" and before != "passed":
+                self.store.record_event(
+                    conn,
+                    run_id=run_id,
+                    task_id=int(run["task_id"]),
+                    kind="verified",
+                    detail={"head_sha": head_sha},
+                )
+        return IntakeResult(
+            True,
+            f"check suite {action} recorded",
+            task_id=int(runs[0]["task_id"]),
+            run_id=str(runs[0]["id"]),
         )
 
     # --------------------------------------------------------------- notifications

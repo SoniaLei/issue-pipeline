@@ -141,7 +141,9 @@ Terminal states: `merged`, `closed_unmerged`, `cancelled`, `failed`, `no_output`
 entered only by check evaluation, which is gated off (D-011). With the gate off,
 a task stays in `pr_open` from the PR opening until it closes. The state is
 defined now so that enabling verification later is a flag and a transition, not
-a migration.
+a migration. The dashboard nevertheless *reports* a `pr_open` run whose
+current head has passing check suites under "awaiting review" — a report-time
+derivation from `checks_state`, not a state change (D-030).
 
 Revocation after execution has started is a flag on the run, not a state: see
 §5 Revocation and `decisions.md` D-006.
@@ -196,8 +198,10 @@ push code and cannot merge — D-005 says the pipeline must not merge, and this
 makes it unable to. Devin pushes its own branch under its own GitHub
 authentication.
 
-Events subscribed: `issues`, `pull_request`, `pull_request_review`, and
-`check_suite` / `status` once verification lands.
+Events subscribed: `issues`, `pull_request`, `pull_request_review` and
+`check_suite`. Check suites are recorded per head SHA and folded into a
+per-run `checks_state`; they never drive a transition (D-011), only the
+dashboard's *verified* count (D-030).
 
 ### Request path
 

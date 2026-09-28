@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>issue-pipeline dashboard</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #1d232b; --muted: #667085; --line: #e4e7ec;
+    --ok: #12805c; --warn: #b54708; --bad: #b42318; --info: #175cd3; --sim: #6941c6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         color: var(--ink); background: var(--bg); }
+  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center;
+           padding: 14px 24px; background: var(--card); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; }
+  .env-switch { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .env-switch button { border: 0; background: var(--card); padding: 6px 14px; cursor: pointer; color: var(--muted); }
+  .env-switch button.active { background: var(--ink); color: #fff; }
+  .env-switch button[data-env="sim"].active { background: var(--sim); }
+  .fresh { color: var(--muted); font-size: 13px; }
+  .fresh b { color: var(--ink); }
+  .banner { padding: 8px 24px; font-size: 13px; }
+  .banner.sim { background: #f4f0ff; color: var(--sim); border-bottom: 1px solid #e0d4ff; }
+  .banner.live { background: #ecfdf3; color: var(--ok); border-bottom: 1px solid #c8f0d9; }
+  .banner.stale { background: #fff4e5; color: var(--warn); }
+  main { padding: 20px 24px; display: grid; gap: 16px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; }
+  .stat { padding: 8px 10px; border-radius: 8px; background: var(--bg); }
+  .stat .n { font-size: 22px; font-weight: 600; }
+  .stat .l { color: var(--muted); font-size: 12px; }
+  .stat.bad .n { color: var(--bad); } .stat.warn .n { color: var(--warn); } .stat.ok .n { color: var(--ok); }
+  .def { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  tbody tr { cursor: pointer; } tbody tr:hover { background: var(--bg); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+          background: #eef2f6; color: var(--ink); }
+  .pill.ok { background: #e6f7ee; color: var(--ok); } .pill.warn { background: #fff4e5; color: var(--warn); }
+  .pill.bad { background: #fee4e2; color: var(--bad); } .pill.info { background: #e7f0fd; color: var(--info); }
+  .muted { color: var(--muted); } .small { font-size: 12px; }
+  .bars { display: flex; gap: 4px; align-items: flex-end; height: 70px; margin-top: 6px; }
+  .bar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; min-width: 6px; }
+  .bar div { border-radius: 2px 2px 0 0; }
+  .bar .v { background: #7fc8a9; } .bar .m { background: var(--ok); }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .health dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+  .health dt { color: var(--muted); } .health dd { margin: 0; }
+  #drawer { position: fixed; inset: 0 0 0 auto; width: min(760px, 100%); background: var(--card);
+            border-left: 1px solid var(--line); box-shadow: -8px 0 24px rgba(0,0,0,.08);
+            transform: translateX(100%); transition: transform .15s ease; overflow: auto; padding: 18px 22px; }
+  #drawer.open { transform: none; }
+  #drawer h2 { margin: 0 0 4px; font-size: 16px; }
+  #drawer .close { float: right; border: 0; background: none; font-size: 20px; cursor: pointer; color: var(--muted); }
+  .links a { margin-right: 14px; }
+  .tl { list-style: none; margin: 12px 0 0; padding: 0 0 0 14px; border-left: 2px solid var(--line); }
+  .tl li { position: relative; padding: 0 0 12px 14px; }
+  .tl li::before { content: ""; position: absolute; left: -19px; top: 5px; width: 8px; height: 8px;
+                   border-radius: 50%; background: var(--muted); }
+  .tl li.state::before { background: var(--info); } .tl li.verified::before { background: var(--ok); }
+  .tl li.bad::before { background: var(--bad); } .tl li.pr::before { background: #7fc8a9; }
+  .tl time { color: var(--muted); font-size: 12px; margin-right: 8px; }
+  pre { background: var(--bg); padding: 8px 10px; border-radius: 6px; font-size: 12px; overflow: auto; margin: 6px 0 0; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+  a { color: var(--info); text-decoration: none; } a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>issue-pipeline</h1>
+  <div class="env-switch" role="group" aria-label="Environment">
+    <button data-env="live">Live</button>
+    <button data-env="sim">Simulation</button>
+  </div>
+  <span class="fresh" id="fresh">loading…</span>
+  <span class="fresh" id="counts"></span>
+</header>
+<div class="banner" id="banner"></div>
+<main>
+  <section class="grid">
+    <div class="card"><h2>Current workload</h2><div class="stats" id="workload"></div></div>
+    <div class="card"><h2>Results</h2><div class="stats" id="results"></div>
+      <div class="def" id="results-def"></div></div>
+    <div class="card"><h2>Speed</h2><div class="stats" id="speed"></div>
+      <div class="def" id="speed-def"></div></div>
+    <div class="card"><h2>Throughput · last 14 UTC days</h2><div id="throughput"></div>
+      <div class="legend"><span><i style="background:#7fc8a9"></i>verified</span>
+      <span><i style="background:var(--ok)"></i>merged</span></div></div>
+    <div class="card health"><h2>Integration health</h2><dl id="health"></dl></div>
+  </section>
+  <section class="card">
+    <h2>Needs attention</h2>
+    <table><thead><tr><th>Issue</th><th>State</th><th>Blocker</th><th>Age</th><th>Next action</th></tr></thead>
+    <tbody id="attention"></tbody></table>
+  </section>
+  <section class="card">
+    <h2>Tasks</h2>
+    <table><thead><tr>
+      <th>Issue</th><th>State</th><th>Elapsed</th><th>Tests</th><th>PR</th><th>Slack</th><th>Last update</th>
+    </tr></thead><tbody id="tasks"></tbody></table>
+  </section>
+</main>
+<aside id="drawer" aria-hidden="true"></aside>
+<script>
+const DEFAULT_ENV = __DEFAULT_ENV__;
+const $ = (id) => document.getElementById(id);
+const el = (tag, attrs = {}, children = []) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const child of [].concat(children)) {
+    if (child === null || child === undefined) continue;
+    node.append(typeof child === "string" ? document.createTextNode(child) : child);
+  }
+  return node;
+};
+const link = (href, text) => href ? el("a", { href, target: "_blank", rel: "noopener", text }) : el("span", { class: "muted", text: "—" });
+const fmtDur = (s) => {
+  if (s === null || s === undefined) return "—";
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+  return `${(s / 86400).toFixed(1)}d`;
+};
+const fmtTime = (iso) => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toISOString().replace("T", " ").slice(0, 19) + "Z";
+};
+const ago = (iso) => iso ? `${fmtDur((Date.now() - new Date(iso)) / 1000)} ago` : "never";
+
+const BUCKET_LABEL = {
+  awaiting_approval: ["awaiting approval", ""], queued: ["queued", ""], running: ["running", "info"],
+  pr_open: ["PR opened", "info"], awaiting_review: ["verified · awaiting review", "ok"],
+  blocked: ["blocked", "warn"], failed: ["failed", "bad"], merged: ["merged", "ok"],
+  closed_unmerged: ["closed unmerged", "bad"], cancelled: ["cancelled", ""],
+};
+const pill = (bucket, extra) => {
+  const [label, tone] = BUCKET_LABEL[bucket] || [bucket, ""];
+  return el("span", { class: `pill ${tone}`, text: extra ? `${label} · ${extra}` : label });
+};
+const CHECK_TONE = { passed: "ok", failed: "bad", pending: "warn", unknown: "" };
+
+let env = new URLSearchParams(location.search).get("env") || DEFAULT_ENV;
+let timer = null;
+
+function stat(label, n, tone) {
+  return el("div", { class: `stat ${tone || ""}` }, [el("div", { class: "n", text: String(n) }), el("div", { class: "l", text: label })]);
+}
+
+function render(d) {
+  document.querySelectorAll(".env-switch button").forEach((b) => b.classList.toggle("active", b.dataset.env === env));
+  const stale = d.health.worker.stale;
+  $("fresh").replaceChildren("data as of ", el("b", { text: fmtTime(d.data_as_of) }), ` (${ago(d.data_as_of)}) · rendered ${fmtTime(d.generated_at)}`);
+  $("counts").textContent = `runs stored: live ${d.envs_available.live || 0} · sim ${d.envs_available.sim || 0}`;
+  const banner = $("banner");
+  banner.className = `banner ${env}${stale ? " stale" : ""}`;
+  banner.textContent = (env === "sim"
+    ? "SIMULATION — every number on this page comes from simulated runs and fixtures. Nothing here happened on GitHub or in Devin."
+    : "LIVE — numbers come only from live runs; simulated runs are excluded.")
+    + (stale ? `  ·  Worker heartbeat is stale (last tick ${ago(d.health.worker.last_tick_at)}): counts may be behind reality.` : "");
+
+  const w = d.workload;
+  $("workload").replaceChildren(
+    stat("queued", w.queued), stat("running", w.running, "info"), stat("PR opened", w.pr_open, "info"),
+    stat("awaiting review", w.awaiting_review, "ok"), stat("blocked", w.blocked, w.blocked ? "warn" : ""),
+    stat("failed", w.failed, w.failed ? "bad" : ""), stat("awaiting approval", w.awaiting_approval));
+  const r = d.results;
+  $("results").replaceChildren(stat("PRs opened", r.pr_opened), stat("verified", r.verified, "ok"), stat("merged", r.merged, "ok"), stat("closed unmerged", r.closed_unmerged, r.closed_unmerged ? "bad" : ""));
+  $("results-def").textContent = `Opened: ${d.definitions.pr_opened} Verified: ${d.definitions.verified} Merged: ${d.definitions.merged}`;
+  const s = d.speed;
+  $("speed").replaceChildren(
+    stat("median to review-ready", fmtDur(s.review_ready.median_seconds)), stat("p90", fmtDur(s.review_ready.p90_seconds)),
+    stat("samples", s.review_ready.samples), stat("median to PR opened", fmtDur(s.pr_opened.median_seconds)),
+    stat("samples", s.pr_opened.samples));
+  $("speed-def").textContent = d.definitions.review_ready + (s.review_ready.samples < 5 ? " Fewer than 5 samples: treat as anecdote, not a trend." : "");
+
+  const max = Math.max(1, ...d.throughput.map((x) => x.verified + x.merged));
+  $("throughput").replaceChildren(el("div", { class: "bars" }, d.throughput.map((day) =>
+    el("div", { class: "bar", title: `${day.day}: ${day.verified} verified, ${day.merged} merged` }, [
+      el("div", { class: "v", style: `height:${(day.verified / max) * 64}px` }),
+      el("div", { class: "m", style: `height:${(day.merged / max) * 64}px` }),
+    ]))));
+
+  const h = d.health;
+  const dt = (k, v, tone) => [el("dt", { text: k }), el("dd", { class: tone || "" }, v)];
+  $("health").replaceChildren(
+    ...dt("last GitHub delivery", `${fmtTime(h.github.last_delivery_at)} (${ago(h.github.last_delivery_at)})`),
+    ...dt("last Devin poll", `${fmtTime(h.devin.last_poll_at)} (${ago(h.devin.last_poll_at)})`),
+    ...dt("worker heartbeat", el("span", { class: h.worker.stale ? "pill warn" : "pill ok", text: h.worker.stale ? `stale · ${ago(h.worker.last_tick_at)}` : `ok · ${ago(h.worker.last_tick_at)}` })),
+    ...dt("Slack delivery failures", el("span", { class: h.slack.failed ? "pill bad" : "pill ok", text: `${h.slack.failed} failed · ${h.slack.pending} pending · ${h.slack.sent} sent` })),
+    ...(h.slack.last_error ? dt("last Slack error", el("span", { class: "small", text: h.slack.last_error })) : []),
+    ...dt("last Slack post", `${fmtTime(h.slack.last_sent_at)} (${ago(h.slack.last_sent_at)})`));
+
+  const att = $("attention");
+  att.replaceChildren(...(d.attention.length ? d.attention.map((a) => {
+    const row = el("tr", {}, [
+      el("td", {}, [link(a.issue.url, `#${a.issue.number}`), " ", el("span", { class: "muted small", text: a.issue.title })]),
+      el("td", {}, pill(BUCKET_FOR_STATE(a.state), a.reason)), el("td", { text: a.blocker }),
+      el("td", { text: fmtDur(a.age_seconds) }), el("td", { text: a.next_action })]);
+    row.onclick = () => openTimeline(a.task_id);
+    return row;
+  }) : [el("tr", {}, el("td", { colspan: 5, class: "empty", text: "Nothing needs a human right now." }))]));
+
+  const tb = $("tasks");
+  tb.replaceChildren(...(d.tasks.length ? d.tasks.map((t) => {
+    const checks = t.tests.checks;
+    const tests = el("div", {}, [
+      el("span", { class: `pill ${CHECK_TONE[checks.state] || ""}`, text: `checks ${checks.state}` }), " ",
+      el("span", { class: "small muted", text: `regression test ${t.tests.regression_test}` }),
+      t.tests.tests_run ? el("div", { class: "small muted", text: t.tests.tests_run }) : null]);
+    const pr = t.pr.number ? el("div", {}, [link(t.pr.url, `#${t.pr.number}`), " ",
+      el("span", { class: "small muted", text: t.pr.state + (t.pr.draft ? " · draft" : "") + (t.verified ? " · verified" : "") })]) : el("span", { class: "muted", text: "—" });
+    const slack = el("span", { class: `pill ${{ sent: "ok", failed: "bad", pending: "warn", none: "" }[t.slack.status]}`,
+      text: t.slack.status === "none" ? "no messages" : `${t.slack.status} · ${t.slack.sent}/${t.slack.sent + t.slack.pending + t.slack.failed}` });
+    const row = el("tr", {}, [
+      el("td", {}, [link(t.issue.url, `#${t.issue.number}`), " ", el("span", { text: t.issue.title }),
+        t.attempts > 1 ? el("span", { class: "small muted", text: ` · ${t.attempts} runs` }) : null]),
+      el("td", {}, [pill(t.bucket), t.failure_reason && ["blocked", "failed"].includes(t.bucket) ? el("div", { class: "small muted", text: t.failure_reason }) : null]),
+      el("td", { text: fmtDur(t.timing.elapsed_seconds) + (t.timing.ended_at ? "" : " ⏱") }),
+      el("td", {}, tests), el("td", {}, pr), el("td", {}, slack),
+      el("td", { class: "small muted", text: `${fmtTime(t.last_update)} · ${ago(t.last_update)}` })]);
+    row.onclick = () => openTimeline(t.task_id);
+    return row;
+  }) : [el("tr", {}, el("td", { colspan: 7, class: "empty", text: `No ${env === "sim" ? "simulated" : "live"} runs recorded yet.` }))]));
+}
+
+const STATE_BUCKET = { awaiting_approval: "awaiting_approval", queued: "queued", starting: "running", running: "running",
+  session_blocked: "blocked", pr_open: "pr_open", awaiting_review: "awaiting_review", no_output: "blocked", expired: "blocked",
+  failed: "failed", cancelled: "cancelled", merged: "merged", closed_unmerged: "closed_unmerged" };
+const BUCKET_FOR_STATE = (s) => STATE_BUCKET[s] || s;
+
+async function load() {
+  try {
+    const res = await fetch(`/api/dashboard?env=${encodeURIComponent(env)}`);
+    if (!res.ok) throw new Error(`${res.status}`);
+    render(await res.json());
+  } catch (err) {
+    $("fresh").textContent = `failed to load: ${err.message}`;
+  }
+}
+
+async function openTimeline(taskId) {
+  const drawer = $("drawer");
+  drawer.replaceChildren(el("p", { class: "muted", text: "loading…" }));
+  drawer.classList.add("open"); drawer.setAttribute("aria-hidden", "false");
+  const res = await fetch(`/api/tasks/${taskId}/timeline`);
+  if (!res.ok) { drawer.replaceChildren(el("p", { text: `failed to load timeline (${res.status})` })); return; }
+  const t = await res.json();
+  const latest = t.runs[t.runs.length - 1];
+  const close = el("button", { class: "close", "aria-label": "close", text: "×" });
+  close.onclick = closeTimeline;
+  const links = el("p", { class: "links" }, [
+    link(t.issue.url, `issue #${t.issue.number}`),
+    ...t.runs.map((r) => r.session.url ? link(r.session.url, `Devin session ${r.session.id || ""}`.trim()) : null),
+    ...t.runs.map((r) => r.pr.url ? link(r.pr.url, `PR #${r.pr.number}`) : null)]);
+  const facts = latest ? el("div", { class: "grid" }, [
+    el("div", { class: "card" }, [el("h2", { text: "Outcome" }),
+      el("div", {}, [pill(latest.bucket), " ", el("span", { class: "muted small", text: `env ${latest.env} · run ${latest.run_id}` })]),
+      latest.failure_reason ? el("p", {}, [el("b", { text: "Reason: " }), latest.failure_reason]) : null,
+      latest.attention ? el("p", {}, [el("b", { text: "Next action: " }), latest.attention.next_action]) : null,
+      el("p", { class: "small muted", text: `elapsed ${fmtDur(latest.timing.elapsed_seconds)} · to PR ${fmtDur(latest.timing.pr_opened_seconds)} · to review-ready ${fmtDur(latest.timing.review_ready_seconds)} · ACUs ${latest.session.acus_consumed ?? "—"}/${latest.session.max_acu_limit ?? "—"}` })]),
+    el("div", { class: "card" }, [el("h2", { text: "Test evidence" }),
+      el("p", {}, [el("b", { text: "GitHub checks: " }), el("span", { class: `pill ${CHECK_TONE[latest.tests.checks.state] || ""}`, text: latest.tests.checks.state }),
+        el("span", { class: "small muted", text: latest.tests.checks.head_sha ? ` on ${latest.tests.checks.head_sha.slice(0, 10)}` : " (no PR head yet)" })]),
+      latest.tests.checks.suites.length ? el("ul", { class: "small" }, latest.tests.checks.suites.map((s) => el("li", {}, [s.url ? link(s.url, s.app || "check suite") : (s.app || "check suite"), ` · ${s.status}${s.conclusion ? " · " + s.conclusion : ""}`]))) : null,
+      el("p", {}, [el("b", { text: "Session's account: " }), `regression test ${latest.tests.regression_test}`, latest.tests.tests_run ? `, ran "${latest.tests.tests_run}"` : "", latest.tests.session_outcome ? `, outcome "${latest.tests.session_outcome}"` : ""]),
+      el("p", { class: "small muted", text: "The session's account is what Devin reported; only GitHub checks count as verification." })]),
+    el("div", { class: "card" }, [el("h2", { text: "Human review" }),
+      t.review ? el("p", {}, [el("b", { text: "Outcome: " }), t.review.outcome, t.review.review_state ? ` · latest review ${t.review.review_state}` : " · no review submitted",
+        t.review.merged_by ? ` · merged by ${t.review.merged_by}` : "", t.review.merged_sha ? ` · ${t.review.merged_sha.slice(0, 10)}` : ""]) : el("p", { class: "muted", text: "no run yet" })]),
+  ]) : el("p", { class: "muted", text: "No runs for this task yet." });
+
+  const items = [];
+  for (const e of t.events) {
+    let text = "", cls = e.kind;
+    const d = e.detail || {};
+    if (e.kind === "state") text = e.from_state ? `${e.from_state} → ${e.to_state}` : `run created in ${e.to_state}` + (d.approved_by ? ` (approved by ${d.approved_by})` : "");
+    else if (e.kind === "session") text = e.reason === "created" ? `Devin session ${d.session_id || ""} created` : `session ${d.status}${d.status_detail ? "/" + d.status_detail : ""}` + (d.acus_consumed != null ? ` · ${d.acus_consumed} ACU` : "");
+    else if (e.kind === "pr") text = `PR #${d.number} ${e.reason}` + (d.head_sha ? ` · head ${String(d.head_sha).slice(0, 10)}` : "") + (d.merged_by ? ` by ${d.merged_by}` : "");
+    else if (e.kind === "checks") text = `check suite ${d.app || ""} ${d.status || ""}${d.conclusion ? " · " + d.conclusion : ""} → head ${e.reason}`;
+    else if (e.kind === "verified") text = `verified: all check suites passed on ${String(d.head_sha || "").slice(0, 10)}`;
+    else if (e.kind === "review") text = `review ${e.reason}${d.reviewer ? " by " + d.reviewer : ""}`;
+    else text = `${e.kind} ${e.reason || ""}`;
+    if (e.reason && ["failed", "no_output", "expired", "session_blocked", "closed_unmerged"].includes(e.to_state || "")) { cls += " bad"; text += ` · reason: ${e.reason}`; }
+    if (e.kind === "checks" && e.reason === "failed") cls += " bad";
+    const li = el("li", { class: cls }, [el("time", { text: fmtTime(e.at), datetime: e.at }), text]);
+    if (e.kind === "session" && d.structured_output) li.append(el("pre", { text: JSON.stringify(d.structured_output, null, 2) }));
+    items.push([e.at, li]);
+  }
+  for (const n of t.notifications) {
+    const at = n.sent_at || n.at;
+    items.push([at, el("li", { class: n.state === "failed" ? "bad" : "note" }, [el("time", { text: fmtTime(at), datetime: at }),
+      `Slack ${n.kind} → ${n.destination}: ${n.state} (${n.attempts} attempt${n.attempts === 1 ? "" : "s"})`, n.last_error ? ` · ${n.last_error}` : ""])]);
+  }
+  // Lexicographic on the ISO string: Date() would drop the microseconds that
+  // separate a Slack send from the next event.
+  items.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+
+  drawer.replaceChildren(close, el("h2", { text: `#${t.issue.number} ${t.issue.title}` }),
+    el("p", { class: "muted small", text: `${t.repo} · issue ${t.issue.state} · labels: ${(t.issue.labels || []).join(", ") || "none"}` }),
+    links, facts, el("h2", { text: "Timeline", style: "margin-top:16px" }),
+    items.length ? el("ul", { class: "tl" }, items.map(([, li]) => li)) : el("p", { class: "muted", text: "no events" }));
+}
+function closeTimeline() { const d = $("drawer"); d.classList.remove("open"); d.setAttribute("aria-hidden", "true"); }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeTimeline(); });
+document.querySelectorAll(".env-switch button").forEach((b) => b.onclick = () => {
+  env = b.dataset.env;
+  history.replaceState(null, "", `?env=${env}`);
+  closeTimeline(); load();
+});
+load();
+timer = setInterval(load, 30000);
+</script>
+</body>
+</html>
