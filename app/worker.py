@@ -43,7 +43,14 @@ from app.devin_client import (
     SessionInsights,
     SessionSnapshot,
 )
-from app.notifications import build_payload, destination_is_operator, fingerprint, Kind
+from app.notifications import (
+    anchor_reaction,
+    build_payload,
+    destination_is_operator,
+    fingerprint,
+    is_follow_up,
+    Kind,
+)
 from app.prompts import (
     branch_name,
     build_prompt,
@@ -818,22 +825,49 @@ class Worker:
         A Slack failure is a notification problem and nothing else: it never
         touches the run's state, because a delivered fix that nobody was told
         about is still a delivered fix.
+
+        A run's "PR opened" message is the anchor for what follows it: later
+        messages for the run go into its thread and add a reaction to it, so
+        the channel reads one line per PR. A follow-up whose anchor is still
+        queued waits for it; one whose anchor never got a timestamp (webhook
+        transport, failed anchor, history from before anchors) goes top-level
+        rather than being lost. Slack holds no state here that GitHub does
+        not: the anchor is a place to put words, never a source of truth.
         """
         sent = 0
         for row in self.store.due_notifications():
             outbox_id = int(row["id"])
             destination = str(row["destination"])
             try:
-                url = self.settings.webhook_url_for(destination)
+                target = self.settings.slack_target_for(destination)
             except Exception as exc:  # configuration, not transport
                 self.store.mark_notification_failed(outbox_id, str(exc))
                 continue
 
+            kind = Kind(str(row["kind"]))
+            run_id = str(row["run_id"]) if row["run_id"] else None
+            anchor: sqlite3.Row | None = None
+            if run_id and self.slack.threads and is_follow_up(kind):
+                anchor = self.store.slack_anchor(run_id, destination)
+                if anchor is None and self.store.slack_anchor_pending(
+                    run_id, destination
+                ):
+                    continue
+            thread_ts = str(anchor["slack_ts"]) if anchor is not None else None
+
             payload: dict[str, Any] = json.loads(str(row["payload"]))
-            result = self.slack.send(url, payload)
+            result = self.slack.send(target, payload, thread_ts=thread_ts)
             if result.ok:
-                self.store.mark_notification_sent(outbox_id, result.detail)
+                self.store.mark_notification_sent(
+                    outbox_id,
+                    result.detail,
+                    channel=result.channel,
+                    ts=result.ts,
+                    thread_ts=thread_ts,
+                )
                 sent += 1
+                if anchor is not None:
+                    self._react_on_anchor(outbox_id, anchor, kind, row["reason"])
                 continue
             attempts = int(row["attempts"]) + 1
             if not result.retryable or attempts >= MAX_NOTIFICATION_ATTEMPTS:
@@ -843,11 +877,34 @@ class Worker:
             self.store.mark_notification_retry(outbox_id, result.detail, delay)
         return sent
 
+    def _react_on_anchor(
+        self, outbox_id: int, anchor: sqlite3.Row, kind: Kind, reason: str | None
+    ) -> None:
+        """Best effort, once: the reply is the record, the reaction is a glance.
+
+        A reaction that fails is recorded on the reply's row and not retried;
+        retrying would re-send nothing useful and the thread already carries
+        the information.
+        """
+        name = anchor_reaction(kind, reason)
+        if name is None:
+            return
+        result = self.slack.react(
+            str(anchor["slack_channel"]), str(anchor["slack_ts"]), name
+        )
+        self.store.mark_notification_reaction(
+            outbox_id, name, None if result.ok else result.detail
+        )
+
 
 def build_worker(settings: Settings, store: Store) -> Worker:
     """Assemble a worker from configuration."""
     from app.devin_client import LiveDevinClient, SimulatedDevinClient
-    from app.slack_client import FakeSlackTransport, LiveSlackTransport
+    from app.slack_client import (
+        BotSlackTransport,
+        FakeSlackTransport,
+        LiveSlackTransport,
+    )
 
     devin: DevinClient = (
         LiveDevinClient(
@@ -858,9 +915,13 @@ def build_worker(settings: Settings, store: Store) -> Worker:
         if settings.devin_mode == "live"
         else SimulatedDevinClient()
     )
-    slack: SlackTransport = (
-        LiveSlackTransport() if settings.slack_mode == "live" else FakeSlackTransport()
-    )
+    slack: SlackTransport
+    if settings.slack_mode != "live":
+        slack = FakeSlackTransport(threads=settings.slack_transport == "bot")
+    elif settings.slack_transport == "bot":
+        slack = BotSlackTransport(settings.slack_bot_token)
+    else:
+        slack = LiveSlackTransport()
     return Worker(store, settings, devin, slack)
 
 

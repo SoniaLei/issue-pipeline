@@ -965,6 +965,9 @@ def build_timeline(
             "state": str(row["state"]),
             "attempts": int(row["attempts"]),
             "last_error": row["last_error"],
+            "threaded": row["thread_ts"] is not None,
+            "reaction": row["reaction"],
+            "reaction_error": row["reaction_error"],
         }
         for row in store.notifications_for_task(task_id)
     ]

@@ -394,7 +394,8 @@ Two mapping traps worth naming:
 
 ## D-011 — Check and status evaluation is out of v1
 
-**Status**: accepted
+**Status**: accepted; amended by D-036 (failed checks, findings and
+verification are announced once per head, in the PR's thread)
 
 Deriving "review-ready" from checks means handling which checks are required,
 re-runs, in-progress suites, and pull requests from forks. Each is a source of
@@ -879,3 +880,49 @@ it produces takes effect without a human merging it.
 **Revisit when** a month of runs shows the signal-to-noise ratio: widen scope
 to the target repository, or narrow the prompt, based on what maintainers
 actually acted on.
+
+---
+
+## D-036 — The "PR opened" post is the run's Slack anchor; the rest of the PR's life is a thread and reactions on it
+
+**Status**: accepted (maintainer decision)
+
+**Decision.** With a bot token (`SLACK_TRANSPORT=bot`) the worker keeps the
+channel and `ts` that `chat.postMessage` returns for a run's *PR opened*
+message, and posts every later message for that run and destination — checks
+failed, Devin Review findings, verified, human review, needs-human, merged,
+closed — as a reply in that thread, adding one reaction to the anchor per
+event. Incoming webhooks stay supported (`SLACK_TRANSPORT=webhook`, the
+default) with the previous top-level behaviour, because a webhook returns no
+message id and cannot thread or react.
+
+**Why.** A channel that gets one line per lifecycle event per PR is a channel
+people mute. One line per PR, whose reactions read as its history at a glance
+(:x: checks failed, :mag: findings, :large_green_circle: verified,
+:white_check_mark: merged), keeps the channel readable while the thread keeps
+the record.
+
+**What this changes about D-011.** Check-derived messages were kept out of v1
+because they were the likeliest source of noise. In a thread the noise cost is
+near zero and the signal (the head failed; the head is verified) is what a
+reviewer waits for, so failed checks, review findings and verification are
+announced — once per head, on the first derivation, never per suite or per
+poll, and never for a superseded head.
+
+**Rules.** A follow-up whose anchor is still retrying waits in the outbox for
+it. A follow-up with no usable anchor (webhook transport, anchor failed for
+good, history from before anchors) goes top-level rather than being dropped.
+The reaction is attempted once after the reply is recorded sent; its failure is
+stored on that row and not retried; `already_reacted` is success. Fingerprint
+suppression is unchanged.
+
+**Authority.** Slack still holds no state that GitHub does not. The anchor is
+read only to decide where a message goes; nothing about a run, its
+verification or the dashboard's facts depends on it, and losing it costs only
+message placement. The bot token gets `chat:write` and `reactions:write` and
+nothing else; channel ids come from configuration, never from issue or PR
+content (the same rule that governed webhook destinations).
+
+**Revisit when** message updates (`chat.update` of the anchor's text) would
+say something reactions cannot, or when a destination needs more than one
+anchor per run (e.g. a per-repository digest).

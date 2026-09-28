@@ -124,6 +124,7 @@ review, accept, amend or close with a reason. It never merges (D-035).
 ## 7. Optional: run it live
 
 Needs a public endpoint, a repository webhook on the watched repository, a
-Devin service-user token and a Slack incoming webhook — see *Running it live*
-in the README. `scripts/run_live.sh --tunnel` proves the path from a laptop.
+Devin service-user token and Slack — an incoming webhook for top-level posts,
+or a bot token for one post per PR with its history threaded and reacted
+under it (D-036) — see *Running it live* in the README. `scripts/run_live.sh --tunnel` proves the path from a laptop.
 A live run spends real ACUs up to `MAX_ACU_LIMIT` per session.

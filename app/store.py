@@ -130,7 +130,15 @@ CREATE TABLE IF NOT EXISTS outbox (
     last_response   TEXT,
     next_attempt_at TEXT,
     created_at      TEXT NOT NULL,
-    sent_at         TEXT
+    sent_at         TEXT,
+    -- Identity Slack gave the message, when the transport reports one. The
+    -- run's sent `pr_opened` row is the anchor later PR-lifecycle messages
+    -- thread under (thread_ts) and react to (reaction).
+    slack_channel   TEXT,
+    slack_ts        TEXT,
+    thread_ts       TEXT,
+    reaction        TEXT,
+    reaction_error  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (state, next_attempt_at);
@@ -295,6 +303,27 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns the schema gained after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a live
+        database predating a column would otherwise fail on first write.
+        """
+        for table, column, decl in (
+            ("outbox", "slack_channel", "TEXT"),
+            ("outbox", "slack_ts", "TEXT"),
+            ("outbox", "thread_ts", "TEXT"),
+            ("outbox", "reaction", "TEXT"),
+            ("outbox", "reaction_error", "TEXT"),
+        ):
+            present = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in present:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -1121,17 +1150,64 @@ class Store:
             ).fetchall()
         )
 
-    def mark_notification_sent(self, outbox_id: int, response: str) -> None:
+    def mark_notification_sent(
+        self,
+        outbox_id: int,
+        response: str,
+        *,
+        channel: str | None = None,
+        ts: str | None = None,
+        thread_ts: str | None = None,
+    ) -> None:
         with self.transaction() as conn:
             conn.execute(
                 """
                 UPDATE outbox
                 SET state = 'sent', attempts = attempts + 1, sent_at = ?,
-                    last_response = ?, last_error = NULL
+                    last_response = ?, last_error = NULL,
+                    slack_channel = ?, slack_ts = ?, thread_ts = ?
                 WHERE id = ?
                 """,
-                (now_iso(), response[:500], outbox_id),
+                (now_iso(), response[:500], channel, ts, thread_ts, outbox_id),
             )
+
+    def mark_notification_reaction(
+        self, outbox_id: int, name: str, error: str | None
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE outbox SET reaction = ?, reaction_error = ? WHERE id = ?",
+                (name, error[:500] if error else None, outbox_id),
+            )
+
+    def slack_anchor(self, run_id: str, destination: str) -> sqlite3.Row | None:
+        """The run's delivered `pr_opened` message in a destination, if any.
+
+        Only a message Slack gave a timestamp can be an anchor; a webhook
+        delivery is sent but cannot be threaded under.
+        """
+        return self._conn.execute(
+            """
+            SELECT * FROM outbox
+            WHERE run_id = ? AND destination = ? AND kind = 'pr_opened'
+              AND state = 'sent' AND slack_ts IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (run_id, destination),
+        ).fetchone()
+
+    def slack_anchor_pending(self, run_id: str, destination: str) -> bool:
+        """Whether the run's `pr_opened` message is still waiting to be sent."""
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM outbox
+            WHERE run_id = ? AND destination = ? AND kind = 'pr_opened'
+              AND state = 'pending'
+            LIMIT 1
+            """,
+            (run_id, destination),
+        ).fetchone()
+        return row is not None
 
     def mark_notification_retry(
         self, outbox_id: int, error: str, retry_after_seconds: float

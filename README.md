@@ -19,7 +19,8 @@ limitations under the License.
 
 An event-driven service that tracks GitHub issues, delegates approved
 engineering work to Devin, and notifies a Slack channel when a pull request
-opens or needs attention. Humans keep review and merge.
+opens or needs attention — with the rest of the PR's life (checks, review,
+merge) threaded under that post. Humans keep review and merge.
 
 The design this implements lives in `docs/`: `architecture.md` (components,
 state machine, schema), `decisions.md` (the decision record, D-001 onward, with
@@ -57,7 +58,7 @@ Build-order steps 1–4, which is everything that needs no credential:
 | 2. Webhook intake, signature verification, dedupe | done |
 | 3. Simulated Devin adapter, worker loop | done |
 | 4. Outbox, notification formatting, fake Slack transport | done |
-| 5. Live Slack transport | done — verified against a real channel |
+| 5. Live Slack transport | done — webhook verified against a real channel; bot transport (threads + reactions, D-036) implemented, awaiting a token |
 | 6. Live Devin adapter | implemented, needs a service-user token |
 | 7. Reconciliation loop | partial — poll and tag-based orphan recovery |
 | 8. Report endpoint | done |
@@ -105,7 +106,14 @@ export SLACK_WEBHOOK_ENGINEERING_UPDATES='https://hooks.slack.com/services/...'
 python scripts/run_simulation.py --live-slack
 ```
 
-Two messages arrive in the channel behind that URL, so only run it against a
+Or, to see the PR thread and reactions for real, with a bot token instead:
+
+```bash
+export SLACK_BOT_TOKEN='xoxb-...' SLACK_CHANNEL_ENGINEERING_UPDATES='C0...'
+python scripts/run_simulation.py --live-slack-bot
+```
+
+Messages arrive in the channel behind that URL or id, so only run it against a
 destination whose owner has authorized it.
 
 ### Replaying a captured delivery
@@ -152,8 +160,23 @@ the ones it can check are present:
    the dashboard's *Live* view rather than *Simulation*; the two are never
    summed.
 
-4. **A Slack incoming webhook** per logical destination in
-   `SLACK_DESTINATIONS`, with `SLACK_MODE=live`.
+4. **Slack**, with `SLACK_MODE=live`, in one of two transports:
+   - `SLACK_TRANSPORT=webhook` (default): an incoming webhook per logical
+     destination in `SLACK_DESTINATIONS`. Every message is top-level.
+   - `SLACK_TRANSPORT=bot`: a bot token in `SLACK_BOT_TOKEN` (scopes
+     `chat:write`, `reactions:write`; create at https://api.slack.com/apps →
+     *OAuth & Permissions* → install → *Bot User OAuth Token*) and a channel
+     id per destination in `SLACK_CHANNELS`
+     (`engineering-updates=C0…,automation-alerts=C0…`; the id is at the
+     bottom of a channel's *About* tab). Invite the bot to each channel
+     (`/invite @app`). The run's *PR opened* post becomes its anchor: checks
+     failed, Devin Review findings, verified, human review, merged and
+     closed arrive as replies in its thread, each adding a reaction to the
+     anchor (:x: :mag: :large_green_circle: :thumbsup: :white_check_mark:),
+     so the channel reads one line per PR. Follow-ups wait for a retrying
+     anchor and fall back to top-level if it never delivered; a reaction
+     that fails is shown in the run's timeline, never retried, and never
+     touches the run (D-036).
 
 Then a maintainer in `MAINTAINER_ALLOWLIST` applies `devin-ready` to an issue,
 and `/dashboard?env=live` shows the run from `queued` onwards: the session
