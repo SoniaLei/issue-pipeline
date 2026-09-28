@@ -396,6 +396,13 @@ issue snapshot, baseline revision, run ID, branch name, PR marker, acceptance
 criteria and allowed scope. Keeping the invariant part in a playbook means it is
 versioned in one place and the prompt diff between two runs is the task.
 
+Repository-specific knowledge — how to stand up the target application, which
+hosts it fetches from, which fixtures a reproduction needs — lives in **skills
+committed to the target repository** under `.agents/skills/`, not in this
+service. A session picks them up from the checkout it is working in, so the
+pipeline stays repository-agnostic and each repository's runtime knowledge is
+versioned and reviewed where it applies (D-031).
+
 ### Structured output
 
 v3 supports `structured_output_schema` (JSON Schema draft 7) and

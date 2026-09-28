@@ -627,3 +627,38 @@ even while the API keeps answering.
 **Revisit when** the service is hosted and has live runs: the metrics only
 describe runs this service tracked, so Automation-started sessions are not in
 them by construction.
+
+---
+
+## D-031 — Repository runtime knowledge lives in skills committed to the target repository
+
+**Status**: accepted (maintainer decision)
+
+**Decision.** How to stand up and test a *target* repository — interpreter and
+toolchain versions, isolated config, which hosts a dependency install reaches,
+fixture and permission gotchas — is captured as a skill file committed to that
+repository under `.agents/skills/<name>/SKILL.md`. The first one is
+`superset-local-runtime-testing` on `SoniaLei/superset-cognition-demo`
+(https://github.com/SoniaLei/superset-cognition-demo/pull/5), written from the
+run that verified PR #3 there. Sessions started by this pipeline read it from
+the checkout as a quick starter for reproduction and regression testing.
+
+**Why the target repository, not the service.** The pipeline is
+repository-agnostic: the prompt (D-020) carries the task, the playbook carries
+the invariant contract, and neither should know that Superset wants Python 3.11,
+npm 11 and `cdn.sheetjs.com` allowlisted. That knowledge changes with the
+target's code, so it is versioned, reviewed and merged next to that code by the
+people who own it. Adding a second repository to `REPO_ALLOWLIST` means adding
+a skill there, with no change here.
+
+**Why a file, not the prompt.** The live run on issue #2 lost most of its time
+to environment setup, not to the fix. A skill turns that into a read at the start
+of the next session instead of a rediscovery, and each run can improve it via an
+ordinary PR that a maintainer reviews like any other doc change.
+
+**What it is not.** A skill is guidance, not a gate: it does not authorize
+work, grant network access or replace the checks. Network allowlisting for the
+hosts it names is still configured on the session/automation side.
+
+**Revisit when** more than one target repository is tracked, to decide whether
+a shared skill format or a pipeline-side index of per-repo skills is worth it.
