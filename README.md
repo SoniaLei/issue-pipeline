@@ -22,8 +22,12 @@ engineering work to Devin, and notifies a Slack channel when a pull request
 opens or needs attention. Humans keep review and merge.
 
 The design this implements lives in `docs/`: `architecture.md` (components,
-state machine, schema), `decisions.md` (29 decisions with rationale) and
-`open-questions.md` (what is still undecided and what the default is).
+state machine, schema), `decisions.md` (the decision record, D-001 onward, with
+rationale) and `open-questions.md` (what is still undecided and what the
+default is). New here? Start with `docs/onboarding.md`, or with the generated
+[DeepWiki](https://deepwiki.com/SoniaLei/issue-pipeline) for a guided tour with
+diagrams — see [Documentation and the wiki](#documentation-and-the-wiki) for
+which of these is authoritative.
 
 It is a standalone service and shares no code, dependencies or database with
 the repositories it watches. It began life under `issue-pipeline/` in
@@ -32,13 +36,16 @@ and was split out with its history intact.
 
 ## How it relates to the Devin Automations
 
-Two Devin Automations act on `SoniaLei/superset-cognition-demo` today without
-this service running anywhere: one turns a `devin-ready` label into a Devin
-session that opens a PR, the other posts to Slack when a `devin/issue-*` PR is
-merged. They are configured in Devin, not in either repository, so moving this
-code does not affect them. This service is the durable version of that flow —
-pre-spend maintainer gate, webhook dedupe, task state, PR correlation — for
-when it is hosted behind a public HTTPS endpoint.
+Devin Automations are configured in Devin, not in either repository, so
+nothing here changes them. Two exist for `SoniaLei/superset-cognition-demo`:
+the label Automation (a `devin-ready` label → session → PR) is **disabled**,
+because it and this service both watched the same label and started duplicate
+sessions on the first live run; the merged-PR → Slack Automation is still
+enabled. This service is the durable version of the label flow — pre-spend
+maintainer gate, webhook dedupe, task state, PR correlation, the review gate —
+and picks up triage whenever it is hosted behind a public HTTPS endpoint. A
+third Automation, the overnight sweep of *this* repository, is described under
+[Documentation and the wiki](#documentation-and-the-wiki).
 
 ## What is built
 
@@ -55,6 +62,8 @@ Build-order steps 1–4, which is everything that needs no credential:
 | 7. Reconciliation loop | partial — poll and tag-based orphan recovery |
 | 8. Report endpoint | done |
 | 9. Dashboard: workload, results, speed, throughput, health, run timeline | done |
+| 10. Devin analytics: cost & efficiency, provider cross-check | done |
+| 11. Devin Review gate on the PR's current head | done |
 
 The whole pipeline runs end to end with `DEVIN_MODE=sim` and
 `SLACK_MODE=fake`, spending nothing and calling nobody.
@@ -81,8 +90,9 @@ python scripts/run_simulation.py
 ```
 
 Replays `issue_opened` → `issue_labeled` → a simulated Devin session →
-`pull_request.opened` → `check_suite` (queued, then passed) →
-`pull_request_review` → `pull_request.closed(merged)` and prints the task
+`pull_request.opened` → `check_suite` (queued, then passed) → a simulated
+Devin Review (requested, run, clear verdict) → `pull_request_review` →
+`pull_request.closed(merged)` and prints the task
 state, the Slack messages that would have been sent and the dashboard's
 summary. No network. Add `--serve` to keep the store alive and browse
 `/dashboard` over that simulated run afterwards.
@@ -129,12 +139,15 @@ the ones it can check are present:
 2. **A repository webhook** (or a GitHub App) on each repository in
    `REPO_ALLOWLIST`, pointed at that URL, content type `application/json`,
    secret equal to `GITHUB_WEBHOOK_SECRET`, subscribed to *Issues*,
-   *Pull requests*, *Pull request reviews* and *Check suites*. The service
-   never calls the GitHub API, so the webhook needs no token; it only needs to
-   be delivered.
+   *Pull requests*, *Pull request reviews*, *Pull request review comments*
+   and *Check suites*. Review comments carry Devin Review's inline findings
+   (the per-kind counts on the dashboard); without them only the review's
+   total arrives. The service never calls the GitHub API, so the webhook
+   needs no token; it only needs to be delivered.
 
 3. **A Devin service user**, org-scoped, holding `UseDevinSessions` (create)
-   and `ViewOrgSessions` (get, list). Set `DEVIN_MODE=live`, `DEVIN_ORG_ID`
+   and `ViewOrgSessions` (get, list); the same token is used for the
+   `pr-reviews` and analytics endpoints. Set `DEVIN_MODE=live`, `DEVIN_ORG_ID`
    and `DEVIN_API_TOKEN`. `DEVIN_MODE=live` is also what makes runs land on
    the dashboard's *Live* view rather than *Simulation*; the two are never
    summed.
@@ -165,14 +178,17 @@ The outcome words are used precisely, and the page states its definitions:
 | Word | Means | Evidence |
 | --- | --- | --- |
 | PR opened | a pull request exists for the run; checks may be pending | `pull_request.opened` correlated to the run |
-| Verified | every check suite GitHub reported for the PR's **current** head completed successfully | `check_suite` events for `checks_head_sha == head_sha`; a new commit resets it |
+| Checks passed | every check suite GitHub reported for the PR's **current** head completed successfully | `check_suite` events for `checks_head_sha == head_sha`; a new commit resets it |
+| Review clear | Devin Review of that **same** head reported no findings on GitHub | the Devin bot's `pull_request_review` for `head_sha`; a new commit resets it |
+| Verified | checks passed and, when the review gate is `required`, review clear — both on the current head | the two rows above |
 | Merged | GitHub reported the PR closed with `merged=true` | `pull_request.closed` |
 | Blocked / failed | the run needs a human, with the reason and the next action shown | run state + `failure_reason` |
 
 A session saying it added and ran a test is displayed as *the session's
-account* and is never counted as verification. "Verified" is currently "all
-suites GitHub reported", not "the suites branch protection requires"; reading
-branch protection to narrow it is a later uplift.
+account* and is never counted as verification. "Checks passed" is currently
+"all suites GitHub reported", not "the suites branch protection requires";
+reading branch protection to narrow it is a later uplift. Human review is
+shown as its own fact and is required for merge regardless of any of the above.
 
 Sections: **current workload** (queued, running, PR opened, awaiting review,
 blocked, failed), **results** (opened / verified / merged), **speed** (median and
@@ -191,6 +207,50 @@ event, check suite, verification, review and Slack attempt is a row in
 It only knows about runs *this service* tracked. Sessions started by the Devin
 Automations are not in its store, so until the service is hosted the Live page
 is empty by construction.
+
+### Devin Review gate
+
+After a PR opens, the worker asks Devin Review to look at the PR's current
+head — once per commit — and reads its progress from the organization
+`pr-reviews` API (`pending`, `running`, `completed`, `errored`, `cancelled`,
+`skipped`). What the review *found* does not come from that API: it is the
+review the Devin bot posts on GitHub for that exact commit ("found N potential
+issues" / "no issues found", with inline comments carrying a kind such as
+`bug` or `security`). Both are stored on one row per `(run, head)` in
+`pr_reviews`, with a durable `review_gate` event for every request, status
+change, verdict, error and superseded head.
+
+`REVIEW_GATE_MODE` decides what the review means for *verified*:
+
+| Mode | Review calls | Verified means |
+| --- | --- | --- |
+| `required` (default) | yes | checks passed **and** review clear on the current head |
+| `advisory` | yes, shown everywhere | checks passed (review displayed, not required) |
+| `off` | none | checks passed |
+
+A `completed` status with no GitHub verdict is *awaiting verdict*, not clear.
+Findings do not fail the run: it stays PR-open and unverified with the count
+and kinds in the task row and timeline, and what to do about them — fix,
+dismiss on GitHub with a reason, or raise a follow-up issue — is the
+reviewer's call. A new commit keeps the old head's review for audit and starts
+a fresh request; nothing from an earlier head counts. Provider errors are
+stored on that head, retried up to `REVIEW_MAX_ATTEMPTS` times
+`REVIEW_POLL_SECONDS` apart on idle worker ticks (a permanent error such as
+a missing permission is not retried at all), then shown as *unavailable*
+under Needs attention; they never stop the worker or touch another run.
+
+The mode is read at two different moments, and changing it mid-history shows
+the difference. The *verified* count and each task row are recomputed from
+stored checks and reviews under the mode in force **now**. Speed samples and
+daily throughput come from the durable `verified` event, which is written once
+when a head first satisfied the gate under the mode in force **then** (the
+event records that mode). Tightening the mode leaves earlier samples in place;
+loosening it does not backfill samples for heads that would now count. Pick
+the mode per environment before it carries data, and treat a change as a new
+series.
+
+The gate is a second reader, not a second approver: a PR that is checks-green
+and review-clear still needs a maintainer to approve and merge it. See D-033.
 
 ### Devin analytics: cost, efficiency and a cross-check
 
@@ -248,6 +308,9 @@ The two that decide whether anything happens at all:
 - `MAINTAINER_ALLOWLIST` — GitHub logins whose `devin-ready` label is treated
   as authorization to spend. Nobody else's is.
 
+Review gate: `REVIEW_GATE_MODE` (`required` by default; `advisory`, `off`),
+`REVIEW_POLL_SECONDS` (60), `REVIEW_MAX_ATTEMPTS` (5).
+
 Analytics: `ANALYTICS_ENABLED` (default `true`), `INSIGHTS_REFRESH_SECONDS`
 (600), `INSIGHTS_SETTLE_SECONDS` (86400), `METRICS_REFRESH_SECONDS` (300). The
 same `DEVIN_API_TOKEN` is used; the organization-level analytics endpoints
@@ -265,3 +328,47 @@ ruff check . && ruff format --check . && mypy app scripts
 The suite runs against fixtures and the simulated adapters. No test touches a
 network. `pre-commit install` runs the same checks on each commit; CI runs
 them plus the simulated end-to-end run on every push and pull request.
+
+## Documentation and the wiki
+
+Five kinds of text describe this system. They answer different questions and
+only the first three are authoritative:
+
+| Read | For | Changed by |
+| --- | --- | --- |
+| this README | how to run, configure and read it | reviewed PR |
+| `docs/architecture.md` | what it is meant to do and where the boundaries are | reviewed PR |
+| `docs/decisions.md` | why, what each choice is *not*, and when to revisit it | reviewed PR |
+| `.agents/skills/` in a **target** repository (e.g. [superset-cognition-demo](https://github.com/SoniaLei/superset-cognition-demo/tree/master/.agents/skills)) | how a Devin session stands up and tests *that* repository (D-031) | reviewed PR there |
+| [DeepWiki](https://deepwiki.com/SoniaLei/issue-pipeline) | a generated tour of the code as it is — diagrams, per-area pages, source links | regenerated from the code |
+
+**DeepWiki** is Devin's generated wiki for a connected repository. It is the
+fastest way in for a new engineer and the context Ask Devin and Devin sessions
+read, and it is steered by `.devin/wiki.json` at the repository root, which
+names the pages it should have (overview, lifecycle, review gate, security,
+operations, onboarding …) and carries the notes that tell the generator what
+this system is and which documents are canonical. Change the page tree by
+changing that file in a PR. What the wiki cannot hold is intent that the code
+does not yet implement, a rejected alternative or a "revisit when" — those are
+in `docs/decisions.md`, so when the wiki and the docs disagree, the docs say
+what was meant, the wiki says what was built, and the gap is a bug in one of
+them. Reading the wiki, or asking Devin about the repository, creates nothing:
+no issue, no PR, no session (D-034).
+
+**Ask Devin** — in the Devin app, or on the public wiki page — answers
+questions about this repository grounded in the wiki and code ("where is the
+maintainer gate enforced?", "what resets verification?"). Agents can read the
+same material through the DeepWiki MCP (`read_wiki_structure`,
+`read_wiki_contents`, `ask_question`).
+
+**Overnight sweep.** One scheduled Devin Automation runs nightly against this
+repository: it compares the code with the README, `architecture.md` and
+`decisions.md`, looks for defects it can demonstrate with a test, and for each
+actionable finding opens a GitHub issue (needs a decision, or not small) or a
+PR with a test (small and clearly right), then posts one Slack summary. It is
+bounded — fixed prompt, one run per night, no overlap, an ACU cap — and it
+never merges: its PRs go through CI, the review gate and human review like any
+other, and its issues go through the `devin-ready` gate before any further
+spend (D-035).
+
+A short reading path for new engineers is in `docs/onboarding.md`.

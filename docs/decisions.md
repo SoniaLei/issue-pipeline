@@ -720,3 +720,162 @@ usage are displayed as a backlog for D-031 skills, and no agent acts on them.
 the consumption lag and whether `billing` supersedes `session` totals in
 practice; and when a separate review agent (deferred) needs these figures as
 input.
+
+---
+
+## D-033 — Devin Review is a per-head PR gate; repository-wide scanning is a separate, periodic sweep
+
+**Status**: accepted (maintainer decision)
+
+**Decision.** A second, independent reading of every pipeline PR is done by
+Devin Review, requested and read through the organization API
+(`POST`/`GET /v3/organizations/{org}/pr-reviews`) for the PR's **exact current
+head**. It is a stage after `pr_open`, not a second session per PR. With
+`REVIEW_GATE_MODE=required` (default) a run is *verified* only when GitHub's
+check suites pass on the current head **and** the Devin Review of that same
+commit is clear; `advisory` shows the review without withholding verification;
+`off` makes no review calls. Findings, provider errors and a review that never
+happened are all "not clear". Repository-wide security or architecture scans
+(Code Scans / Security Swarm) are a separate periodic activity whose findings
+enter as *issues* through the normal `devin-ready` gate; they are not attached
+to a PR and never call `remediate` directly.
+
+**Two sources, kept apart.** The `pr-reviews` API says how far a review has
+got (`pending`, `running`, `completed`, `errored`, `cancelled`, `skipped`); it
+does not say what was found. The verdict is the review the Devin bot
+(`devin-ai-integration[bot]`) submits on GitHub for that commit ("found N
+potential issues" / "no issues found"), plus its inline comments, which carry a
+kind (`bug`, `security`, `flag`). The store keeps both on one row per
+`(run, head_sha)`: `status`/`status_at`/`attempts`/`last_error` from the API,
+`findings`/`findings_by_kind`/`review_url`/`verdict_at` from GitHub. A
+`completed` status with no GitHub verdict is *awaiting verdict*, not clear;
+a GitHub verdict with no API status is a verdict all the same. The row is
+never re-polled once a verdict exists, so a later API answer cannot overwrite
+what GitHub said.
+
+**Why the exact head, and why old rows stay.** A review of commit A says
+nothing about commit B. When GitHub reports a new head the run's old review
+row is left in place for the audit trail, a `review_gate superseded` event is
+written, and a new row is started (and a new request made) for the new head.
+Verification reads only the row whose `head_sha` equals the run's current
+head. If the API reports that Devin reviewed a *newer* commit than the run
+knows, that is recorded as the run's head being skipped — the pipeline waits
+for GitHub to tell it about the new head rather than trusting the provider's
+view of the PR.
+
+**Why it is not another session.** Devin Review is the tool built for this,
+costs XS–S per head, lands its result on the PR where the human reviewer
+already looks, and cannot be steered by the PR's own content the way a prompt
+can. A bespoke "security reviewer" session per PR would double the ACU spend
+per PR and produce testimony (D-022) rather than a GitHub-bound review.
+
+**Why the worker asks, on idle ticks, at most once per head.** Devin Review
+also auto-runs on connected repositories, so the request is idempotent by
+`(pr_url, head_sha)`: the worker asks once, then only reads. Reads are paced
+by `REVIEW_POLL_SECONDS` and capped by `REVIEW_MAX_ATTEMPTS` consecutive
+provider errors, after which the head is marked `unavailable` and surfaces in
+*Needs attention* with the reason and the action (re-run the review, or fix
+the provider/credential problem). Review calls run only when no run advanced
+that tick, so a slow provider never delays intake, session polling or Slack.
+A failure is stored on that head's row and logged; it neither stops the worker
+nor touches any other run.
+
+**What stays GitHub's.** Whether a PR exists, its current head, its checks,
+the human review state and the merge are read from GitHub events as before.
+The gate adds one more GitHub-bound fact (the bot's review) and one provider
+progress indicator; it removes nothing from the human reviewer. Human review
+and merge remain mandatory and are shown separately from the bot's verdict
+(§12). A run with findings is not failed: it stays `pr_open`, unverified, with
+the finding count and kinds in the task row and timeline, and the follow-up —
+fix in the same PR, dismiss with a reason on GitHub, or open a follow-up issue
+— is a human decision. Nothing merges automatically, including any remediation
+PR a scan might propose.
+
+**Revisit when** GitHub's branch protection can be read through the App
+(D-030), so "checks passed" and "review clear" can both be narrowed to what
+protection actually requires; and if the review API begins to expose findings
+directly, in which case GitHub's review remains the verdict and the API's copy
+becomes a cross-check (D-032).
+
+---
+
+## D-034 — DeepWiki is generated navigation and context; README and `docs/` remain the canonical statement of intent
+
+**Status**: accepted (maintainer decision)
+
+**Decision.** Both repositories (`SoniaLei/issue-pipeline` and
+`SoniaLei/superset-cognition-demo`) are indexed by Devin's DeepWiki, steered by
+a committed `.devin/wiki.json` that names the pages the wiki should have and
+what each is for. The wiki is the *description* of the code as it is:
+architecture diagrams, per-area pages, source links, and the context that Ask
+Devin, Devin Desktop and pipeline sessions read. It is not where decisions are
+made. `README.md` is the canonical entry point and operating guide,
+`docs/architecture.md` the intended design, `docs/decisions.md` the record of
+why, and `.agents/skills/` in a target repository the runtime instructions a
+session follows (D-031). When the wiki and the docs disagree, the docs state
+what was intended, the wiki what was built, and the gap is a bug in one or the
+other to be fixed by a reviewed PR.
+
+**Why steer it with a committed file.** An unsteered wiki organises the code
+by directory. `wiki.json` lets the page tree follow the architecture instead —
+lifecycle, authority boundaries, security, operations, onboarding — and is
+versioned and reviewed like any other doc, so a change to the intended
+structure of the system is a diff someone approves.
+
+**Why the wiki is not canonical.** It is regenerated from the code; it cannot
+hold an intent the code does not yet implement, a rejected alternative, or a
+"revisit when". Those live in the decisions log. Making generated text the
+source of truth would let an implementation drift redefine the design.
+
+**What it is for.** Onboarding (read the wiki's overview and lifecycle pages,
+then the README to run it, then the decisions when changing behaviour); Ask
+Devin questions about how something works; and context for Devin sessions,
+which read the wiki alongside the checkout. Reading the wiki creates nothing:
+no issue, no PR, no session. A change proposal — from a human or from the
+scheduled sweep in D-035 — is always a PR reviewed and merged by a maintainer.
+
+**Revisit when** the wiki's refresh behaviour on push is confirmed from the
+settings UI, and when a second target repository is added (whether one shared
+page template is enough).
+
+---
+
+## D-035 — An overnight scheduled session looks for drift and bugs; it proposes, humans dispose
+
+**Status**: accepted (maintainer decision)
+
+**Decision.** One scheduled Devin Automation runs overnight against
+`SoniaLei/issue-pipeline`. It reads the current code, `docs/architecture.md`,
+`docs/decisions.md`, the README and the DeepWiki pages, and looks for two
+things: places where the implementation and the documented intent disagree,
+and defects it can demonstrate (a failing test it can write, a reproducible
+misbehaviour). For each actionable finding it opens either a GitHub issue
+(when the fix needs a decision or is not small) or a PR with a test (when it is
+small and clearly right). It posts a short summary to Slack. It runs at most
+once per night, does not start if the previous run is still going, is capped in
+ACUs, and never merges anything.
+
+**Why a scheduled session, not a per-push hook.** Drift between docs and code
+is slow and cross-cutting; it is cheaper and less noisy to read the whole
+picture once a night than to react to each commit. Per-PR concerns are already
+covered by CI and the review gate (D-033).
+
+**Why issues *and* PRs, and never a merge.** The sweep's output is a proposal.
+A PR from it goes through the same checks, the same Devin Review and the same
+human review as any pipeline PR; an issue from it goes through the same
+`devin-ready` gate as any other request before any further spend. The sweep
+therefore adds no new trust path and cannot change `main` on its own.
+
+**Bounding it.** Fixed prompt in the Automation; explicit repository scope;
+one run per schedule with concurrency 1; ACU cap per run; "no actionable
+finding" is a valid and expected result and produces only the Slack line. It
+must not reopen an issue or PR it already raised for the same finding, and must
+link the doc section and code location for every claim.
+
+**What it is not.** Not a security scan (that is Code Scans, separately
+authorised); not a substitute for the review gate; not self-healing — nothing
+it produces takes effect without a human merging it.
+
+**Revisit when** a month of runs shows the signal-to-noise ratio: widen scope
+to the target repository, or narrow the prompt, based on what maintainers
+actually acted on.

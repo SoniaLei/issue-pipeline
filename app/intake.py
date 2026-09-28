@@ -32,11 +32,25 @@ from typing import Any
 from app.config import Settings
 from app.notifications import build_payload, destination_is_operator, fingerprint, Kind
 from app.prompts import extract_marker
+from app.review_gate import (
+    finding_kind,
+    gate_state,
+    is_review_bot,
+    is_verified,
+    parse_summary,
+)
 from app.states import check_transition, PRE_EXECUTION, State
 from app.store import now_iso, Store
 
 SUPPORTED_EVENTS = frozenset(
-    {"issues", "pull_request", "pull_request_review", "check_suite", "ping"}
+    {
+        "issues",
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+        "check_suite",
+        "ping",
+    }
 )
 
 # Check-suite conclusions that mean the head is not verified, whatever any
@@ -131,6 +145,8 @@ class Intake:
                 result = self._handle_pull_request(conn, repo, str(action), payload)
             elif event == "check_suite":
                 result = self._handle_check_suite(conn, repo, str(action), payload)
+            elif event == "pull_request_review_comment":
+                result = self._handle_review_comment(conn, repo, str(action), payload)
             else:
                 result = self._handle_review(conn, repo, str(action), payload)
 
@@ -382,7 +398,15 @@ class Intake:
 
         if action in OPEN_ACTIONS:
             return self._pull_request_open(
-                conn, repo, action, state, fields, task_id, run_id, head_sha
+                conn,
+                repo,
+                action,
+                state,
+                fields,
+                task_id,
+                run_id,
+                head_sha,
+                previous_head=run["head_sha"],
             )
         if action == "closed":
             return self._pull_request_closed(
@@ -404,6 +428,8 @@ class Intake:
         task_id: int,
         run_id: str,
         head_sha: str,
+        *,
+        previous_head: str | None,
     ) -> IntakeResult:
         if state in {State.MERGED, State.CLOSED_UNMERGED}:
             # A delayed delivery must not resurrect a finished task.
@@ -417,6 +443,24 @@ class Intake:
             # A new head invalidates whatever was known about the old one.
             fields["checks_state"] = None
             fields["checks_head_sha"] = None
+            if previous_head and head_sha and previous_head != head_sha:
+                stale = self.store.review_for_head(run_id, previous_head)
+                if stale is not None:
+                    # The review row stays, keyed by the old head; only its
+                    # relevance ends. The worker asks for the new head afresh.
+                    self.store.record_event(
+                        conn,
+                        run_id=run_id,
+                        task_id=task_id,
+                        kind="review_gate",
+                        reason="superseded",
+                        detail={
+                            "head_sha": head_sha,
+                            "previous_head": previous_head,
+                            "previous_status": stale["status"],
+                            "previous_findings": stale["findings"],
+                        },
+                    )
         if state is not State.PR_OPEN:
             check_transition(state, State.PR_OPEN)
             fields["state"] = State.PR_OPEN.value
@@ -547,6 +591,12 @@ class Intake:
         run = self._correlate(repo, pull) if pull else None
         if run is None:
             return IntakeResult(False, "review for an untracked PR")
+        reviewer = str((review.get("user") or {}).get("login") or "")
+        if is_review_bot(reviewer):
+            # Devin Review's summary: the verdict of the review gate, tied to
+            # the commit it reviewed. Not a human review, so it never touches
+            # `review_state`.
+            return self._handle_bot_review(conn, run, action, review)
         review_state = str(review.get("state") or "")
         self.store.update_run(conn, str(run["id"]), review_state=review_state)
         self.store.record_event(
@@ -566,6 +616,120 @@ class Intake:
             f"review {action} recorded",
             task_id=int(run["task_id"]),
             run_id=str(run["id"]),
+        )
+
+    def _handle_bot_review(
+        self,
+        conn: sqlite3.Connection,
+        run: sqlite3.Row,
+        action: str,
+        review: dict[str, Any],
+    ) -> IntakeResult:
+        run_id = str(run["id"])
+        task_id = int(run["task_id"])
+        commit = str(review.get("commit_id") or "")
+        findings = parse_summary(review.get("body"))
+        if not commit or findings is None or action != "submitted":
+            return IntakeResult(False, "Devin Review comment without a verdict")
+        self.store.upsert_review(
+            conn,
+            run_id=run_id,
+            head_sha=commit,
+            env=str(run["env"]),
+            pr_url=str(run["pr_url"] or ""),
+            findings=findings,
+            review_url=review.get("html_url"),
+            verdict_at=now_iso(),
+        )
+        self.store.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="review_gate",
+            reason="clear" if findings == 0 else "findings",
+            detail={
+                "head_sha": commit,
+                "findings": findings,
+                "url": review.get("html_url"),
+                "current_head": commit == run["head_sha"],
+            },
+        )
+        if commit == run["head_sha"]:
+            self._record_verified_if_due(conn, run_id, task_id, commit)
+        return IntakeResult(
+            True, "Devin Review verdict recorded", task_id=task_id, run_id=run_id
+        )
+
+    def _handle_review_comment(
+        self, conn: sqlite3.Connection, repo: str, action: str, payload: dict[str, Any]
+    ) -> IntakeResult:
+        """Count Devin Review's inline findings by kind (bug, security, flag)
+        for the commit they were left on. Human review comments are not
+        recorded."""
+        comment = payload.get("comment") or {}
+        pull = payload.get("pull_request") or {}
+        kind = finding_kind(comment.get("body"))
+        login = (comment.get("user") or {}).get("login")
+        if not is_review_bot(login) or kind is None:
+            return IntakeResult(False, "not a Devin Review finding")
+        if action != "created":
+            return IntakeResult(False, f"finding comment {action} ignored")
+        run = self._correlate(repo, pull) if pull else None
+        if run is None:
+            return IntakeResult(False, "finding for an untracked PR")
+        commit = str(comment.get("commit_id") or "")
+        if not commit:
+            return IntakeResult(False, "finding without a commit")
+        run_id = str(run["id"])
+        row = self.store.review_for_head(run_id, commit)
+        by_kind: dict[str, int] = (
+            json.loads(str(row["findings_by_kind"])) if row is not None else {}
+        )
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        self.store.upsert_review(
+            conn,
+            run_id=run_id,
+            head_sha=commit,
+            env=str(run["env"]),
+            pr_url=str(run["pr_url"] or ""),
+            findings_by_kind=json.dumps(by_kind, sort_keys=True),
+        )
+        return IntakeResult(
+            True,
+            f"Devin Review {kind} finding recorded",
+            task_id=int(run["task_id"]),
+            run_id=run_id,
+        )
+
+    def _record_verified_if_due(
+        self, conn: sqlite3.Connection, run_id: str, task_id: int, head_sha: str
+    ) -> None:
+        """Record *verified* for a head once, when GitHub checks have passed
+        on it and the review gate is satisfied for it (D-033). Called from
+        every path that can complete either half."""
+        run = self.store.get_run(run_id)
+        if run is None or run["head_sha"] != head_sha:
+            return
+        mode = self.settings.review_gate_mode
+        review = self.store.review_for_head(run_id, head_sha)
+        if not is_verified(run, review, mode):
+            return
+        for event in self.store.events_for_run(run_id):
+            if event["kind"] != "verified":
+                continue
+            detail = json.loads(str(event["detail"] or "{}"))
+            if detail.get("head_sha") == head_sha:
+                return
+        self.store.record_event(
+            conn,
+            run_id=run_id,
+            task_id=task_id,
+            kind="verified",
+            detail={
+                "head_sha": head_sha,
+                "review_gate": gate_state(review, mode),
+                "mode": mode,
+            },
         )
 
     # --------------------------------------------------------------------- checks
@@ -636,12 +800,8 @@ class Intake:
                 },
             )
             if after == "passed" and before != "passed":
-                self.store.record_event(
-                    conn,
-                    run_id=run_id,
-                    task_id=int(run["task_id"]),
-                    kind="verified",
-                    detail={"head_sha": head_sha},
+                self._record_verified_if_due(
+                    conn, run_id, int(run["task_id"]), head_sha
                 )
         return IntakeResult(
             True,
@@ -679,13 +839,7 @@ class Intake:
             detail={"head_sha": head_sha, "suites_adopted": adopted},
         )
         if after == "passed":
-            self.store.record_event(
-                conn,
-                run_id=run_id,
-                task_id=task_id,
-                kind="verified",
-                detail={"head_sha": head_sha},
-            )
+            self._record_verified_if_due(conn, run_id, task_id, head_sha)
 
     # --------------------------------------------------------------- notifications
 

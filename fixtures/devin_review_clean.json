@@ -1,0 +1,42 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 5101,
+    "state": "commented",
+    "commit_id": "a1b2c3d4",
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91#pullrequestreview-5101",
+    "user": {
+      "login": "devin-ai-integration[bot]",
+      "type": "Bot"
+    },
+    "body": "**Devin Review**: No Issues Found\n\n<!-- devin-review-badge-begin --><a href=\"https://app.devin.ai/review/sonialei/superset-cognition-demo/pull/91\">Devin Review</a><!-- devin-review-badge-end -->"
+  },
+  "pull_request": {
+    "number": 91,
+    "title": "fix(dashboard): keep native filter state across single-chart refresh",
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo/pull/91",
+    "body": "Cause: the refresh path rebuilt filter state from defaults.\n\nFixes #4242\n\n<!-- automation-run: RUN_ID -->",
+    "head": {
+      "ref": "devin/issue-4242-RUN_ID",
+      "sha": "a1b2c3d4",
+      "repo": {
+        "full_name": "SoniaLei/superset-cognition-demo"
+      }
+    },
+    "base": {
+      "ref": "master",
+      "sha": "0501796837"
+    }
+  },
+  "repository": {
+    "full_name": "SoniaLei/superset-cognition-demo",
+    "html_url": "https://github.com/SoniaLei/superset-cognition-demo"
+  },
+  "sender": {
+    "login": "devin-ai-integration[bot]",
+    "type": "Bot"
+  }
+}

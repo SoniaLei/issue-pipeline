@@ -134,6 +134,23 @@ CAPACITY_DETAILS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class PullRequestReview:
+    """One Devin Review of one PR commit, as the pr-reviews API reports it.
+
+    Progress only: ``status`` is pending/running/completed/errored/cancelled/
+    skipped. What the review found is not in this record; it reaches the
+    pipeline as a GitHub review by the Devin bot (see ``review_gate``).
+    """
+
+    pr_url: str
+    commit_sha: str
+    status: str
+    pr_number: int | None = None
+    repo_path: str | None = None
+    created_at: str | None = None
+
+
 def map_status(snapshot: SessionSnapshot, has_pr: bool) -> tuple[State, str | None]:
     """Translate provider status into an application state and reason.
 
@@ -214,13 +231,22 @@ class DevinClient(Protocol):
         time_before: datetime,
     ) -> ProviderMetrics: ...
 
+    def get_pr_review(
+        self, pr_url: str, commit_sha: str | None = None
+    ) -> PullRequestReview | None: ...
+
+    def request_pr_review(self, pr_url: str) -> PullRequestReview: ...
+
 
 class DevinError(RuntimeError):
     """A provider call failed in a way the caller must decide about."""
 
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    def __init__(
+        self, message: str, *, retryable: bool = True, status_code: int | None = None
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
 
 
 def _parse_session(data: dict[str, Any]) -> SessionSnapshot:
@@ -274,6 +300,18 @@ def _parse_consumption(data: dict[str, Any]) -> DailyConsumption:
     )
 
 
+def _parse_pr_review(data: dict[str, Any], pr_url: str) -> PullRequestReview:
+    number = data.get("pr_number")
+    return PullRequestReview(
+        pr_url=str(data.get("pr_url") or pr_url),
+        commit_sha=str(data.get("commit_sha") or ""),
+        status=str(data.get("status") or "pending"),
+        pr_number=int(number) if number is not None else None,
+        repo_path=data.get("repo_path"),
+        created_at=data.get("created_at"),
+    )
+
+
 def _parse_metrics(prs: dict[str, Any], sessions: dict[str, Any]) -> ProviderMetrics:
     avg = sessions.get("avg_acus_per_session")
     return ProviderMetrics(
@@ -308,6 +346,8 @@ class LiveDevinClient:
     consumption         ``GET    /consumption/daily/sessions/{id}``
     PR metrics          ``GET    /metrics/prs``
     session metrics     ``GET    /metrics/sessions``
+    PR review lookup    ``GET    /pr-reviews?pr_url=&commit_sha=``
+    PR review request   ``POST   /pr-reviews``
     ==================  ==========================================
 
     Authentication is a dedicated service user holding ``UseDevinSessions``
@@ -315,7 +355,8 @@ class LiveDevinClient:
     unattended pipeline keyed to one person's account stops working the moment
     their access changes. The organization-level analytics endpoints answer to
     the same token; the ``/v3/enterprise`` variants need ``ViewAccountMetrics``
-    and are not used.
+    and are not used. The pr-reviews endpoints need Devin Review enabled for
+    the organization and the Devin GitHub app on the repository.
     """
 
     def __init__(
@@ -352,16 +393,20 @@ class LiveDevinClient:
         except httpx.HTTPError as exc:
             raise DevinError(str(exc), retryable=True) from exc
 
-        if response.status_code in {401, 403}:
+        code = response.status_code
+        if code in {401, 403}:
             raise DevinError(
-                f"not authorized for {path} ({response.status_code})", retryable=False
+                f"not authorized for {path} ({code})", retryable=False, status_code=code
             )
-        if response.status_code >= 500 or response.status_code == 429:
-            raise DevinError(f"{path} returned {response.status_code}", retryable=True)
-        if response.status_code >= 400:
+        if code >= 500 or code == 429:
             raise DevinError(
-                f"{path} returned {response.status_code}: {response.text[:200]}",
+                f"{path} returned {code}", retryable=True, status_code=code
+            )
+        if code >= 400:
+            raise DevinError(
+                f"{path} returned {code}: {response.text[:200]}",
                 retryable=False,
+                status_code=code,
             )
         parsed: dict[str, Any] = response.json()
         return parsed
@@ -452,6 +497,31 @@ class LiveDevinClient:
             self._analytics("GET", "/metrics/sessions", params=params),
         )
 
+    def get_pr_review(
+        self, pr_url: str, commit_sha: str | None = None
+    ) -> PullRequestReview | None:
+        """The review of one commit, or None when Devin has never reviewed
+        it. Without ``commit_sha`` Devin resolves the PR's current head, which
+        is a different question from the one the gate asks, so the worker
+        always passes the head it knows."""
+        params: dict[str, Any] = {"pr_url": pr_url}
+        if commit_sha:
+            params["commit_sha"] = commit_sha
+        try:
+            data = self._analytics("GET", "/pr-reviews", params=params)
+        except DevinError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return _parse_pr_review(data, pr_url)
+
+    def request_pr_review(self, pr_url: str) -> PullRequestReview:
+        """Ask for a review. Devin always reviews the PR's latest commit; the
+        response says which one that was, and the worker stores it under
+        that sha rather than the one it expected."""
+        data = self._analytics("POST", "/pr-reviews", json={"pr_url": pr_url})
+        return _parse_pr_review(data, pr_url)
+
 
 SIM_SERVICE_USER = "service-user-sim"
 
@@ -488,10 +558,25 @@ class SimulatedDevinClient:
         },
     ]
 
-    def __init__(self, script: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        script: list[dict[str, Any]] | None = None,
+        *,
+        review_statuses: tuple[str, ...] = ("pending", "running", "completed"),
+    ) -> None:
         self._script = script if script is not None else list(self.DEFAULT_SCRIPT)
         self._sessions: dict[str, _SimSession] = {}
         self._counter = itertools.count(1)
+        # (pr_url, commit) -> index into review_statuses; each read advances
+        # one step, the way a real review progresses between polls.
+        self._review_statuses = review_statuses
+        self._reviews: dict[tuple[str, str], int] = {}
+        self.review_requests: list[tuple[str, str]] = []
+        # What the "current head" is for a PR the simulation requests a review
+        # of: set by the harness, since the sim has no GitHub to ask. Falls
+        # back to the head the worker last asked about.
+        self.pr_heads: dict[str, str] = {}
+        self._asked: dict[str, str] = {}
 
     def create_session(
         self,
@@ -602,6 +687,30 @@ class SimulatedDevinClient:
             ),
             avg_acus_per_session=(sum(acus) / len(acus)) if acus else None,
             sessions_by_size={"s": len(sessions)} if sessions else {},
+        )
+
+    def get_pr_review(
+        self, pr_url: str, commit_sha: str | None = None
+    ) -> PullRequestReview | None:
+        sha = commit_sha or self.pr_heads.get(pr_url, "")
+        if commit_sha:
+            self._asked[pr_url] = commit_sha
+        key = (pr_url, sha)
+        if key not in self._reviews:
+            return None
+        position = self._reviews[key]
+        if position < len(self._review_statuses) - 1:
+            self._reviews[key] = position + 1
+        return PullRequestReview(
+            pr_url=pr_url, commit_sha=sha, status=self._review_statuses[position]
+        )
+
+    def request_pr_review(self, pr_url: str) -> PullRequestReview:
+        sha = self.pr_heads.get(pr_url) or self._asked.get(pr_url, "")
+        self.review_requests.append((pr_url, sha))
+        self._reviews.setdefault((pr_url, sha), 0)
+        return PullRequestReview(
+            pr_url=pr_url, commit_sha=sha, status=self._review_statuses[0]
         )
 
     def _get(self, session_id: str) -> _SimSession:

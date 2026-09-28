@@ -73,6 +73,7 @@ def test_a_pr_is_opened_but_not_verified_until_checks_pass(
 
     assert board["results"] == {
         "pr_opened": 1,
+        "checks_passed": 0,
         "verified": 0,
         "merged": 0,
         "closed_unmerged": 0,
@@ -81,6 +82,12 @@ def test_a_pr_is_opened_but_not_verified_until_checks_pass(
     assert board["workload"]["awaiting_review"] == 0
     (task,) = board["tasks"]
     assert task["tests"]["checks"]["state"] == "unknown"
+    assert task["review"]["state"] == "not_requested"
+    assert board["review_gate"] == {
+        "mode": "required",
+        "states": {"not_requested": 1},
+        "last_call_at": None,
+    }
     # Devin said it added a test; that is reported, but it is not verification.
     assert task["tests"]["regression_test"] == "added"
     assert not task["verified"]
@@ -99,10 +106,36 @@ def test_checks_passing_on_the_current_head_verifies(
     send(intake, "check_suite", "check_suite_success.json", run_id)
     board = build_dashboard(store, "sim")
 
+    # Checks alone are half the gate: reported as such, not as verified.
     run = store.get_run(run_id)
     assert run is not None
-    assert is_verified(run)
+    assert not is_verified(run, None, "required")
+    assert is_verified(run, None, "advisory")
+    assert board["results"]["checks_passed"] == 1
+    assert board["results"]["verified"] == 0
+    assert board["workload"]["pr_open"] == 1
+    (task,) = board["tasks"]
+    assert task["checks_passed"]
+    assert not task["verified"]
+    assert task["review"]["state"] == "not_requested"
+    assert "verified" not in [e["kind"] for e in store.events_for_run(run_id)]
+
+    # Devin Review's verdict for the same commit arrives from GitHub.
+    send(intake, "pull_request_review", "devin_review_clean.json", run_id)
+    board = build_dashboard(store, "sim")
+
+    run = store.get_run(run_id)
+    assert run is not None
+    review = store.review_for_head(run_id, run["head_sha"])
+    assert review is not None
+    assert review["findings"] == 0
+    assert is_verified(run, review, "required")
     assert board["results"]["verified"] == 1
+    (task,) = board["tasks"]
+    assert task["review"]["state"] == "clear"
+    assert task["review"]["head_sha"] == "a1b2c3d4"
+    assert task["review"]["satisfied"]
+    assert task["pr"]["review_state"] is None  # the bot is not a human reviewer
     assert board["workload"] == {
         "awaiting_approval": 0,
         "queued": 0,
@@ -144,6 +177,7 @@ def test_a_new_commit_resets_verification(
 ) -> None:
     run_id = run_to_pr(intake, worker, store)
     send(intake, "check_suite", "check_suite_success.json", run_id)
+    send(intake, "pull_request_review", "devin_review_clean.json", run_id)
     assert build_dashboard(store, "sim")["results"]["verified"] == 1
 
     payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
@@ -153,10 +187,18 @@ def test_a_new_commit_resets_verification(
 
     board = build_dashboard(store, "sim")
     assert board["results"]["verified"] == 0
+    assert board["results"]["checks_passed"] == 0
     assert board["workload"]["pr_open"] == 1
     checks = board["tasks"][0]["tests"]["checks"]
     assert checks["state"] == "unknown"
     assert checks["head_sha"] == "e5f6a7b8"
+    # The clear verdict belonged to a1b2c3d4; the new head starts unreviewed.
+    review = board["tasks"][0]["review"]
+    assert review["state"] == "not_requested"
+    assert review["head_sha"] == "e5f6a7b8"
+    assert review["findings"] is None
+    kinds = [(e["kind"], e["reason"]) for e in store.events_for_run(run_id)]
+    assert ("review_gate", "superseded") in kinds
 
     # A late suite for the *old* head must not re-verify the new one.
     stale = substitute_run_id(load_fixture("check_suite_success.json"), run_id)
@@ -166,6 +208,26 @@ def test_a_new_commit_resets_verification(
     )
     assert not result.accepted
     assert build_dashboard(store, "sim")["results"]["verified"] == 0
+
+    # Nor may a late Devin verdict for the old head clear the new one, even
+    # once the new head's checks pass.
+    new_suite = substitute_run_id(load_fixture("check_suite_success.json"), run_id)
+    new_suite["check_suite"]["head_sha"] = "e5f6a7b8"
+    intake.handle(
+        delivery_id=next_delivery_id(), event="check_suite", payload=new_suite
+    )
+    late = substitute_run_id(load_fixture("devin_review_clean.json"), run_id)
+    late["review"]["id"] = 5199
+    late["pull_request"]["head"]["sha"] = "e5f6a7b8"
+    late["review"]["commit_id"] = "a1b2c3d4"
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="pull_request_review", payload=late
+    )
+    assert result.accepted  # recorded against a1b2c3d4, as history
+    board = build_dashboard(store, "sim")
+    assert board["results"]["checks_passed"] == 1
+    assert board["results"]["verified"] == 0
+    assert board["tasks"][0]["review"]["state"] == "not_requested"
 
 
 def test_a_check_suite_for_an_unknown_head_is_recorded_and_ignored(
@@ -209,11 +271,15 @@ def test_suites_requested_before_the_pr_opens_are_adopted_and_keep_it_pending(
     assert run is not None
     assert run["state"] == State.PR_OPEN.value
     assert run["checks_state"] == "pending"
-    assert not is_verified(run)
+    assert not is_verified(run, None, "advisory")
     assert len(store.checks_for_head(run_id, "a1b2c3d4")) == 2
-    assert build_dashboard(store, "sim")["results"]["verified"] == 0
+    assert build_dashboard(store, "sim")["results"]["checks_passed"] == 0
 
-    # Only once the second suite completes does the head verify.
+    # Only once the second suite completes do the checks pass; with the
+    # review verdict already on GitHub, that is the moment the head verifies.
+    send(intake, "pull_request_review", "devin_review_clean.json", run_id)
+    kinds = [row["kind"] for row in store.events_for_run(run_id)]
+    assert kinds.count("verified") == 0
     finished_second = substitute_run_id(
         load_fixture("check_suite_success.json"), run_id
     )
@@ -223,7 +289,7 @@ def test_suites_requested_before_the_pr_opens_are_adopted_and_keep_it_pending(
     )
     run = store.get_run(run_id)
     assert run is not None
-    assert is_verified(run)
+    assert is_verified(run, store.review_for_head(run_id, "a1b2c3d4"), "required")
     kinds = [row["kind"] for row in store.events_for_run(run_id)]
     assert kinds.count("verified") == 1
 
@@ -236,6 +302,7 @@ def test_merged_is_github_saying_so(
 ) -> None:
     run_id = run_to_pr(intake, worker, store)
     send(intake, "check_suite", "check_suite_success.json", run_id)
+    send(intake, "pull_request_review", "devin_review_clean.json", run_id)
     send(intake, "pull_request_review", "pr_review_approved.json", run_id)
     send(intake, "pull_request", "pr_merged.json", run_id)
 
@@ -251,8 +318,20 @@ def test_merged_is_github_saying_so(
     assert timeline is not None
     assert timeline["review"]["outcome"] == "merged"
     assert timeline["review"]["review_state"] == "approved"
+    assert timeline["review"]["devin_review"]["state"] == "clear"
+    (history,) = timeline["review"]["devin_review_history"]
+    assert history["head_sha"] == "a1b2c3d4"
+    assert history["current"]
     kinds = [e["kind"] for e in timeline["events"]]
-    for kind in ("state", "session", "pr", "checks", "verified", "review"):
+    for kind in (
+        "state",
+        "session",
+        "pr",
+        "checks",
+        "review_gate",
+        "verified",
+        "review",
+    ):
         assert kind in kinds
     states = [e["to_state"] for e in timeline["events"] if e["kind"] == "state"]
     assert states[0] == State.QUEUED.value
@@ -312,6 +391,7 @@ def test_live_and_simulated_runs_are_never_summed(
     assert sim["results"]["merged"] == 1
     assert live["results"] == {
         "pr_opened": 0,
+        "checks_passed": 0,
         "verified": 0,
         "merged": 0,
         "closed_unmerged": 0,
@@ -388,6 +468,9 @@ def test_dashboard_endpoints(
     assert "Simulation" in page.text
     assert "Live" in page.text
     assert 'const DEFAULT_ENV = "sim";' in page.text
+    # The per-state summary counts PRs; that count must not be drawn as a
+    # finding count on the pill.
+    assert "findings: null, findings_by_kind: {} }), ` ×${n} `" in page.text
 
     default = client.get("/api/dashboard").json()
     assert default["env"] == "sim"

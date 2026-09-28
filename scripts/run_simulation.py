@@ -115,6 +115,7 @@ def main() -> None:
         maintainer_allowlist=frozenset({"sonialei"}),
         database_path=":memory:",
         slack_destinations=destinations(args.live_slack),
+        review_poll_seconds=0,
     )
     store = Store(settings.database_path)
     intake = Intake(store, settings)
@@ -157,7 +158,7 @@ def main() -> None:
     )
     worker.tick()
 
-    print("6. GitHub reports the check suite: queued, then passed -> verified")
+    print("6. GitHub reports the check suite: queued, then passed -> checks passed")
     intake.handle(
         delivery_id="sim-5",
         event="check_suite",
@@ -169,16 +170,27 @@ def main() -> None:
         payload=fixture("check_suite_success.json", run_id),
     )
 
-    print("7. a maintainer approves the review")
+    print(
+        "7. worker asks Devin Review for the head; the bot's verdict lands -> verified"
+    )
+    for _ in range(4):
+        worker.tick()
     intake.handle(
         delivery_id="sim-7",
+        event="pull_request_review",
+        payload=fixture("devin_review_clean.json", run_id),
+    )
+
+    print("8. a maintainer approves the review")
+    intake.handle(
+        delivery_id="sim-8",
         event="pull_request_review",
         payload=fixture("pr_review_approved.json", run_id),
     )
 
-    print("8. a human merges it")
+    print("9. a human merges it")
     intake.handle(
-        delivery_id="sim-8",
+        delivery_id="sim-9",
         event="pull_request",
         payload=fixture("pr_merged.json", run_id),
     )

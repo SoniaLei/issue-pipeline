@@ -180,7 +180,8 @@
 <main>
   <section class="grid">
     <div class="card"><h2>Current workload <span class="tag pipeline">pipeline</span></h2><div class="stats" id="workload"></div></div>
-    <div class="card"><h2>Results <span class="tag github">GitHub authoritative</span></h2><div class="stats" id="results"></div>
+    <div class="card"><h2>Results <span class="tag github">GitHub authoritative</span> <span class="tag devin" id="gate-tag">review gate</span></h2><div class="stats" id="results"></div>
+      <div id="gate-states"></div>
       <div class="def" id="results-def"></div></div>
     <div class="card"><h2>Speed <span class="tag pipeline">pipeline</span></h2><div class="stats" id="speed"></div>
       <div class="def" id="speed-def"></div></div>
@@ -253,6 +254,19 @@ const pill = (bucket, extra) => {
   return el("span", { class: `pill ${tone}`, text: extra ? `${label} · ${extra}` : label });
 };
 const CHECK_TONE = { passed: "ok", failed: "bad", pending: "warn", unknown: "" };
+const GATE_LABEL = {
+  off: ["review off", "plain"], not_requested: ["review not requested", ""], pending: ["review pending", "warn"],
+  running: ["review running", "info"], awaiting_verdict: ["review done · awaiting verdict", "warn"], clear: ["review clear", "ok"],
+  findings: ["review findings", "bad"], errored: ["review errored", "bad"], cancelled: ["review cancelled", "warn"],
+  skipped: ["review skipped", "warn"], unavailable: ["review unavailable", "warn"],
+};
+const gatePill = (rv) => {
+  const [label, tone] = GATE_LABEL[rv.state] || [`review ${rv.state}`, ""];
+  const n = rv.findings;
+  const kinds = Object.entries(rv.findings_by_kind || {}).map(([k, v]) => `${v} ${k}`).join(", ");
+  const text = rv.state === "findings" && n != null ? `${n} finding${n === 1 ? "" : "s"}${kinds ? ` (${kinds})` : ""}` : label;
+  return el("span", { class: `pill ${tone}`, title: rv.head_sha ? `Devin Review of ${rv.head_sha.slice(0, 10)} · mode ${rv.mode}` : `mode ${rv.mode}`, text });
+};
 const SIZE_LABEL = { xs: "XS", s: "S", m: "M", l: "L", xl: "XL" };
 const SOURCE_LABEL = { billing: "billed", session: "session total", poll: "last poll" };
 
@@ -375,8 +389,15 @@ function render(d) {
     stat("awaiting review", w.awaiting_review, "ok"), stat("blocked", w.blocked, w.blocked ? "warn" : ""),
     stat("failed", w.failed, w.failed ? "bad" : ""), stat("awaiting approval", w.awaiting_approval));
   const r = d.results;
-  $("results").replaceChildren(stat("PRs opened", r.pr_opened), stat("verified", r.verified, "ok"), stat("merged", r.merged, "ok"), stat("closed unmerged", r.closed_unmerged, r.closed_unmerged ? "bad" : ""));
-  $("results-def").replaceChildren(el("b", { text: "Opened: " }), d.definitions.pr_opened, " ", el("b", { text: "Verified: " }), d.definitions.verified, " ", el("b", { text: "Merged: " }), d.definitions.merged);
+  $("results").replaceChildren(stat("PRs opened", r.pr_opened), stat("checks passed", r.checks_passed, "ok", "GitHub, current head"), stat("verified", r.verified, "ok", `checks + review gate (${d.review_gate.mode})`), stat("merged", r.merged, "ok"), stat("closed unmerged", r.closed_unmerged, r.closed_unmerged ? "bad" : ""));
+  const g = d.review_gate;
+  $("gate-tag").textContent = `Devin Review · ${g.mode}`;
+  const gateEntries = Object.entries(g.states);
+  $("gate-states").replaceChildren(el("p", { class: "small muted", style: "margin:8px 0 0" }, [
+    "Open PRs by review state: ",
+    ...(gateEntries.length ? gateEntries.flatMap(([s, n]) => [gatePill({ state: s, mode: g.mode, findings: null, findings_by_kind: {} }), ` ×${n} `]) : ["none"]),
+    g.last_call_at ? el("span", { class: "faint", text: ` · last pr-reviews read ${ago(g.last_call_at)}` }) : null]));
+  $("results-def").replaceChildren(el("b", { text: "Opened: " }), d.definitions.pr_opened, " ", el("b", { text: "Checks passed: " }), d.definitions.checks_passed, " ", el("b", { text: "Verified: " }), d.definitions.verified, " ", el("b", { text: "Merged: " }), d.definitions.merged, " ", el("b", { text: "Review gate: " }), d.definitions.review_gate);
   const s = d.speed;
   $("speed").replaceChildren(
     stat("median to review-ready", fmtDur(s.review_ready.median_seconds)), stat("p90", fmtDur(s.review_ready.p90_seconds)),
@@ -409,6 +430,8 @@ function render(d) {
     const checks = t.tests.checks;
     const tests = el("div", {}, [
       el("span", { class: `pill ${CHECK_TONE[checks.state] || ""}`, text: `checks ${checks.state}` }), " ",
+      t.pr.number && t.review.state !== "off" ? gatePill(t.review) : null,
+      t.review.last_error ? el("div", { class: "small muted", text: `review: ${t.review.last_error}` }) : null,
       el("div", { class: "small muted", text: `regression test ${t.tests.regression_test}` }),
       t.tests.tests_run ? el("div", { class: "small faint mono", text: t.tests.tests_run }) : null]);
     const pr = t.pr.number ? el("div", {}, [link(t.pr.url, `#${t.pr.number}`), " ",
@@ -472,6 +495,26 @@ function insightsCard(ins) {
   return el("div", { class: "card wide" }, parts);
 }
 
+function reviewCard(rv, history) {
+  const head = el("h2", {}, ["Devin Review ", el("span", { class: "tag devin", text: `gate ${rv.mode}` })]);
+  if (rv.state === "off") return el("div", { class: "card" }, [head, el("p", { class: "muted", text: "Review gate is off: verification is GitHub checks only." })]);
+  const parts = [head,
+    el("div", {}, [gatePill(rv), " ", el("span", { class: "small muted", text: rv.head_sha ? `on ${rv.head_sha.slice(0, 10)}` : "(no PR head yet)" })]),
+    el("p", { class: "kv" }, [el("b", { text: "API progress: " }), rv.status || "not asked", rv.status_at ? ` · read ${ago(rv.status_at)}` : "", rv.attempts ? ` · ${rv.attempts} call${rv.attempts === 1 ? "" : "s"}` : ""]),
+    el("p", { class: "kv" }, [el("b", { text: "Verdict on GitHub: " }),
+      rv.findings === null || rv.findings === undefined ? "none yet" : rv.findings === 0 ? "no findings" : `${rv.findings} finding${rv.findings === 1 ? "" : "s"}`,
+      Object.keys(rv.findings_by_kind || {}).length ? ` (${Object.entries(rv.findings_by_kind).map(([k, v]) => `${v} ${k}`).join(", ")})` : "",
+      ...(rv.review_url ? [" · ", link(rv.review_url, "open review")] : [])]),
+    rv.last_error ? el("p", { class: "kv" }, [el("b", { text: "Provider error: " }), rv.last_error]) : null,
+  ];
+  const older = (history || []).filter((h) => !h.current);
+  if (older.length) parts.push(el("ul", { class: "small issue-list" }, older.map((h) => el("li", {}, [
+    `${h.head_sha.slice(0, 10)} (superseded): ${h.findings === null ? (h.status || "not asked") : h.findings === 0 ? "clear" : `${h.findings} findings`}`,
+    ...(h.review_url ? [" · ", link(h.review_url, "review")] : [])]))));
+  parts.push(el("p", { class: "note", text: rv.mode === "required" ? "Required: the PR is verified only when checks pass and this review is clear on the same commit." : "Advisory: shown for the reviewer; does not hold back verification." }));
+  return el("div", { class: "card" }, parts);
+}
+
 async function openTimeline(taskId) {
   const drawer = $("drawer");
   drawer.replaceChildren(el("p", { class: "muted", text: "loading…" }));
@@ -497,7 +540,8 @@ async function openTimeline(taskId) {
         el("span", { class: "small muted", text: latest.tests.checks.head_sha ? ` on ${latest.tests.checks.head_sha.slice(0, 10)}` : " (no PR head yet)" })]),
       latest.tests.checks.suites.length ? el("ul", { class: "small issue-list" }, latest.tests.checks.suites.map((s) => el("li", {}, [s.url ? link(s.url, s.app || "check suite") : (s.app || "check suite"), ` · ${s.status}${s.conclusion ? " · " + s.conclusion : ""}`]))) : null,
       el("p", { class: "kv" }, [el("b", { text: "Session's account: " }), `regression test ${latest.tests.regression_test}`, latest.tests.tests_run ? `, ran "${latest.tests.tests_run}"` : "", latest.tests.session_outcome ? `, outcome "${latest.tests.session_outcome}"` : ""]),
-      el("p", { class: "note", text: "The session's account is what Devin reported; only GitHub checks count as verification." })]),
+      el("p", { class: "note", text: "The session's account is what Devin reported; verification counts only GitHub checks and, when required, Devin Review's verdict on GitHub." })]),
+    reviewCard(latest.review, t.review ? t.review.devin_review_history : []),
     el("div", { class: "card" }, [el("h2", {}, ["Human review ", el("span", { class: "tag github", text: "GitHub" })]),
       t.review ? el("p", { class: "kv" }, [el("b", { text: "Outcome: " }), t.review.outcome, t.review.review_state ? ` · latest review ${t.review.review_state}` : " · no review submitted",
         t.review.merged_by ? ` · merged by ${t.review.merged_by}` : "", t.review.merged_sha ? ` · ${t.review.merged_sha.slice(0, 10)}` : ""]) : el("p", { class: "muted", text: "no run yet" })]),
@@ -512,8 +556,16 @@ async function openTimeline(taskId) {
     else if (e.kind === "session") text = e.reason === "created" ? `Devin session ${d.session_id || ""} created` : `session ${d.status}${d.status_detail ? "/" + d.status_detail : ""}` + (d.acus_consumed != null ? ` · ${d.acus_consumed} ACU` : "");
     else if (e.kind === "pr") text = `PR #${d.number} ${e.reason}` + (d.head_sha ? ` · head ${String(d.head_sha).slice(0, 10)}` : "") + (d.merged_by ? ` by ${d.merged_by}` : "");
     else if (e.kind === "checks") text = `check suite ${d.app || ""} ${d.status || ""}${d.conclusion ? " · " + d.conclusion : ""} → head ${e.reason}`;
-    else if (e.kind === "verified") text = `verified: all check suites passed on ${String(d.head_sha || "").slice(0, 10)}`;
-    else if (e.kind === "review") text = `review ${e.reason}${d.reviewer ? " by " + d.reviewer : ""}`;
+    else if (e.kind === "verified") text = `verified on ${String(d.head_sha || "").slice(0, 10)}: check suites passed` + (d.review_gate && d.review_gate !== "off" ? ` · Devin Review ${d.review_gate}` : "");
+    else if (e.kind === "review") text = `human review ${e.reason}${d.reviewer ? " by " + d.reviewer : ""}`;
+    else if (e.kind === "review_gate") {
+      const sha = String(d.head_sha || "").slice(0, 10);
+      if (e.reason === "clear") text = `Devin Review clear on ${sha}` + (d.current_head === false ? " (older commit)" : "");
+      else if (e.reason === "findings") text = `Devin Review: ${d.findings} finding${d.findings === 1 ? "" : "s"} on ${sha}` + (d.current_head === false ? " (older commit)" : "");
+      else if (e.reason === "superseded") text = `new head ${sha}: Devin Review of ${String(d.previous_head || "").slice(0, 10)} no longer counts`;
+      else text = `Devin Review ${e.reason} for ${sha}` + (d.requested ? " · requested" : "") + (d.error ? ` · ${d.error}` : "");
+      if (["findings", "errored", "unavailable"].includes(e.reason)) cls += " bad";
+    }
     else if (e.kind === "insights") text = `Devin analysis available` + (d.session_size ? ` · size ${SIZE_LABEL[d.session_size] || d.session_size}` : "") + (d.acus_consumed != null ? ` · ${fmtAcu(d.acus_consumed)} ACU` : "") + (d.action_items != null ? ` · ${d.action_items} action item${d.action_items === 1 ? "" : "s"}` : "");
     else text = `${e.kind} ${e.reason || ""}`;
     if (e.reason && ["failed", "no_output", "expired", "session_blocked", "closed_unmerged"].includes(e.to_state || "")) { cls += " bad"; text += ` · reason: ${e.reason}`; }

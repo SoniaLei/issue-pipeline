@@ -49,6 +49,14 @@ DEFAULT_INSIGHTS_REFRESH_SECONDS = 600
 DEFAULT_INSIGHTS_SETTLE_SECONDS = 24 * 60 * 60
 DEFAULT_METRICS_REFRESH_SECONDS = 300
 
+# Review gate (D-033). `required`: a PR head is verified only when GitHub
+# checks pass *and* Devin Review completed on it with no findings.
+# `advisory`: the review is requested and shown but does not gate.
+# `off`: no review is requested.
+DEFAULT_REVIEW_GATE_MODE = "required"
+DEFAULT_REVIEW_POLL_SECONDS = 60
+DEFAULT_REVIEW_MAX_ATTEMPTS = 5
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment cannot produce a usable configuration."""
@@ -124,6 +132,12 @@ class Settings:
     insights_settle_seconds: int = DEFAULT_INSIGHTS_SETTLE_SECONDS
     metrics_refresh_seconds: int = DEFAULT_METRICS_REFRESH_SECONDS
 
+    # Review gate. One pr-reviews call per idle worker tick: a GET for the
+    # current head first, a POST only when no review of it exists.
+    review_gate_mode: str = DEFAULT_REVIEW_GATE_MODE
+    review_poll_seconds: int = DEFAULT_REVIEW_POLL_SECONDS
+    review_max_attempts: int = DEFAULT_REVIEW_MAX_ATTEMPTS
+
     def repo_allowed(self, full_name: str) -> bool:
         return full_name.lower() in self.repo_allowlist
 
@@ -166,6 +180,11 @@ def load_settings() -> Settings:
     slack_mode = os.environ.get("SLACK_MODE", "fake").lower()
     if slack_mode not in {"fake", "live"}:
         raise ConfigError("SLACK_MODE must be 'fake' or 'live'")
+    review_gate_mode = os.environ.get(
+        "REVIEW_GATE_MODE", DEFAULT_REVIEW_GATE_MODE
+    ).lower()
+    if review_gate_mode not in {"off", "advisory", "required"}:
+        raise ConfigError("REVIEW_GATE_MODE must be 'off', 'advisory' or 'required'")
 
     settings = Settings(
         github_webhook_secret=secret,
@@ -215,6 +234,13 @@ def load_settings() -> Settings:
         ),
         metrics_refresh_seconds=_env_int(
             "METRICS_REFRESH_SECONDS", DEFAULT_METRICS_REFRESH_SECONDS
+        ),
+        review_gate_mode=review_gate_mode,
+        review_poll_seconds=_env_int(
+            "REVIEW_POLL_SECONDS", DEFAULT_REVIEW_POLL_SECONDS
+        ),
+        review_max_attempts=_env_int(
+            "REVIEW_MAX_ATTEMPTS", DEFAULT_REVIEW_MAX_ATTEMPTS
         ),
     )
 

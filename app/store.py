@@ -142,7 +142,8 @@ CREATE TABLE IF NOT EXISTS run_events (
     run_id      TEXT NOT NULL REFERENCES runs(id),
     task_id     INTEGER NOT NULL REFERENCES tasks(id),
     at          TEXT NOT NULL,
-    kind        TEXT NOT NULL,             -- state|session|pr|checks|verified|review
+    kind        TEXT NOT NULL,             -- state|session|pr|checks|verified|
+                                           -- review|review_gate|insights
     from_state  TEXT,
     to_state    TEXT,
     reason      TEXT,
@@ -218,6 +219,30 @@ CREATE TABLE IF NOT EXISTS session_insights (
     generate_requested_at TEXT,
     settled             INTEGER NOT NULL DEFAULT 0,
     last_error          TEXT
+);
+
+-- Devin Review of one PR head (D-033). One row per (run, commit): a new head
+-- gets a new row and the old one stays as history, so a verdict can never be
+-- read against a commit it was not given for. `status` is what the pr-reviews
+-- API says about progress; `findings` is what GitHub carries as the bot's
+-- review of that commit. Only the latter can clear a head.
+CREATE TABLE IF NOT EXISTS pr_reviews (
+    run_id          TEXT NOT NULL REFERENCES runs(id),
+    head_sha        TEXT NOT NULL,
+    env             TEXT NOT NULL,
+    pr_url          TEXT NOT NULL,
+    status          TEXT,                    -- pending|running|completed|errored|
+                                             -- cancelled|skipped|unavailable
+    requested_at    TEXT,                    -- when this worker asked for it
+    status_at       TEXT,                    -- last API read
+    attempts        INTEGER NOT NULL DEFAULT 0,  -- failed API calls in a row
+    retryable       INTEGER NOT NULL DEFAULT 1,  -- 0: last error was permanent
+    last_error      TEXT,
+    findings        INTEGER,                 -- from the bot's GitHub review summary
+    findings_by_kind TEXT NOT NULL DEFAULT '{{}}',  -- JSON kind -> count
+    review_url      TEXT,                    -- the bot's review on GitHub
+    verdict_at      TEXT,
+    PRIMARY KEY (run_id, head_sha)
 );
 
 -- The latest organization-level counts Devin reports for the pipeline's own
@@ -771,6 +796,122 @@ class Store:
     def provider_metrics(self, env: str) -> sqlite3.Row | None:
         row: sqlite3.Row | None = self._conn.execute(
             "SELECT * FROM provider_metrics WHERE env = ?", (env,)
+        ).fetchone()
+        return row
+
+    # ------------------------------------------------------------- review gate
+
+    def review_for_head(self, run_id: str, head_sha: str | None) -> sqlite3.Row | None:
+        if not head_sha:
+            return None
+        row: sqlite3.Row | None = self._conn.execute(
+            "SELECT * FROM pr_reviews WHERE run_id = ? AND head_sha = ?",
+            (run_id, head_sha),
+        ).fetchone()
+        return row
+
+    def reviews_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM pr_reviews WHERE run_id = ?"
+                " ORDER BY COALESCE(requested_at, verdict_at, status_at)",
+                (run_id,),
+            ).fetchall()
+        )
+
+    def upsert_review(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        head_sha: str,
+        env: str,
+        pr_url: str,
+        **fields: Any,
+    ) -> None:
+        """Insert or update the review row for one head. Fields not given keep
+        their value, so a GitHub verdict and an API status written by
+        different code paths land on the same row without overwriting each
+        other."""
+        conn.execute(
+            "INSERT OR IGNORE INTO pr_reviews (run_id, head_sha, env, pr_url)"
+            " VALUES (?, ?, ?, ?)",
+            (run_id, head_sha, env, pr_url),
+        )
+        if not fields:
+            return
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        conn.execute(
+            f"UPDATE pr_reviews SET {assignments} WHERE run_id = ? AND head_sha = ?",
+            (*fields.values(), run_id, head_sha),
+        )
+
+    def claim_review_request(
+        self, *, run_id: str, head_sha: str, env: str, pr_url: str, requested_at: str
+    ) -> bool:
+        """Mark this head as requested, in its own transaction, before the
+        request leaves the process. Returns False when another worker already
+        holds the claim, so exactly one review is asked for per head."""
+        with self.transaction() as conn:
+            self.upsert_review(
+                conn, run_id=run_id, head_sha=head_sha, env=env, pr_url=pr_url
+            )
+            cursor = conn.execute(
+                "UPDATE pr_reviews SET requested_at = ?"
+                " WHERE run_id = ? AND head_sha = ? AND requested_at IS NULL",
+                (requested_at, run_id, head_sha),
+            )
+            return cursor.rowcount == 1
+
+    def release_review_request(self, run_id: str, head_sha: str) -> None:
+        """Undo a claim whose request failed before Devin accepted it, so the
+        next read may ask again."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE pr_reviews SET requested_at = NULL"
+                " WHERE run_id = ? AND head_sha = ?",
+                (run_id, head_sha),
+            )
+
+    def review_candidates(self, env: str) -> list[sqlite3.Row]:
+        """Runs whose current PR head still needs a review-gate read: GitHub
+        owns the run (pr_open / awaiting_review) and the head has no row, or a
+        row whose API status is not terminal, and GitHub has not already
+        delivered the bot's verdict for it. Heads left ``unavailable`` by a
+        permanent error (``retryable = 0``) are not read again. Oldest read
+        first."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT runs.*, tasks.repo AS task_repo, tasks.issue_number,
+                       pr_reviews.status AS review_status,
+                       pr_reviews.status_at AS review_status_at,
+                       pr_reviews.attempts AS review_attempts,
+                       pr_reviews.findings AS review_findings
+                FROM runs
+                JOIN tasks ON tasks.id = runs.task_id
+                LEFT JOIN pr_reviews
+                  ON pr_reviews.run_id = runs.id AND pr_reviews.head_sha = runs.head_sha
+                WHERE runs.env = ?
+                  AND runs.state IN ('pr_open', 'awaiting_review')
+                  AND runs.pr_url IS NOT NULL AND runs.head_sha IS NOT NULL
+                  AND pr_reviews.findings IS NULL
+                  AND (pr_reviews.status IS NULL
+                       OR pr_reviews.status IN ('pending', 'running')
+                       OR (pr_reviews.status = 'unavailable'
+                           AND pr_reviews.retryable = 1))
+                ORDER BY pr_reviews.status_at IS NOT NULL, pr_reviews.status_at
+                """,
+                (env,),
+            ).fetchall()
+        )
+
+    def last_review_call(self, env: str) -> sqlite3.Row | None:
+        """Most recent pr-reviews API read in this environment, for health."""
+        row: sqlite3.Row | None = self._conn.execute(
+            "SELECT status, status_at, last_error FROM pr_reviews"
+            " WHERE env = ? AND status_at IS NOT NULL ORDER BY status_at DESC LIMIT 1",
+            (env,),
         ).fetchone()
         return row
 

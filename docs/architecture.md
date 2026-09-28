@@ -174,6 +174,8 @@ no PR sits in `running` forever and nobody is told.
 | Execution | Worker claims lease | Create Devin session, poll | Session ID and URL |
 | Implementation | Devin works | Reproduce, test, fix, open PR | Branch, PR, test evidence |
 | PR notification | `pull_request.opened` | Correlate, update task, enqueue Slack | "PR opened" message |
+| Checks | `check_suite` for the current head | Record per-head check state | `checks_state` on the exact head |
+| Review gate | Worker, idle tick, PR head known | Ask Devin Review once per head, read its progress; bot verdict arrives from GitHub | `pr_reviews` row for the exact head (§8b) |
 | Review | Reviewer acts in GitHub | Record decision | Review state |
 | Merge | `pull_request.closed` + `merged=true` | Record merge SHA | "PR merged" message |
 | Closure | `pull_request.closed` + `merged=false` | Record outcome | Accurate status |
@@ -198,8 +200,9 @@ push code and cannot merge — D-005 says the pipeline must not merge, and this
 makes it unable to. Devin pushes its own branch under its own GitHub
 authentication.
 
-Events subscribed: `issues`, `pull_request`, `pull_request_review` and
-`check_suite`. Check suites are recorded per head SHA and folded into a
+Events subscribed: `issues`, `pull_request`, `pull_request_review`,
+`pull_request_review_comment` (the Devin bot's inline findings, counted per
+kind) and `check_suite`. Check suites are recorded per head SHA and folded into a
 per-run `checks_state`; they never drive a transition (D-011), only the
 dashboard's *verified* count (D-030).
 
@@ -517,6 +520,86 @@ is established through GitHub: the PR exists, on the expected repository and
 branch, and the checks on its *latest head SHA* are what they are. The pipeline
 reports both and conflates neither.
 
+## 8b. Review gate (D-033)
+
+After `pr_open`, every pipeline PR gets an independent reading by Devin Review
+before the pipeline will call it verified. The gate has one mode setting and
+three separate facts, and the design is mostly about keeping the facts apart.
+
+### Lifecycle
+
+```text
+PR head known (pull_request.opened / synchronize)
+  └─ worker, idle tick: POST /pr-reviews {pr_url}          once per (pr_url, head)
+       └─ GET /pr-reviews?pr_url&commit_sha=<head>          every REVIEW_POLL_SECONDS
+            status: pending → running → completed | errored | cancelled | skipped
+  └─ GitHub: pull_request_review by devin-ai-integration[bot] on that commit
+       body "found N potential issues" | "no issues found"   → findings, review_url
+       inline comments <!-- devin-review-comment {kind} -->  → findings_by_kind
+  └─ new head (synchronize): old row kept, event `review_gate superseded`,
+     new row + new request for the new head
+```
+
+The worker asks and reads only on ticks where no run advanced, so a slow
+provider never delays intake, session polling or Slack. It stops reading a head
+as soon as a GitHub verdict exists for it, when the API reports a terminal
+status, or after `REVIEW_MAX_ATTEMPTS` consecutive provider errors, at which
+point the head is `unavailable` with the last error stored. Every request,
+status change, verdict, error and supersession is a durable `review_gate` event
+in the run's timeline.
+
+### Three facts, one row per head
+
+| Fact | Source | Columns | Answers |
+| --- | --- | --- | --- |
+| Provider progress | `pr-reviews` API | `status`, `status_at`, `attempts`, `last_error` | Has Devin reviewed this commit yet? |
+| Verdict | GitHub review by the Devin bot | `findings`, `findings_by_kind`, `review_url`, `verdict_at` | What did it find on this commit? |
+| Human review | GitHub review by a person | `runs.review_state`, `runs.reviewer` | Does a maintainer accept the change? |
+
+A `completed` status with no verdict is *awaiting verdict*, never clear. A
+verdict without a status is a verdict. A row is never re-polled once it has a
+verdict, so a later API answer cannot overwrite what GitHub said. If the API
+reports a review of a commit the run does not know, that is recorded as the
+run's head being skipped and the pipeline waits for GitHub to report the new
+head — the provider's view of a PR is not used to update the run's head.
+
+### Current head only
+
+`Store.review_for_head(run_id, runs.head_sha)` is the only read that feeds
+verification. Rows for earlier heads remain for audit and appear in the
+timeline as *superseded*; they count toward nothing. This is the same rule the
+check suites follow (D-030), applied to a second kind of evidence.
+
+### What "verified" means per mode
+
+| `REVIEW_GATE_MODE` | Review calls | `verified` |
+| --- | --- | --- |
+| `off` | none | checks passed on the current head |
+| `advisory` | ask + read, shown everywhere | checks passed on the current head (review shown, not required) |
+| `required` (default) | ask + read | checks passed **and** review clear, both on the current head |
+
+Findings do not fail a run. It stays `pr_open` and unverified, the count and
+kinds are on the task row and in the timeline, and the follow-up — fix in the
+PR, dismiss with a reason on GitHub, or open a follow-up issue through the
+normal gate — is a human decision. Unknown, errored, skipped, unavailable and
+not-yet-reviewed are all "not clear". Nothing here changes who merges: the
+human review and the merge stay in GitHub and are shown separately (§12).
+
+### Failure isolation
+
+A provider error is stored on that head's row, logged, and counted against
+`REVIEW_MAX_ATTEMPTS`; it is never raised into the worker loop and never
+touches another run. Permission failures (403) are not retried — as elsewhere
+(§11), a 403 is a configuration problem. A run whose head is `unavailable`
+appears in *Needs attention* with the reason and the action.
+
+### Repository-wide scans are not this
+
+Code Scans / Security Swarm read a whole repository, run as sessions and can
+propose remediation PRs. When used, their findings enter as GitHub issues that
+go through the `devin-ready` maintainer gate like any other request; the
+pipeline does not call `remediate` and nothing they propose merges on its own.
+
 ## 9. Slack notifications
 
 ### Transport
@@ -791,6 +874,25 @@ CREATE TABLE session_insights (
     last_error          TEXT
 );
 
+-- Devin Review of one PR head. One row per (run, head); old heads are kept for
+-- audit and never satisfy verification for a newer head (§8b).
+CREATE TABLE pr_reviews (
+    run_id          TEXT NOT NULL REFERENCES runs(id),
+    head_sha        TEXT NOT NULL,
+    env             TEXT NOT NULL,
+    pr_url          TEXT NOT NULL,
+    status          TEXT,                         -- pr-reviews API: pending | running | completed | errored | cancelled | skipped | unavailable
+    requested_at    TEXT,                         -- POST made (once per head)
+    status_at       TEXT,                         -- last API read
+    attempts        INTEGER NOT NULL DEFAULT 0,   -- consecutive provider errors
+    last_error      TEXT,
+    findings        INTEGER,                      -- GitHub verdict: 0 = clear, N = findings, NULL = none yet
+    findings_by_kind TEXT NOT NULL DEFAULT '{}',  -- {"bug": n, "security": n, ...} from inline markers
+    review_url      TEXT,                         -- the bot's review on GitHub
+    verdict_at      TEXT,
+    PRIMARY KEY (run_id, head_sha)
+);
+
 -- Organization counts from Devin for the pipeline's service user(s), one row
 -- per env. A failed refresh keeps the last good metrics and records the error.
 CREATE TABLE provider_metrics (
@@ -816,8 +918,12 @@ CREATE TABLE provider_metrics (
 - Application timeout, provider suspension and actual usage control are three
   different things (§8) and are reported as three different things.
 - **A new PR head invalidates prior verification.** On a new commit, clear
-  `checks_state` back to pending for the new `head_sha`. Verification is always
-  a statement about one specific revision.
+  `checks_state` back to pending for the new `head_sha`, keep the old
+  `pr_reviews` row, and start a new one for the new head. Verification is
+  always a statement about one specific revision, for checks and for review.
+- **A review-provider failure is that head's problem.** It is recorded on the
+  row, capped by `REVIEW_MAX_ATTEMPTS`, shown as `unavailable`, and never
+  stops the worker or affects another run.
 - **Fetch current GitHub state before acting on a delayed event.** A late
   `pull_request` delivery must not move a merged PR back to open. This is the
   rule that makes out-of-order delivery survivable.
@@ -836,6 +942,13 @@ GitHub's "ready for review" reflects draft status only.
 Reviewers validate behaviour, inspect scope and request changes in GitHub.
 Branch protection and manual merge stay in force. After a merge the pipeline
 records the merge SHA and the issue's actual state.
+
+Devin Review (§8b) is a second reader, not a second approver. Its verdict is
+required for *verified* under the default gate mode, shown separately from the
+human review state, and satisfies none of the human's obligations: a PR that is
+checks-green and review-clear still waits for a maintainer to read it, approve
+it and merge it. The same applies to any PR produced by the overnight sweep
+(§16) or proposed by a repository scan.
 
 A later extension may relay an *explicitly approved* change request into the
 existing session via the messages endpoint. It will not execute review comments
@@ -897,15 +1010,53 @@ rather than a test helper.
 
 ## 15. Deliberately out of scope for v1
 
-- Automatic merge. Never in v1.
-- Acting on review comments automatically.
-- Check/status evaluation to derive "review-ready". Notify on PR opened and PR
-  closed; treat everything between as the reviewer's business. Required checks,
-  re-runs, in-progress suites and forks each have enough edge cases to be their
-  own milestone.
+- Automatic merge. Never in v1, including for remediation or sweep PRs.
+- Acting on review comments automatically — Devin Review findings included;
+  they are shown, and a human decides.
+- Narrowing "checks passed" and "review clear" to what branch protection
+  requires (needs the App to read protection). Today it is all suites GitHub
+  reported plus the Devin Review verdict on the current head (D-030, D-033).
 - Slack interactive actions, message updates, Events API subscription.
 - Follow-up instructions to an existing session from a reviewer.
 - Similar-bug discovery, feature implementation, deployment verification.
 
 Threading is the one later-release item worth designing for now: see
 `decisions.md`, D-009.
+
+## 16. Documentation, DeepWiki and the overnight sweep (D-034, D-035)
+
+Four kinds of text describe this system, and they are not interchangeable:
+
+| Text | Where | Says | Changed by |
+| --- | --- | --- | --- |
+| Operating guide | `README.md` | how to run, configure and read it | reviewed PR |
+| Intended design | `docs/architecture.md` | what the system is meant to do and why the boundaries are where they are | reviewed PR |
+| Decision record | `docs/decisions.md` | why each choice was made, what it is not, when to revisit | reviewed PR |
+| Runtime instructions for sessions | `.agents/skills/` in the **target** repository | how to stand up and test that repository (D-031) | reviewed PR in that repository |
+| Generated description | DeepWiki, steered by `.devin/wiki.json` | what the code does today, with diagrams and source links | regenerated from the code; page tree by reviewed PR |
+
+The README and `docs/` are canonical. DeepWiki is navigation and context: the
+place a new engineer starts reading, the corpus Ask Devin and Devin sessions
+consult, and never the record of intent. `.devin/wiki.json` names the pages the
+wiki should have (overview, lifecycle, authority boundaries, review gate,
+security, operations, onboarding) so the generated structure follows the
+architecture rather than the directory tree. Reading the wiki creates nothing —
+no issue, PR or session. When the wiki and the docs disagree, one of them has a
+bug, and it is fixed by a PR.
+
+### Overnight sweep
+
+One scheduled Devin Automation runs nightly against this repository with a
+fixed prompt: compare the code with `docs/architecture.md`, `docs/decisions.md`
+and the README, look for demonstrable defects, and for each actionable finding
+open an issue (needs a decision, or not small) or a PR with a test (small and
+clearly right); then post one Slack summary. Bounds: repository scope named in
+the prompt, one run per night, no overlap with a still-running previous run,
+an ACU cap, no reopening of a finding already raised, and "nothing actionable"
+as an expected result.
+
+The sweep's output is a proposal. Its PRs go through CI, the review gate (§8b)
+and human review like every other PR; its issues go through the `devin-ready`
+maintainer gate before any further spend. It adds no trust path and cannot
+change `main` on its own. It is not the per-PR gate, not a security scan (Code
+Scans are authorised separately) and not self-healing.
