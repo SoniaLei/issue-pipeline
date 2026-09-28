@@ -139,6 +139,7 @@
                    font-size: 18px; line-height: 1; cursor: pointer; color: var(--muted); }
   #drawer .close:hover { color: var(--ink); }
   #drawer .grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  #drawer .card.wide { grid-column: 1 / -1; }
   .links a { margin-right: 16px; font-size: 13px; }
   .links a::before { content: "↗ "; color: var(--faint); }
   .tl { list-style: none; margin: 8px 0 0; padding: 0 0 0 16px; border-left: 2px solid var(--line-2); }
@@ -443,7 +444,7 @@ async function load() {
 function insightsCard(ins) {
   const head = el("h2", {}, ["Devin's account ", el("span", { class: "tag devin", text: "provider" })]);
   if (!ins || !ins.available) {
-    return el("div", { class: "card" }, [head,
+    return el("div", { class: "card wide" }, [head,
       el("p", { class: "kv" }, [el("b", { text: "ACUs: " }), ins && ins.cost.acus !== null ? `${fmtAcu(ins.cost.acus)} (last poll)` : "not read yet"]),
       el("p", { class: "note", text: "Session analytics have not been read from Devin for this run yet." })]);
   }
@@ -467,7 +468,7 @@ function insightsCard(ins) {
   }
   if (ins.last_error) parts.push(el("p", { class: "note", text: `last analytics error: ${ins.last_error}` }));
   parts.push(el("p", { class: "note", text: `Devin's own figures and analysis, read ${ago(ins.fetched_at)}. They describe cost and process; the outcome above comes from GitHub.` }));
-  return el("div", { class: "card" }, parts);
+  return el("div", { class: "card wide" }, parts);
 }
 
 async function openTimeline(taskId) {
