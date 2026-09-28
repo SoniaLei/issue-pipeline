@@ -603,7 +603,8 @@ def _cost(runs: list[dict[str, Any]]) -> dict[str, Any]:
         sources[str(r["insights"]["cost"]["source"])] += 1
 
     return {
-        "acus_total": total,
+        # Sessions exist but none is priced yet: the total is unknown, not 0.
+        "acus_total": total if acus or not with_session else None,
         "acus_median_per_run": statistics.median(acus) if acus else None,
         "acus_p90_per_run": _percentile(acus, 0.9) if acus else None,
         "acus_per_pr_opened": _ratio(total, len(opened)) if opened else None,

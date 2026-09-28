@@ -596,7 +596,7 @@ def test_a_session_with_no_figure_yet_is_pending_not_free(
     assert insights["cost"]["acus"] is None
     assert insights["cost"]["source"] is None
     cost = board["cost"]
-    assert cost["acus_total"] == 0
+    assert cost["acus_total"] is None
     assert cost["acus_per_pr_opened"] is None
     assert cost["acus_median_per_run"] is None
     assert cost["coverage"] == {
