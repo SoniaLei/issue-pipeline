@@ -348,32 +348,36 @@ def _issue(number: int) -> dict[str, Any]:
     }
 
 
-def test_worker_prunes_deliveries_past_retention(
+def _bodies(store: Store) -> int:
+    row = store._conn.execute(
+        "SELECT COUNT(*) FROM deliveries WHERE payload != ''"
+    ).fetchone()
+    return int(row[0])
+
+
+def _age_deliveries(store: Store) -> None:
+    old = (utcnow() - timedelta(days=31)).isoformat()
+    store._conn.execute("UPDATE deliveries SET received_at = ?", (old,))
+
+
+def test_worker_prunes_delivery_bodies_past_retention(
     intake: Intake, store: Store, worker: Worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     deliver(intake, "issues", "issue_labeled.json")
+    _age_deliveries(store)
     deliver(intake, "issues", "issue_labeled.json")
-    old = (utcnow() - timedelta(days=31)).isoformat()
-    store._conn.execute(
-        "UPDATE deliveries SET received_at = ?"
-        " WHERE rowid = (SELECT MIN(rowid) FROM deliveries)",
-        (old,),
-    )
-
-    def count() -> int:
-        return int(store._conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
 
     worker.tick()
-    assert count() == 1
+    assert _bodies(store) == 1
 
     deliver(intake, "issues", "issue_labeled.json")
-    store._conn.execute("UPDATE deliveries SET received_at = ?", (old,))
+    _age_deliveries(store)
     worker.tick()
-    assert count() == 2, "pruned again inside the interval"
+    assert _bodies(store) == 2, "pruned again inside the interval"
 
     monkeypatch.setattr(worker, "_pruned_at", -PRUNE_INTERVAL_SECONDS * 2.0)
     worker.tick()
-    assert count() == 0
+    assert _bodies(store) == 0
 
     keep = Worker(
         store,
@@ -382,6 +386,44 @@ def test_worker_prunes_deliveries_past_retention(
         worker.slack,
     )
     deliver(intake, "issues", "issue_labeled.json")
-    store._conn.execute("UPDATE deliveries SET received_at = ?", (old,))
+    _age_deliveries(store)
     keep.tick()
-    assert count() == 1
+    assert _bodies(store) == 1
+
+
+def test_a_pruned_delivery_is_still_a_duplicate(
+    intake: Intake, store: Store, worker: Worker
+) -> None:
+    payload = load_fixture("issue_labeled.json")
+    first = intake.handle(delivery_id="d-old", event="issues", payload=payload)
+    runs = store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    _age_deliveries(store)
+    worker.tick()
+    assert _bodies(store) == 0
+
+    again = intake.handle(delivery_id="d-old", event="issues", payload=payload)
+    assert first.run_id is not None
+    assert (again.accepted, again.reason) == (False, "duplicate delivery")
+    assert store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == runs
+
+
+def test_a_failed_prune_is_retried_on_the_next_tick(
+    intake: Intake, store: Store, worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deliver(intake, "issues", "issue_labeled.json")
+    _age_deliveries(store)
+    real = store.prune_deliveries
+    calls: list[int] = []
+
+    def flaky(days: int) -> int:
+        calls.append(days)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(days)
+
+    monkeypatch.setattr(store, "prune_deliveries", flaky)
+    worker.tick()
+    assert _bodies(store) == 1
+    worker.tick()
+    assert len(calls) == 2
+    assert _bodies(store) == 0

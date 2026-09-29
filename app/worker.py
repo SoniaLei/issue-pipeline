@@ -175,7 +175,7 @@ class Worker:
         return advanced or delivered > 0
 
     def prune_deliveries(self) -> int:
-        """Drop raw deliveries older than DELIVERY_RETENTION_DAYS (D-014),
+        """Drop raw delivery bodies older than DELIVERY_RETENTION_DAYS (D-014),
         at most once per PRUNE_INTERVAL_SECONDS. Zero or less keeps them all."""
         now = time.monotonic()
         if self.settings.delivery_retention_days <= 0 or (
@@ -183,12 +183,12 @@ class Worker:
             and now - self._pruned_at < PRUNE_INTERVAL_SECONDS
         ):
             return 0
-        self._pruned_at = now
         try:
             removed = self.store.prune_deliveries(self.settings.delivery_retention_days)
         except sqlite3.Error:
             logger.exception("pruning deliveries failed")
             return 0
+        self._pruned_at = now
         if removed:
             logger.info("pruned %d deliveries", removed)
         return removed
