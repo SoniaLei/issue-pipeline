@@ -98,6 +98,16 @@ state, the Slack messages that would have been sent and the dashboard's
 summary. No network. Add `--serve` to keep the store alive and browse
 `/dashboard` over that simulated run afterwards.
 
+After the scripted run, the script also seeds 90 days of made-up sim history
+(`app/sim_history.py`) so the charts have shape. Volume grows over time and
+drops at weekends. There is a holiday lull, a release crunch, and a week where
+the baseline was broken and checks went red. After a "skills landed" day,
+sessions get cheaper. The last few days hold runs that are still in flight.
+These rows are written straight to the store as `env='sim'` and never pass
+through intake or the worker, so they are scenery, not evidence.
+`--history-days N` changes the length of the history, and `--history-days 0`
+skips it.
+
 To prove the notification path against a real channel without spending an ACU,
 keep Devin simulated and send for real:
 
