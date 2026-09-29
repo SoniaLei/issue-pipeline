@@ -39,8 +39,12 @@ from app.review_gate import (
     is_verified,
     parse_summary,
 )
-from app.states import check_transition, PRE_EXECUTION, State
+from app.states import can_transition, check_transition, PRE_EXECUTION, State
 from app.store import now_iso, Store
+
+_PR_LIFECYCLE = frozenset(
+    {State.PR_OPEN, State.AWAITING_REVIEW, State.MERGED, State.CLOSED_UNMERGED}
+)
 
 SUPPORTED_EVENTS = frozenset(
     {
@@ -614,6 +618,10 @@ class Intake:
         if existing_pr is not None and int(existing_pr) != int(pull["number"]):
             # First correlated PR wins the lifecycle; a second one is a scope
             # signal for a human, not a second task.
+            return None
+
+        state = State(str(run["state"]))
+        if state not in _PR_LIFECYCLE and not can_transition(state, State.PR_OPEN):
             return None
         return run
 
