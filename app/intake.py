@@ -31,7 +31,7 @@ from typing import Any
 
 from app.config import Settings
 from app.notifications import build_payload, destination_is_operator, fingerprint, Kind
-from app.prompts import extract_marker
+from app.prompts import extract_marker, same_pr_url
 from app.review_gate import (
     finding_kind,
     gate_state,
@@ -100,6 +100,17 @@ def derive_checks_state(suites: list[sqlite3.Row]) -> str:
     if all(c in PASSING_CONCLUSIONS for c in conclusions):
         return "passed"
     return "unknown"
+
+
+def _primary_is_another_pr(run: sqlite3.Row, pull: dict[str, Any]) -> bool:
+    """Whether the run's primary PR, known by number from its webhook or by URL
+    from a session poll, is a different PR from `pull`. Only for PRs
+    `_correlate` refused: a poll's URL never stops GitHub attaching a PR."""
+    if run["pr_number"] is not None:
+        return int(run["pr_number"]) != int(pull["number"])
+    primary = run["pr_url"]
+    url = str(pull.get("html_url") or "")
+    return bool(primary) and bool(url) and not same_pr_url(primary, url)
 
 
 @dataclass(frozen=True)
@@ -537,6 +548,15 @@ class Intake:
                     else f"{action}:{head_sha}"
                 ),
             )
+            run = self.store.get_run(run_id)
+            if run is not None:
+                extra = json.loads(str(run["extra_pr_urls"]))
+                self._notify_scope_prs(
+                    conn,
+                    task_id,
+                    run_id,
+                    [url for url in extra if not same_pr_url(url, fields["pr_url"])],
+                )
         return IntakeResult(True, f"PR {action}", task_id=task_id, run_id=run_id)
 
     def _pull_request_closed(
@@ -630,16 +650,18 @@ class Intake:
     ) -> sqlite3.Row | None:
         """The run this PR names when that run already owns a different PR."""
         run = self._lookup_run(repo, pull)
-        if run is None or run["pr_number"] is None:
-            return None
-        if int(run["pr_number"]) == int(pull["number"]):
+        if run is None or not _primary_is_another_pr(run, pull):
             return None
         return run
 
     def _extra_pull_request(
         self, conn: sqlite3.Connection, run: sqlite3.Row, pull: dict[str, Any]
     ) -> IntakeResult:
-        """Record a run's second PR and tell a human, once per PR."""
+        """Record a run's second PR and tell a human, once per PR.
+
+        Until the primary PR's own webhook has queued the run's "PR opened"
+        anchor, the alert waits for it (see `_notify_scope_prs`), so it lands in
+        that PR's thread rather than top-level."""
         run_id = str(run["id"])
         task_id = int(run["task_id"])
         url = str(pull.get("html_url") or "")
@@ -655,18 +677,25 @@ class Intake:
                 reason="extra",
                 detail={"number": int(pull["number"]), "url": url},
             )
-        self._notify(
-            conn,
-            task_id=task_id,
-            run_id=run_id,
-            kind=Kind.NEEDS_HUMAN,
-            reason="scope",
-            revision=f"scope:{url}",
-            detail=url,
-        )
+        if run["pr_number"] is not None:
+            self._notify_scope_prs(conn, task_id, run_id, [url])
         return IntakeResult(
             True, "extra PR recorded as a scope signal", task_id=task_id, run_id=run_id
         )
+
+    def _notify_scope_prs(
+        self, conn: sqlite3.Connection, task_id: int, run_id: str, urls: list[str]
+    ) -> None:
+        for url in urls:
+            self._notify(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                kind=Kind.NEEDS_HUMAN,
+                reason="scope",
+                revision=f"scope:{url}",
+                detail=url,
+            )
 
     # -------------------------------------------------------------------- reviews
 

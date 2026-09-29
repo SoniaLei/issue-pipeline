@@ -225,3 +225,31 @@ def test_a_fork_naming_the_run_is_not_a_scope_signal(
 
     assert not result.accepted
     assert _scope_notifications(store) == []
+
+
+def test_a_poll_known_primary_still_catches_an_extra_pr_and_threads_it(
+    intake: Intake, store: Store
+) -> None:
+    run_id = queued_run(intake, store)
+    primary = "https://github.com/SoniaLei/superset-cognition-demo/pull/91"
+    with store.transaction() as conn:
+        store.update_run(conn, run_id, pr_url=primary, state=State.PR_OPEN.value)
+
+    result = intake.handle(
+        delivery_id=next_delivery_id(),
+        event="pull_request",
+        payload=_second_pr(run_id),
+    )
+    assert result.accepted
+    run = store.get_run(run_id)
+    assert run is not None
+    assert "/pull/92" in run["extra_pr_urls"]
+    # No "PR opened" anchor exists yet, so the alert is not sent top-level.
+    assert _scope_notifications(store) == []
+
+    deliver_pr(intake, "pr_opened.json", run_id)
+    kinds = [(n["kind"], n["reason"]) for n in store.all_notifications()]
+    assert kinds.index(("pr_opened", None)) < kinds.index(("needs_human", "scope"))
+    scope = _scope_notifications(store)
+    assert len(scope) == 1
+    assert "/pull/92" in str(scope[0]["payload"])

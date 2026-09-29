@@ -54,6 +54,7 @@ from app.notifications import (
 from app.prompts import (
     branch_name,
     build_prompt,
+    same_pr_url,
     session_tags,
     session_title,
 )
@@ -97,14 +98,22 @@ def _snapshot_fields(snapshot: SessionSnapshot) -> dict[str, Any]:
 
 
 def _pull_request_fields(run: sqlite3.Row, snapshot: SessionSnapshot) -> dict[str, Any]:
-    """The first PR owns the lifecycle; any others are recorded, not followed."""
+    """The first PR owns the lifecycle; any others are recorded, not followed.
+
+    The primary is whichever PR the run already has, not the provider's first
+    entry: GitHub may have attached a different one first."""
     fields: dict[str, Any] = {}
+    primary = run["pr_url"] or snapshot.pull_requests[0].url
     if not run["pr_url"]:
-        fields["pr_url"] = snapshot.pull_requests[0].url
-    if len(snapshot.pull_requests) > 1:
-        fields["extra_pr_urls"] = json.dumps(
-            [pr.url for pr in snapshot.pull_requests[1:]]
-        )
+        fields["pr_url"] = primary
+    extra: list[str] = json.loads(str(run["extra_pr_urls"] or "[]"))
+    for pr in snapshot.pull_requests:
+        if not same_pr_url(pr.url, primary) and not any(
+            same_pr_url(pr.url, known) for known in extra
+        ):
+            extra.append(pr.url)
+    if extra:
+        fields["extra_pr_urls"] = json.dumps(extra)
     return fields
 
 
@@ -423,18 +432,20 @@ class Worker:
                 conn, task_id=task_id, run_id=run_id, target=target, reason=reason
             )
 
-        for url in json.loads(fields.get("extra_pr_urls", "[]")):
-            # The fingerprint makes this once per extra PR, whichever of the
-            # poll and the webhook sees it first.
-            self._notify(
-                conn,
-                task_id=task_id,
-                run_id=run_id,
-                kind=Kind.NEEDS_HUMAN,
-                reason="scope",
-                revision=f"scope:{url}",
-                detail=str(url),
-            )
+        # Without the primary's webhook there is no "PR opened" anchor yet; that
+        # webhook sends these once it has queued one. The fingerprint makes it
+        # once per extra PR either way.
+        if run["pr_number"] is not None:
+            for url in json.loads(fields.get("extra_pr_urls", "[]")):
+                self._notify(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    kind=Kind.NEEDS_HUMAN,
+                    reason="scope",
+                    revision=f"scope:{url}",
+                    detail=str(url),
+                )
 
     def _notify_state_change(
         self,
