@@ -385,8 +385,7 @@ function render(d) {
     ...repos.map((r) => el("option", { value: r.repo, text: `${r.repo} (${r.runs})` })));
   if (d.repo && !repos.some((r) => r.repo === d.repo)) $("repo-filter").append(el("option", { value: d.repo, text: `${d.repo} (0)` }));
   $("repo-filter").value = d.repo || "";
-  const shown = d.repo || (repos.length === 1 ? repos[0].repo : repos.length ? `${repos.length} repositories` : null);
-  if (shown) $("repo-name").textContent = shown;
+  $("repo-name").textContent = d.repo || (repos.length === 1 ? repos[0].repo : repos.length ? `${repos.length} repositories` : "all repositories");
   const banner = $("banner");
   banner.className = `banner ${env}${stale ? " stale" : ""}`;
   banner.replaceChildren(el("b", { text: env === "sim" ? "SIMULATION" : "LIVE" }),
@@ -467,13 +466,16 @@ const STATE_BUCKET = { awaiting_approval: "awaiting_approval", queued: "queued",
   failed: "failed", cancelled: "cancelled", merged: "merged", closed_unmerged: "closed_unmerged" };
 const BUCKET_FOR_STATE = (s) => STATE_BUCKET[s] || s;
 
+let generation = 0;
 async function load() {
+  const mine = ++generation;
   try {
     const res = await fetch(`/api/dashboard?${query()}`);
     if (!res.ok) throw new Error(`${res.status}`);
-    render(await res.json());
+    const data = await res.json();
+    if (mine === generation) render(data);
   } catch (err) {
-    $("fresh").textContent = `failed to load: ${err.message}`;
+    if (mine === generation) $("fresh").textContent = `failed to load: ${err.message}`;
   }
 }
 

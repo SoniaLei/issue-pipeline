@@ -559,3 +559,20 @@ def test_repo_filter_narrows_every_run_figure(
     api = client.get("/api/dashboard", params={"repo": OTHER_REPO}).json()
     assert [t["repo"] for t in api["tasks"]] == [OTHER_REPO]
     assert len(client.get("/api/dashboard").json()["tasks"]) == 2
+
+
+def test_repo_picker_folds_names_that_differ_only_in_case(
+    settings: Settings, store: Store, intake: Intake
+) -> None:
+    deliver(intake, "issues", "issue_labeled.json")
+    payload = load_fixture("issue_labeled.json")
+    payload["issue"] = {**payload["issue"], "number": 4243}
+    payload["repository"] = {**payload["repository"], "full_name": REPO.upper()}
+    intake.handle(delivery_id=next_delivery_id(), event="issues", payload=payload)
+
+    board = build_dashboard(store, "sim", repo=REPO.lower())
+    [entry] = board["repos_available"]
+    assert entry["runs"] == 2
+    assert entry["repo"].lower() == REPO.lower()
+    assert board["repo"] == entry["repo"]
+    assert board["totals"]["tasks"] == 2

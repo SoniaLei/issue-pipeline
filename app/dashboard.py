@@ -819,12 +819,17 @@ def build_dashboard(
     current = now or utcnow()
     rows = store.list_runs(env)
     all_runs = [_run_view(store, row, current, review_gate_mode) for row in rows]
+    # GitHub names are case-insensitive: one entry per repository, under the
+    # first spelling seen.
+    spelling: dict[str, str] = {}
     repos: dict[str, int] = defaultdict(int)
     for run in all_runs:
-        repos[run["repo"]] += 1
+        key = run["repo"].lower()
+        spelling.setdefault(key, run["repo"])
+        repos[key] += 1
     wanted = repo.lower() if repo else None
     runs = [r for r in all_runs if wanted is None or r["repo"].lower() == wanted]
-    chosen_repo = next((name for name in repos if name.lower() == wanted), repo)
+    chosen_repo = spelling.get(wanted, repo) if wanted else None
 
     workload = {bucket: 0 for bucket in WORKLOAD_BUCKETS}
     for run in runs:
@@ -896,7 +901,7 @@ def build_dashboard(
         "envs_available": store.count_runs_by_env(),
         "repo": chosen_repo,
         "repos_available": [
-            {"repo": name, "runs": repos[name]} for name in sorted(repos, key=str.lower)
+            {"repo": spelling[key], "runs": repos[key]} for key in sorted(repos)
         ],
         "generated_at": current.isoformat(),
         "data_as_of": data_as_of,
