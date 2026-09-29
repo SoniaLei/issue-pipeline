@@ -197,6 +197,15 @@ exactly one env at a time — `?env=live` or `?env=sim`, defaulting to the
 service's own mode. A banner names which one is shown; there is no "all" view,
 so a simulated merge can never inflate a live success number.
 
+**One repository or all of them.** The service tracks every repository in
+`REPO_ALLOWLIST`, and `?repo=owner/name` (the repository picker in the header)
+narrows workload, results, speed, throughput, needs attention, Slack health,
+cost and the task table to that repository. Without it the page covers every
+tracked repository in the chosen env. The Devin analytics cross-check always
+spans all repositories, because Devin counts per service user rather than per
+repository; `devin_analytics.scope` says so. A repository with no runs gives an
+empty page rather than an error.
+
 The outcome words are used precisely, and the page states its definitions:
 
 | Word | Means | Evidence |

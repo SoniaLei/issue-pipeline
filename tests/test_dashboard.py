@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -39,6 +40,7 @@ from tests.conftest import (
     load_fixture,
     load_script,
     next_delivery_id,
+    REPO,
     substitute_run_id,
 )
 
@@ -495,3 +497,82 @@ def test_github_health_is_labelled_as_spanning_environments(store: Store) -> Non
     # Deliveries carry no env, so the figure cannot be scoped like the others.
     board = build_dashboard(store, "live", worker_stale_after_seconds=3600)
     assert board["health"]["github"]["scope"] == "all environments"
+
+
+OTHER_REPO = "SoniaLei/another-service"
+
+
+def test_repo_filter_narrows_every_run_figure(
+    settings: Settings,
+    store: Store,
+    intake: Intake,
+    worker: Worker,
+    client: TestClient,
+) -> None:
+    run_to_pr(intake, worker, store)
+    other = Intake(
+        store,
+        replace(
+            settings, repo_allowlist=settings.repo_allowlist | {OTHER_REPO.lower()}
+        ),
+    )
+    payload = load_fixture("issue_labeled.json")
+    payload["repository"] = {
+        "full_name": OTHER_REPO,
+        "name": "another-service",
+        "owner": {"login": "SoniaLei"},
+    }
+    assert other.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=payload
+    ).run_id
+
+    everything = build_dashboard(store, "sim")
+    assert everything["repo"] is None
+    assert everything["repos_available"] == [
+        {"repo": OTHER_REPO, "runs": 1},
+        {"repo": REPO, "runs": 1},
+    ]
+    assert everything["totals"]["tasks"] == 2
+
+    demo = build_dashboard(store, "sim", repo=REPO.upper())
+    assert demo["repo"] == REPO
+    assert [t["repo"] for t in demo["tasks"]] == [REPO]
+    assert demo["results"]["pr_opened"] == 1
+
+    second = build_dashboard(store, "sim", repo=OTHER_REPO)
+    assert [t["repo"] for t in second["tasks"]] == [OTHER_REPO]
+    assert second["results"]["pr_opened"] == 0
+    assert second["repos_available"] == everything["repos_available"]
+
+    # Devin counts per service user, so the cross-check is never narrowed.
+    for board in (demo, second):
+        analytics = board["health"]["devin_analytics"]
+        assert analytics["scope"] == "all repositories"
+        assert (
+            analytics["pipeline"] == everything["health"]["devin_analytics"]["pipeline"]
+        )
+
+    unknown = build_dashboard(store, "sim", repo="someone/else")
+    assert unknown["repo"] == "someone/else"
+    assert unknown["tasks"] == []
+
+    api = client.get("/api/dashboard", params={"repo": OTHER_REPO}).json()
+    assert [t["repo"] for t in api["tasks"]] == [OTHER_REPO]
+    assert len(client.get("/api/dashboard").json()["tasks"]) == 2
+
+
+def test_repo_picker_folds_names_that_differ_only_in_case(
+    settings: Settings, store: Store, intake: Intake
+) -> None:
+    deliver(intake, "issues", "issue_labeled.json")
+    payload = load_fixture("issue_labeled.json")
+    payload["issue"] = {**payload["issue"], "number": 4243}
+    payload["repository"] = {**payload["repository"], "full_name": REPO.upper()}
+    intake.handle(delivery_id=next_delivery_id(), event="issues", payload=payload)
+
+    board = build_dashboard(store, "sim", repo=REPO.lower())
+    [entry] = board["repos_available"]
+    assert entry["runs"] == 2
+    assert entry["repo"].lower() == REPO.lower()
+    assert board["repo"] == entry["repo"]
+    assert board["totals"]["tasks"] == 2
