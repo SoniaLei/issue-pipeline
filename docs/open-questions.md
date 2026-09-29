@@ -13,11 +13,11 @@ remains open.
 - **Decided:** Q-001, Q-002, Q-004, Q-005 (concurrency), Q-006, Q-014, Q-015,
   and Q-021 (by D-032).
 - **Resolved by API verification:** Q-007.
-- **Resolved, recommendation implemented:** Q-003, Q-008, Q-009, Q-010 and
-  Q-017.
+- **Resolved, recommendation implemented:** Q-003, Q-008, Q-009, Q-010,
+  Q-012, Q-013 and Q-017.
 - **Still open**, each running on a default. The *Current behaviour* line under
   each question says where that default differs from its recommendation:
-  - Q-011, Q-012 (tracked in issue #9), Q-013, Q-016, Q-018, Q-019 and Q-020;
+  - Q-011, Q-016, Q-018, Q-019 and Q-020;
   - Q-022, which waits on D-037.
 
 Two decided values are provisional by design and expected to change: the daily
@@ -290,20 +290,27 @@ left alone. Open, together with Q-020.
 
 ---
 
-## Q-012 — Delivery retention window? *(non-blocking)*
+## Q-012 — Delivery retention window? — **RESOLVED: bodies pruned after 30 days**
 
 `deliveries` stores raw webhook bodies, which contain issue and PR content from
 a public repository. Retention has a storage cost and a tidiness cost.
 
 **Recommendation**: 30 days, pruned by the worker.
 
-**Current behaviour**: `DELIVERY_RETENTION_DAYS` (default 30) is read and
-`Store.prune_deliveries` exists, but nothing calls it, so deliveries are kept
-forever. Tracked in issue #9.
+**Resolved** (PR #22, closes issue #9):
+
+- `Worker.tick` calls `Worker.prune_deliveries` at most once an hour. It clears
+  the raw `payload` of deliveries older than `DELIVERY_RETENTION_DAYS`
+  (default 30; `0` or less keeps them forever).
+- The row and its `delivery_id` stay, so a redelivery of a pruned webhook is
+  still rejected as a duplicate. `scripts/replay_webhook.py` can no longer
+  replay a pruned delivery's body.
+- A failed prune (SQLite error) is retried after 1, 2 and 4 minutes, then waits
+  for the next hourly slot.
 
 ---
 
-## Q-013 — Does the report endpoint need authentication? *(non-blocking)*
+## Q-013 — Does the report endpoint need authentication? — **RESOLVED: shared operator token**
 
 The report exposes issue numbers, approver logins, session URLs and ACU spend.
 Session URLs in particular should not be public.
@@ -311,10 +318,20 @@ Session URLs in particular should not be public.
 **Recommendation**: bind it to localhost, or put it behind a shared secret. Do
 not expose it unauthenticated alongside the public webhook endpoint.
 
-**Current behaviour**: not followed. `/report`, `/report.txt`, `/dashboard` and
-`/api/*` have no authentication and are served by the same app as `/webhook`.
-`scripts/run_live.sh` binds `0.0.0.0`, and with `--tunnel` all of them are
-public. This needs a call before the service is hosted.
+**Resolved** (PR #21), with both parts of the recommendation:
+
+- **Shared secret:** when `DASHBOARD_TOKEN` is set, every path except `/health`
+  and `/webhooks/github` needs it. Browsers use HTTP Basic (any username, the
+  token as password); scripts send `Authorization: Bearer <token>`. The
+  webhook keeps its HMAC signature check.
+- **Required in live mode:** `DEVIN_MODE=live` refuses to start without the
+  token, and `scripts/run_live.sh --tunnel` refuses to open a tunnel without it.
+- **Localhost by default:** `compose.yaml` and `scripts/run_live.sh` listen on
+  `${BIND_ADDRESS:-127.0.0.1}`. `run_live.sh` refuses a non-loopback address
+  without the token; compose cannot, so there the live-mode check is the
+  backstop.
+- In sim mode with no token, the dashboard stays open (local-only by default)
+  and a warning is logged.
 
 ---
 
