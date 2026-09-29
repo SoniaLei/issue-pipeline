@@ -432,7 +432,7 @@ function render(d) {
   if (![...$("days-filter").options].some((o) => o.value === window)) $("days-filter").append(el("option", { value: window, text: `${window} days` }));
   $("days-filter").value = window;
   const max = Math.max(1, ...d.throughput.map((x) => x.verified + x.merged));
-  $("throughput").replaceChildren(el("div", { class: d.throughput.length > 30 ? "bars dense" : "bars" }, d.throughput.map((day) =>
+  $("throughput").replaceChildren(el("div", { class: d.throughput.length > 14 ? "bars dense" : "bars" }, d.throughput.map((day) =>
     el("div", { class: "bar", title: `${day.day}: ${day.verified} verified, ${day.merged} merged` }, [
       el("div", { class: "v", style: `height:${(day.verified / max) * 64}px` }),
       el("div", { class: "m", style: `height:${(day.merged / max) * 64}px` }),

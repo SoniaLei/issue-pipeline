@@ -603,5 +603,5 @@ def test_throughput_window_is_adjustable(
     assert len(api["throughput"]) == 7
     assert api["throughput"][-1]["merged"] == 1
     assert len(client.get("/api/dashboard?env=sim").json()["throughput"]) == 14
-    for bad in ("0", "91", "abc", "-3"):
+    for bad in ("0", "91", "abc", "-3", "\u00b2", "9" * 5000):
         assert client.get(f"/api/dashboard?days={bad}").status_code == 400

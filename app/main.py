@@ -120,7 +120,9 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
 def _days(requested: str | None) -> int | None:
     if not requested:
         return THROUGHPUT_DAYS
-    days = int(requested) if requested.isdigit() else 0
+    if not (requested.isascii() and requested.isdigit()) or len(requested) > 3:
+        return None
+    days = int(requested)
     return days if 1 <= days <= MAX_THROUGHPUT_DAYS else None
 
 
