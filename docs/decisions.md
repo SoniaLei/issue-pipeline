@@ -60,9 +60,9 @@ race between the check and the write.
 
 Instead: dedupe on `X-GitHub-Delivery`; one active run per task enforced by a
 partial unique index; one PR per run enforced by a unique index; one
-notification per event enforced by `outbox.dedupe_key`. Every one of these is a
-database constraint, so a duplicate is a failed insert rather than a second
-Devin session or a second Slack message.
+notification per event enforced by the unique `outbox.fingerprint` (D-024).
+Every one of these is a database constraint, so a duplicate is a failed insert
+rather than a second Devin session or a second Slack message.
 
 Transitions are also idempotent at the application level: re-applying an event
 to a task already in the destination state succeeds as a no-op.
@@ -135,7 +135,8 @@ mid-flight is cheaper than completing it.
 
 ## D-007 — PR correlation converges from two sources, first writer wins
 
-**Status**: accepted, amended by D-019
+**Status**: accepted, amended by D-019. The single shared function below was
+never built; see *As built*.
 
 The `pull_request.opened` webhook and the Devin session's own `pull_request`
 field both reveal the PR. The webhook is usually first; the poll covers a missed
@@ -145,6 +146,24 @@ function, and the unique index on `runs.pr_number` makes the second one a no-op.
 Correlation matches on the run's recorded head branch or on the PR body closing
 the tracked issue, with the repository check and the multi-PR rule added by
 D-019.
+
+**As built** (checked against the code on 2026-09-29). The two sources take
+different routes. GitHub is authoritative and the poll is testimony:
+
+- **Webhook.** `Intake._correlate` applies all three D-019 conditions:
+  repository, branch or marker, and eligibility. Only this path writes
+  `pr_number` and `head_sha` and queues "PR opened".
+- **Poll.** `Worker._record_snapshot` trusts the session it created for this
+  run. When Devin reports `pull_requests[]`, the run moves to `pr_open` and
+  records `pr_url`, plus any extras (Q-018), without a repository or branch
+  check.
+- **After either one.** GitHub events own the run (`GITHUB_OWNED` in
+  `app/worker.py`), and polls only update cost and output.
+- **Why the missing check is safe.** Nothing reported only by the poll can
+  become *verified*: checks and Devin Review bind to `head_sha`, which only
+  GitHub supplies (D-030, D-033).
+- **The unique index** is `runs_one_pr` on `(task_id, pr_number)`, not on
+  `runs.pr_number`.
 
 ---
 
@@ -394,8 +413,19 @@ Two mapping traps worth naming:
 
 ## D-011 — Check and status evaluation is out of v1
 
-**Status**: accepted; amended by D-036 (failed checks, findings and
-verification are announced once per head, in the PR's thread)
+**Status**: superseded in part by D-030, D-033 and D-036. Checks are now
+evaluated, and the results are announced:
+
+- *Verified* means every suite on the current head passed, plus a clear Devin
+  Review where the gate requires one (D-030, D-033).
+- Failed checks, findings and verification are announced once per head, in the
+  PR's thread (D-036).
+
+What still stands: checks drive no state transition. `awaiting_review` is
+unreachable, and "awaiting review" is derived at report time (D-030).
+
+*The original v1 decision follows, kept for history. Its notification list
+is replaced by D-036.*
 
 Deriving "review-ready" from checks means handling which checks are required,
 re-runs, in-progress suites, and pull requests from forks. Each is a source of
@@ -509,7 +539,7 @@ Requested permissions, least-privilege for v1:
 | Issues | Read & write | intake and label state; write only if the issue comment in Q-020 lands |
 | Pull requests | Read | correlation, draft state, merge state |
 | Contents | Read | baseline revision and setup files |
-| Checks / Commit statuses | Read | unused in v1, needed when D-011 lands |
+| Checks / Commit statuses | Read | current-head check suites for verification (D-030, D-033) |
 | Metadata | Read | mandatory |
 
 No Contents write and no merge permission. D-005 says the pipeline must not

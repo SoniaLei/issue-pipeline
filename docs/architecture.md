@@ -33,11 +33,13 @@ Two processes run under Docker Compose against a shared database volume:
 | Process | Responsibility |
 | --- | --- |
 | `api` | Receives webhooks, validates and persists them, serves the report and health endpoints. Performs no external calls on the request path. |
-| `worker` | Claims queued work under a lease, creates and polls Devin sessions, reconciles GitHub state, drains the notification outbox. |
+| `worker` | Claims queued work under a lease, creates and polls Devin sessions, recovers orphaned sessions by tag, drains the notification outbox. |
 
 GitHub remains the source of truth for issues, pull requests, checks, reviews and
 merges. The database holds our own task state and a cache of the last observed
-GitHub state; on any disagreement, GitHub wins and reconciliation corrects us.
+GitHub state; on any disagreement, GitHub wins. The service makes no GitHub API
+calls, so it learns GitHub state only from webhooks, and a missed delivery is not
+repaired automatically (see *Reconciliation* in §6).
 
 ### Webhook directions
 
@@ -117,7 +119,8 @@ attempted and what it cost stays intact.
 ```
 
 Terminal states: `merged`, `closed_unmerged`, `cancelled`, `failed`, `no_output`,
-`expired`. Everything else is live and is visited by reconciliation.
+`expired`. Everything else is live, and the worker keeps polling its Devin
+session.
 
 ### State table
 
@@ -279,10 +282,13 @@ Two consequences worth stating plainly:
   transaction as the state change that produced them, then delivered by the
   worker with retries. This is what makes "state changed but Slack never heard"
   impossible.
-- **Reconciliation loop.** On an interval, every live task is compared against
-  current GitHub and Devin state and corrected. This is the safety net for
-  missed, dropped or out-of-order deliveries, and it is how the system recovers
-  after being down.
+- **Reconciliation (partial).** The intended design compares every live task
+  against current GitHub and Devin state on an interval, as the safety net for
+  missed, dropped or out-of-order deliveries and for recovery after downtime.
+  Only the Devin half is built: the worker polls each live session, and an
+  ambiguous session-create is recovered by tag lookup (§8). There is no GitHub
+  half. A missed or unmatched GitHub delivery is not re-fetched or re-evaluated;
+  it stays in `deliveries` for a human to inspect (§7).
 - SQLite in WAL mode with a busy timeout, on a persistent volume. Move to
   PostgreSQL before running multiple hosts.
 
@@ -313,12 +319,19 @@ A title match alone, or a marker alone on an unexpected repository, is never
 sufficient — the marker is public text on a public repository and anyone can
 copy it into their own PR body.
 
-The webhook usually arrives before the session poll returns a URL, so an
-unmatched `pull_request.opened` is not discarded: it is parked in `deliveries`
-and re-evaluated by reconciliation once the run has a branch recorded.
+The worker records the run's branch when it starts the session, before Devin
+can push, so a webhook that arrives before the session poll still matches. A
+`pull_request` event that matches no run is recorded in `deliveries`
+(`accepted = 0`, with its reason) and is not re-evaluated later, because
+reconciliation has no GitHub half (§6). Its body stays there for a human to
+inspect until `DELIVERY_RETENTION_DAYS` clears it (Q-012).
 
-Correlation writes `(run_id, pr_number)` under a unique constraint, so a race
-between webhook and poll produces one row and one notification.
+The two sources take different routes (D-007). Only the webhook, through
+`Intake._correlate`, writes `pr_number` and `head_sha` and queues "PR opened".
+The poll moves a running run to `pr_open` from the session's own
+`pull_requests[]` and records `pr_url`. After that, GitHub events own the run.
+The "PR opened" fingerprint is keyed on the head SHA, so a webhook redelivery or
+a race with the poll still produces one message.
 
 **`pull_requests` is an array.** A session can open more than one PR. The first
 correlated PR is the run's primary PR and drives the state machine; any
@@ -774,213 +787,265 @@ fake endpoint, not in somebody's channel.
 
 ## 10. Schema
 
-```sql
--- Raw inbound deliveries. Kept for replay and debugging, not just dedupe.
-CREATE TABLE deliveries (
-    delivery_id   TEXT PRIMARY KEY,          -- X-GitHub-Delivery
-    event         TEXT NOT NULL,             -- X-GitHub-Event
-    action        TEXT,
-    repo          TEXT NOT NULL,
-    payload       TEXT NOT NULL,             -- raw JSON body
-    received_at   TEXT NOT NULL,
-    status        TEXT NOT NULL,             -- accepted | ignored | duplicate | error
-    reason        TEXT                       -- why ignored or rejected
-);
-CREATE INDEX idx_deliveries_received ON deliveries(received_at);
-CREATE INDEX idx_deliveries_repo_event ON deliveries(repo, event, action);
+`SCHEMA` in `app/store.py` is the source of truth; this is a copy of it, with
+the `{active}` placeholder filled in from `app.states.ACTIVE`. Columns added
+after a database was first created are backfilled by `Store._migrate`.
 
--- One row per tracked issue.
-CREATE TABLE tasks (
-    id                 INTEGER PRIMARY KEY,
-    repo               TEXT NOT NULL,
-    issue_number       INTEGER NOT NULL,
-    issue_title        TEXT,
-    issue_state        TEXT NOT NULL,        -- open | closed, as last observed
-    labels             TEXT NOT NULL,        -- JSON array, last observed
-    state              TEXT NOT NULL,        -- see state machine
-    created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL,
-    last_reconciled_at TEXT,
+```sql
+CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id TEXT PRIMARY KEY,          -- X-GitHub-Delivery
+    event       TEXT NOT NULL,
+    action      TEXT,
+    repo        TEXT,
+    received_at TEXT NOT NULL,
+    accepted    INTEGER NOT NULL,          -- 0 recorded but not acted on
+    reason      TEXT,                      -- why ignored or rejected
+    payload     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY,
+    repo         TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    issue_title  TEXT NOT NULL DEFAULT '',
+    issue_state  TEXT NOT NULL DEFAULT 'open',
+    labels       TEXT NOT NULL DEFAULT '[]',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
     UNIQUE (repo, issue_number)
 );
-CREATE INDEX idx_tasks_state ON tasks(state, last_reconciled_at);
 
--- One row per authorized attempt.
-CREATE TABLE runs (
-    id                 TEXT PRIMARY KEY,     -- opaque run ID, also the idempotency key
-    task_id            INTEGER NOT NULL REFERENCES tasks(id),
-    state              TEXT NOT NULL,
-    attempt            INTEGER NOT NULL,     -- 1, 2, 3 ... for reruns
+CREATE TABLE IF NOT EXISTS runs (
+    id                    TEXT PRIMARY KEY,   -- run ID, appears in branch and PR marker
+    task_id               INTEGER NOT NULL REFERENCES tasks(id),
+    state                 TEXT NOT NULL,
+    env                   TEXT NOT NULL,      -- live | sim, never mixed in a report
 
-    approved_by        TEXT NOT NULL,        -- GitHub login of the approver
-    approved_via       TEXT NOT NULL,        -- allowlist | repo_permission
-    approved_at        TEXT NOT NULL,
+    approved_by           TEXT,
+    approved_at           TEXT,
+    approval_revoked_by   TEXT,
+    approval_revoked_at   TEXT,
+    input_snapshot        TEXT,               -- issue as it was at approval
 
-    -- Revocation after start is recorded, not acted on (D-006).
-    approval_revoked_by TEXT,
-    approval_revoked_at TEXT,
+    lease_owner           TEXT,
+    lease_expires_at      TEXT,
 
     session_id            TEXT,
     session_url           TEXT,
-    session_status        TEXT,              -- provider `status`, verbatim
-    session_status_detail TEXT,              -- provider `status_detail`, verbatim
+    session_status        TEXT,               -- provider status, verbatim
+    session_status_detail TEXT,               -- provider detail, verbatim
     session_polled_at     TEXT,
+    session_finished_at   TEXT,
     acus_consumed         REAL,
-    max_acu_limit         INTEGER,           -- ceiling sent at creation
-    structured_output     TEXT,              -- validated JSON from the session
+    max_acu_limit         INTEGER,
+    structured_output     TEXT,
 
-    branch             TEXT,                 -- devin/issue-<n>-<run-id>
-    base_sha           TEXT,                 -- baseline revision given to Devin
-    pr_number          INTEGER,
-    pr_url             TEXT,
-    pr_state           TEXT,                 -- open | closed
-    pr_draft           INTEGER,              -- 0 | 1
-    head_sha           TEXT,                 -- latest observed PR head
-    checks_state       TEXT,                 -- pending | passed | failed | unknown
-    checks_head_sha    TEXT,                 -- head the check state refers to
-    review_state       TEXT,                 -- approved | changes_requested | none
-    merged_sha         TEXT,
-    extra_pr_urls      TEXT,                 -- JSON array; session opened >1 PR
+    branch                TEXT,
+    base_sha              TEXT,
+    pr_number             INTEGER,
+    pr_url                TEXT,
+    pr_state              TEXT,
+    pr_draft              INTEGER,
+    head_sha              TEXT,
+    checks_state          TEXT,
+    checks_head_sha       TEXT,
+    review_state          TEXT,
+    merged_sha            TEXT,
+    extra_pr_urls         TEXT NOT NULL DEFAULT '[]',
 
-    env                TEXT NOT NULL,        -- live | sim, never mixed in reports
-
-    lease_owner        TEXT,
-    lease_expires_at   TEXT,
-
-    error              TEXT,
-    started_at         TEXT,
-    ended_at           TEXT,
-    created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL
+    failure_reason        TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
 );
 
--- At most one active run per task. Partial index so terminal runs never collide.
-CREATE UNIQUE INDEX idx_runs_one_active ON runs(task_id)
-    WHERE state IN ('queued','starting','running','session_blocked','pr_open');
+-- At most one active run per issue. Partial, so historical attempts do not
+-- collide with a new one.
+CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active
+    ON runs (task_id) WHERE state IN ('awaiting_approval', 'awaiting_review', 'pr_open', 'queued', 'running', 'session_blocked', 'starting');
 
--- One PR maps to at most one run.
-CREATE UNIQUE INDEX idx_runs_pr ON runs(pr_number)
-    WHERE pr_number IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS runs_one_pr
+    ON runs (task_id, pr_number) WHERE pr_number IS NOT NULL;
 
-CREATE INDEX idx_runs_claimable ON runs(state, lease_expires_at);
-
--- Append-only audit of every state change.
-CREATE TABLE transitions (
-    id            INTEGER PRIMARY KEY,
-    run_id        TEXT REFERENCES runs(id),
-    task_id       INTEGER NOT NULL REFERENCES tasks(id),
-    from_state    TEXT,
-    to_state      TEXT NOT NULL,
-    cause         TEXT NOT NULL,             -- webhook | poll | reconcile | operator
-    delivery_id   TEXT,                      -- when caused by a webhook
-    detail        TEXT,
-    created_at    TEXT NOT NULL
-);
-CREATE INDEX idx_transitions_task ON transitions(task_id, created_at);
-
--- Notifications, committed with the state change that produced them.
-CREATE TABLE outbox (
-    id             INTEGER PRIMARY KEY,
-    task_id        INTEGER NOT NULL REFERENCES tasks(id),
-    run_id         TEXT REFERENCES runs(id),
-    kind           TEXT NOT NULL,            -- pr_opened | ready_for_review | verified
-                                             -- | needs_human | pr_merged | pr_closed
-                                             -- | checks_failed | review_findings
-                                             -- | human_review (reason: approved
-                                             --   | changes_requested)
-                                             -- needs_human carries a reason:
-                                             -- blocked | no_output | expired | failed
-                                             -- | capacity | acu_limit | scope
-                                             -- | approval_revoked
-    -- Fingerprint over (task, kind, destination, relevant revision/state).
-    -- A new head SHA yields a new fingerprint; an unchanged poll does not.
-    fingerprint    TEXT NOT NULL UNIQUE,
-    destination    TEXT NOT NULL,            -- approved destination key, never from issue text
-    channel        TEXT NOT NULL,
-    payload        TEXT NOT NULL,            -- rendered message JSON
-    state          TEXT NOT NULL,            -- pending | sent | dead
-    attempts       INTEGER NOT NULL DEFAULT 0,
+CREATE TABLE IF NOT EXISTS outbox (
+    id              INTEGER PRIMARY KEY,
+    task_id         INTEGER NOT NULL REFERENCES tasks(id),
+    run_id          TEXT REFERENCES runs(id),
+    kind            TEXT NOT NULL,
+    reason          TEXT,
+    -- Over (task, kind, destination, relevant revision/state): a new head SHA
+    -- is a new message, an unchanged poll is not.
+    fingerprint     TEXT NOT NULL UNIQUE,
+    destination     TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending',   -- pending | sent | failed
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    last_response   TEXT,
     next_attempt_at TEXT,
-    last_response  TEXT,                     -- Slack response, never the URL
-    last_error     TEXT,
-    created_at     TEXT NOT NULL,
-    sent_at        TEXT,
-    -- Bot transport only (D-036). The pr_opened row's channel and ts make it
-    -- the run's anchor; follow-ups record the thread they joined and the
-    -- reaction they added to it. NULL under the webhook transport.
-    slack_channel  TEXT,
-    slack_ts       TEXT,
-    thread_ts      TEXT,
-    reaction       TEXT,
-    reaction_error TEXT
+    created_at      TEXT NOT NULL,
+    sent_at         TEXT,
+    -- Identity Slack gave the message, when the transport reports one. The
+    -- run's sent `pr_opened` row is the anchor later PR-lifecycle messages
+    -- thread under (thread_ts) and react to (reaction).
+    slack_channel   TEXT,
+    slack_ts        TEXT,
+    thread_ts       TEXT,
+    reaction        TEXT,
+    reaction_error  TEXT
 );
-CREATE INDEX idx_outbox_pending ON outbox(state, next_attempt_at);
-```
 
-`dedupe_key` is the reason a task cannot be announced twice: the insert is part
-of the same transaction as the transition, and a second attempt violates the
-unique constraint and is discarded.
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (state, next_attempt_at);
 
-```sql
--- Devin's account of a session, one row per run, refreshed in place.
--- Nothing here is applied to runs; it is displayed beside them.
-CREATE TABLE session_insights (
+-- Append-only history of what happened to a run: every state change, plus
+-- the observations (session, PR, checks, review) that a timeline needs.
+CREATE TABLE IF NOT EXISTS run_events (
+    id          INTEGER PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES runs(id),
+    task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,             -- state|session|pr|checks|verified|
+                                           -- review|review_gate|insights
+    from_state  TEXT,
+    to_state    TEXT,
+    reason      TEXT,
+    detail      TEXT                       -- JSON, kind-specific
+);
+
+CREATE INDEX IF NOT EXISTS run_events_run ON run_events (run_id, id);
+
+-- One row per check suite GitHub reported for a head SHA on a tracked run.
+-- Verification is derived from all suites on the *current* head, never
+-- from a single one.
+CREATE TABLE IF NOT EXISTS checks (
+    run_id      TEXT NOT NULL REFERENCES runs(id),
+    head_sha    TEXT NOT NULL,
+    suite_id    TEXT NOT NULL,
+    app         TEXT,
+    status      TEXT NOT NULL,             -- queued | in_progress | completed
+    conclusion  TEXT,                      -- success | failure | ... | NULL
+    url         TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, head_sha, suite_id)
+);
+
+-- Check suites keyed by repository head, whether or not a run tracks that
+-- head yet. GitHub reports suites for a pushed commit before the pull request
+-- that carries it is opened; a run that only learns about suites after its PR
+-- exists would see the first completed one arrive alone and call it a pass.
+CREATE TABLE IF NOT EXISTS head_checks (
+    repo        TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    suite_id    TEXT NOT NULL,
+    app         TEXT,
+    status      TEXT NOT NULL,
+    conclusion  TEXT,
+    url         TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (repo, head_sha, suite_id)
+);
+
+-- Liveness of the processes that are supposed to be running. A dashboard
+-- that cannot tell "nothing happened" from "nobody is looking" is useless.
+CREATE TABLE IF NOT EXISTS heartbeats (
+    component   TEXT PRIMARY KEY,          -- worker | api
+    owner       TEXT,
+    at          TEXT NOT NULL,
+    detail      TEXT
+);
+
+-- Devin's account of one run's session: cost, size, and its own analysis of
+-- what went well or badly. Kept in its own table because it is provider
+-- testimony, refreshed on a schedule, and none of it changes a run's state.
+CREATE TABLE IF NOT EXISTS session_insights (
     run_id              TEXT PRIMARY KEY REFERENCES runs(id),
     session_id          TEXT NOT NULL,
     env                 TEXT NOT NULL,
     fetched_at          TEXT NOT NULL,
     fetch_count         INTEGER NOT NULL DEFAULT 1,
-    run_state           TEXT,                     -- run state at the last read
-    session_status      TEXT,                     -- provider status at the last read
+    run_state           TEXT,                -- run state at fetch, drives refresh
+    session_status      TEXT,
     session_status_detail TEXT,
-    acus_consumed       REAL,                     -- insights total (provider)
-    billed_acus         REAL,                     -- daily consumption total (billing)
-    consumption         TEXT NOT NULL DEFAULT '[]', -- [[date, acus], ...]
-    session_size        TEXT,                     -- xs | s | m | l | xl
+    acus_consumed       REAL,                -- session's running total
+    billed_acus         REAL,                -- daily consumption, billing-grade
+    consumption         TEXT NOT NULL DEFAULT '[]',   -- JSON [[day, acus], ...]
+    session_size        TEXT,                -- xs | s | m | l | xl
     category            TEXT,
     subcategory         TEXT,
     origin              TEXT,
-    service_user_id     TEXT,                     -- scopes provider_metrics
+    service_user_id     TEXT,
     num_user_messages   INTEGER,
     num_devin_messages  INTEGER,
-    analysis_status     TEXT,                     -- not_started | pending | completed | failed
-    analysis            TEXT,                     -- provider analysis JSON, verbatim
-    generate_requested_at TEXT,                   -- insights generation asked for once
-    settled             INTEGER NOT NULL DEFAULT 0, -- past the settle window, no more reads
+    analysis_status     TEXT,                -- started | completed | failed
+    analysis            TEXT,                -- JSON, verbatim
+    generate_requested_at TEXT,
+    settled             INTEGER NOT NULL DEFAULT 0,
     last_error          TEXT
 );
 
--- Devin Review of one PR head. One row per (run, head); old heads are kept for
--- audit and never satisfy verification for a newer head (§8b).
-CREATE TABLE pr_reviews (
+-- Devin Review of one PR head (D-033). One row per (run, commit): a new head
+-- gets a new row and the old one stays as history, so a verdict can never be
+-- read against a commit it was not given for. `status` is what the pr-reviews
+-- API says about progress; `findings` is what GitHub carries as the bot's
+-- review of that commit. Only the latter can clear a head.
+CREATE TABLE IF NOT EXISTS pr_reviews (
     run_id          TEXT NOT NULL REFERENCES runs(id),
     head_sha        TEXT NOT NULL,
     env             TEXT NOT NULL,
     pr_url          TEXT NOT NULL,
-    status          TEXT,                         -- pr-reviews API: pending | running | completed | errored | cancelled | skipped | unavailable
-    requested_at    TEXT,                         -- POST made (once per head)
-    status_at       TEXT,                         -- last API read
-    attempts        INTEGER NOT NULL DEFAULT 0,   -- consecutive provider errors
+    status          TEXT,                    -- pending|running|completed|errored|
+                                             -- cancelled|skipped|unavailable
+    requested_at    TEXT,                    -- when this worker asked for it
+    status_at       TEXT,                    -- last API read
+    attempts        INTEGER NOT NULL DEFAULT 0,  -- failed API calls in a row
+    retryable       INTEGER NOT NULL DEFAULT 1,  -- 0: last error was permanent
     last_error      TEXT,
-    findings        INTEGER,                      -- GitHub verdict: 0 = clear, N = findings, NULL = none yet
-    findings_by_kind TEXT NOT NULL DEFAULT '{}',  -- {"bug": n, "security": n, ...} from inline markers
-    review_url      TEXT,                         -- the bot's review on GitHub
+    findings        INTEGER,                 -- from the bot's GitHub review summary
+    findings_by_kind TEXT NOT NULL DEFAULT '{}',  -- JSON kind -> count
+    review_url      TEXT,                    -- the bot's review on GitHub
     verdict_at      TEXT,
     PRIMARY KEY (run_id, head_sha)
 );
 
--- Organization counts from Devin for the pipeline's service user(s), one row
--- per env. A failed refresh keeps the last good metrics and records the error.
-CREATE TABLE provider_metrics (
+-- The latest organization-level counts Devin reports for the pipeline's own
+-- service user, kept per environment so the drift check against the store
+-- compares like with like.
+CREATE TABLE IF NOT EXISTS provider_metrics (
     env                 TEXT PRIMARY KEY,
-    fetched_at          TEXT NOT NULL,
-    window_after        TEXT NOT NULL,
-    window_before       TEXT NOT NULL,
-    service_user_ids    TEXT NOT NULL,            -- JSON list, observed not configured
-    metrics             TEXT,                     -- ProviderMetrics JSON
+    attempted_at        TEXT NOT NULL,       -- last read, successful or not
+    fetched_at          TEXT,                -- last successful read; window,
+    window_after        TEXT,                -- ids and metrics below belong
+    window_before       TEXT,                -- to it and move together
+    service_user_ids    TEXT,                -- JSON list
+    metrics             TEXT,                -- JSON, verbatim
     last_error          TEXT
 );
 ```
+
+Points the DDL alone does not make obvious:
+
+- **Deliveries** record every signed webhook, acted on or not (`accepted`,
+  `reason`). The ID is what makes a redelivery a no-op, so pruning (Q-012)
+  clears `payload` and keeps the row.
+- **One active run per issue.** `runs_one_active` covers every state in
+  `ACTIVE`, including `awaiting_approval`. An issue therefore never has an
+  approval-pending run beside a queued one.
+- **One PR per run.** `runs_one_pr` is unique on `(task_id, pr_number)`, not on
+  `pr_number`, because PR numbers are only unique within a repository.
+  Correlation (§7) resolves a PR to a single run by its branch or marker.
+- **History** is `run_events`: every state change, written in the same
+  transaction as the change, plus the session, PR, checks, review and verified
+  observations the timeline shows. There is no separate `transitions` table.
+- **Checks** are kept twice. `head_checks` holds every suite GitHub reports for
+  a commit, whether or not a run tracks it yet; `checks` holds the suites for a
+  tracked run's heads. A run adopts suites from `head_checks` when its PR
+  appears (D-030).
+- **Outbox.** `fingerprint` is the reason a notification cannot be sent twice.
+  The insert is part of the same transaction as the change that caused it, and
+  a repeat is ignored by the unique constraint. `state` is
+  `pending | sent | failed`. `needs_human` rows carry a `reason` from the
+  vocabulary in `needs_human_text` (`app/notifications.py`).
+- **`heartbeats`** records when each process was last alive, so the dashboard
+  can tell "nothing happened" from "nobody is looking".
 
 ## 11. Recovery rules
 
