@@ -22,7 +22,9 @@ services:
     environment:
       DATABASE_PATH: /data/pipeline.db
     ports:
-      - "8000:8000"
+      # Local-only unless BIND_ADDRESS opens it (e.g. 0.0.0.0 behind an HTTPS
+      # proxy on another host, with DASHBOARD_TOKEN set).
+      - "${BIND_ADDRESS:-127.0.0.1}:8000:8000"
     volumes:
       - pipeline-data:/data
 

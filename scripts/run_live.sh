@@ -41,6 +41,11 @@ source .env
 set +a
 
 PORT="${PORT:-8000}"
+BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
+if [[ "$BIND_ADDRESS" != "127.0.0.1" && -z "${DASHBOARD_TOKEN:-}" ]]; then
+  echo "BIND_ADDRESS=$BIND_ADDRESS exposes the dashboard; set DASHBOARD_TOKEN in .env" >&2
+  exit 1
+fi
 PYTHON="${PYTHON:-python}"
 LOG_DIR="${LOG_DIR:-data/logs}"
 mkdir -p "$(dirname "${DATABASE_PATH:-data/pipeline.db}")" "$LOG_DIR"
@@ -53,7 +58,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$PYTHON" -m uvicorn app.main:get_app --factory --host 0.0.0.0 --port "$PORT" \
+"$PYTHON" -m uvicorn app.main:get_app --factory --host "$BIND_ADDRESS" --port "$PORT" \
   >"$LOG_DIR/api.log" 2>&1 &
 pids+=("$!")
 
