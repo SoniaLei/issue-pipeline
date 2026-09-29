@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from app.intake import Intake
 from app.prompts import branch_name, extract_marker, run_marker
 from app.states import State
@@ -169,6 +171,25 @@ def test_a_new_head_invalidates_previous_check_evidence(
     assert run is not None
     assert run["head_sha"] == "99887766"
     assert run["checks_state"] is None
+
+
+@pytest.mark.parametrize(
+    "terminal", [State.NO_OUTPUT, State.FAILED, State.EXPIRED, State.CANCELLED]
+)
+def test_a_pr_for_a_run_that_ended_without_one_is_not_attached(
+    intake: Intake, store: Store, terminal: State
+) -> None:
+    run_id = queued_run(intake, store)
+    with store.transaction() as conn:
+        store.update_run(conn, run_id, state=terminal.value)
+
+    result = deliver_pr(intake, "pr_opened.json", run_id)
+
+    assert not result.accepted
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["state"] == terminal.value
+    assert run["pr_number"] is None
 
 
 def _second_pr(run_id: str, number: int = 92, fork: bool = False) -> dict[str, Any]:
