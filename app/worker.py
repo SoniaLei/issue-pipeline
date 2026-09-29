@@ -118,6 +118,10 @@ GITHUB_OWNED: frozenset[State] = frozenset({State.PR_OPEN, State.AWAITING_REVIEW
 
 # Deliveries are pruned at most this often; the retention window is days.
 PRUNE_INTERVAL_SECONDS = 3600
+# A failed prune is retried after 1, 2 and 4 minutes, then waits for the next
+# interval.
+PRUNE_RETRY_BASE_SECONDS = 60
+PRUNE_MAX_RETRIES = 3
 
 
 class Worker:
@@ -138,7 +142,8 @@ class Worker:
         self.slack = slack
         self.owner = owner or f"{socket.gethostname()}-{id(self)}"
         self._metrics_dirty = False
-        self._pruned_at: float | None = None
+        self._next_prune_at = 0.0
+        self._prune_failures = 0
 
     # ------------------------------------------------------------------ main loop
 
@@ -178,17 +183,22 @@ class Worker:
         """Drop raw delivery bodies older than DELIVERY_RETENTION_DAYS (D-014),
         at most once per PRUNE_INTERVAL_SECONDS. Zero or less keeps them all."""
         now = time.monotonic()
-        if self.settings.delivery_retention_days <= 0 or (
-            self._pruned_at is not None
-            and now - self._pruned_at < PRUNE_INTERVAL_SECONDS
-        ):
+        if self.settings.delivery_retention_days <= 0 or now < self._next_prune_at:
             return 0
         try:
             removed = self.store.prune_deliveries(self.settings.delivery_retention_days)
         except sqlite3.Error:
-            logger.exception("pruning deliveries failed")
+            self._prune_failures += 1
+            if self._prune_failures > PRUNE_MAX_RETRIES:
+                self._prune_failures = 0
+                delay = PRUNE_INTERVAL_SECONDS
+            else:
+                delay = PRUNE_RETRY_BASE_SECONDS * 2 ** (self._prune_failures - 1)
+            self._next_prune_at = now + delay
+            logger.exception("pruning deliveries failed; next attempt in %ds", delay)
             return 0
-        self._pruned_at = now
+        self._prune_failures = 0
+        self._next_prune_at = now + PRUNE_INTERVAL_SECONDS
         if removed:
             logger.info("pruned %d deliveries", removed)
         return removed

@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+import app.worker as worker_module
 from app.config import Settings
 from app.devin_client import (
     DevinError,
@@ -375,7 +376,7 @@ def test_worker_prunes_delivery_bodies_past_retention(
     worker.tick()
     assert _bodies(store) == 2, "pruned again inside the interval"
 
-    monkeypatch.setattr(worker, "_pruned_at", -PRUNE_INTERVAL_SECONDS * 2.0)
+    monkeypatch.setattr(worker, "_next_prune_at", 0.0)
     worker.tick()
     assert _bodies(store) == 0
 
@@ -407,23 +408,45 @@ def test_a_pruned_delivery_is_still_a_duplicate(
     assert store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == runs
 
 
-def test_a_failed_prune_is_retried_on_the_next_tick(
+def test_a_failed_prune_backs_off_1_2_4_minutes_then_waits_the_interval(
     intake: Intake, store: Store, worker: Worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     deliver(intake, "issues", "issue_labeled.json")
     _age_deliveries(store)
     real = store.prune_deliveries
-    calls: list[int] = []
+    failing = True
+    attempts: list[float] = []
+    clock = [1000.0]
 
     def flaky(days: int) -> int:
-        calls.append(days)
-        if len(calls) == 1:
+        attempts.append(clock[0])
+        if failing:
             raise sqlite3.OperationalError("database is locked")
         return real(days)
 
     monkeypatch.setattr(store, "prune_deliveries", flaky)
-    worker.tick()
-    assert _bodies(store) == 1
-    worker.tick()
-    assert len(calls) == 2
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+
+    def tick_at(offset: float) -> None:
+        clock[0] = 1000.0 + offset
+        worker.tick()
+
+    # Fails at 0; retries at +1, +3 and +7 minutes; ticks in between are skipped.
+    for offset in (0, 30, 60, 150, 180, 400, 420):
+        tick_at(offset)
+    assert [at - 1000.0 for at in attempts] == [0, 60, 180, 420]
+
+    # After three failed retries it waits a full interval.
+    tick_at(420 + PRUNE_INTERVAL_SECONDS - 1)
+    assert len(attempts) == 4
+    failing = False
+    tick_at(420 + PRUNE_INTERVAL_SECONDS)
+    assert len(attempts) == 5
     assert _bodies(store) == 0
+
+    # Success resets the back-off: the next failure retries after 1 minute.
+    failing = True
+    success = 420 + PRUNE_INTERVAL_SECONDS
+    tick_at(success + PRUNE_INTERVAL_SECONDS)
+    tick_at(success + PRUNE_INTERVAL_SECONDS + 60)
+    assert len(attempts) == 7
