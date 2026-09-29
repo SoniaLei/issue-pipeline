@@ -327,12 +327,14 @@ second lifecycle. This is a scope signal worth seeing, not an error: each extra
 PR, whether the session poll or a same-repository `pull_request` webhook sees it
 first, sends one `needs_human` with reason `scope` into the run's PR thread.
 
-**A PR after `no_output`.** A same-repository PR that names a run already
-closed as `no_output` is not attached: terminal means terminal. Instead its
-first `opened`, `reopened` or `ready_for_review` event sends one `needs_human`
-with reason `late_pr`, top-level because the run has no PR thread. The PR is
-then outside the pipeline, and a human reviews it or closes it. PRs naming a
-`failed`, `expired` or `cancelled` run are only recorded.
+**A PR after `no_output`.** A same-repository PR on the recorded branch of a
+run already closed as `no_output` is not attached: terminal means terminal.
+Instead its first `opened`, `reopened` or `ready_for_review` event sends one
+`needs_human` with reason `late_pr`, top-level because the run has no PR
+thread. The PR is then outside the pipeline, and a human reviews it or closes
+it. PRs naming a `failed`, `expired` or `cancelled` run are only recorded. The
+branch is required: the marker is public text, so a copied marker on another
+branch alerts no one.
 
 ## 8. Devin execution contract
 

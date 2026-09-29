@@ -307,6 +307,23 @@ def test_a_late_pr_on_a_no_output_run_alerts_a_human_once(
     assert len(events) == 1
 
 
+@pytest.mark.parametrize("recorded_branch", [None, "devin/issue-4242-other"])
+def test_a_marker_alone_on_a_no_output_run_does_not_alert(
+    intake: Intake, store: Store, recorded_branch: str | None
+) -> None:
+    run_id = queued_run(intake, store)
+    with store.transaction() as conn:
+        store.update_run(
+            conn, run_id, state=State.NO_OUTPUT.value, branch=recorded_branch
+        )
+
+    payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+    payload["pull_request"]["head"]["ref"] = "someone/copied-marker"
+    intake.handle(delivery_id=next_delivery_id(), event="pull_request", payload=payload)
+
+    assert _late_notifications(store) == []
+
+
 def test_a_fork_naming_a_no_output_run_does_not_alert(
     intake: Intake, store: Store
 ) -> None:

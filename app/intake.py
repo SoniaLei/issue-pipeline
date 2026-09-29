@@ -697,12 +697,16 @@ class Intake:
     def _run_that_ended_without_a_pr(
         self, repo: str, pull: dict[str, Any]
     ) -> sqlite3.Row | None:
-        """The `no_output` run this PR names by its branch or marker, if any."""
+        """The `no_output` run whose recorded branch this PR is on, if any.
+
+        The marker is public text, so it cannot attribute a PR to a session on
+        its own; only the branch the run recorded before the session started
+        can."""
         run = self._lookup_run(repo, pull)
         if run is None or State(str(run["state"])) is not State.NO_OUTPUT:
             return None
         branch = str((pull.get("head") or {}).get("ref") or "")
-        if run["branch"] and branch and str(run["branch"]) != branch:
+        if not run["branch"] or str(run["branch"]) != branch:
             return None
         return run
 
