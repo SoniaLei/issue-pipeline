@@ -120,6 +120,7 @@ a test, and opens an issue or a small PR for each actionable finding, then
 posts one Slack line. You will see its PRs and issues in the morning. Treat
 them as proposals from a colleague who has read everything and merged nothing:
 review, accept, amend or close with a reason. It never merges (D-035).
+Extending it to other repositories is proposed in D-037 and waiting on Q-022.
 
 ## 7. Optional: run it live
 

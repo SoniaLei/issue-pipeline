@@ -400,3 +400,21 @@ pipeline-wide spend view and reconcile against billing. Do not sum
 `acus_consumed` across runs and call it the pipeline's spend: the day boundary
 is PST, so the two will not agree, and the endpoint is the one that matches the
 invoice.
+
+---
+
+## Q-022 — Taking the overnight sweep to other repositories (D-037) *(non-blocking)*
+
+D-037 proposes a shared skill, a manifest per repository, a thin Automation
+per repository and a registry. Before it is accepted:
+
+- **Where the platform lives:** this repository, or a separate platform
+  repository that holds the skill, the registry and the sync script.
+- **Automation shape:** one Automation per repository (separate budgets and
+  failure domains, as proposed), or one parameterised Automation per schedule.
+- **Scope for `SoniaLei/superset-cognition-demo`:** which areas the first
+  manifest names, or whether it sweeps only code the pipeline has recently
+  changed.
+- **Registry sync:** manual at first, or a script from day one.
+
+Until then D-035 stands as written: one sweep, this repository only.

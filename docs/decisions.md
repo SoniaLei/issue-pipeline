@@ -926,3 +926,78 @@ content (the same rule that governed webhook destinations).
 **Revisit when** message updates (`chat.update` of the anchor's text) would
 say something reactions cannot, or when a destination needs more than one
 anchor per run (e.g. a per-repository digest).
+
+---
+
+## D-037 — The overnight sweep scales as one shared skill, a manifest per repository and a thin Automation per repository
+
+**Status**: proposed (needs a call from the maintainer; see Q-022)
+
+**Context.** D-035 runs one sweep, against this repository, with the whole
+procedure written into the Automation's prompt. The same service already
+serves more than one repository at runtime (`REPO_ALLOWLIST`, and the
+dashboard's `?repo=` filter), and `SoniaLei/superset-cognition-demo` is the
+next candidate for a sweep. Copying the prompt per repository would fork the
+procedure: every repository would drift from the others and every fix would
+have to be made N times.
+
+**Proposal.** Split the sweep into four layers, each versioned and reviewed as
+code:
+
+1. **Procedure: one skill.** The steps in D-035 (read the intent docs, run the
+   baseline, compare docs with code, skip what is tracked, open an issue or a
+   small PR with a failing-then-passing test, never merge, post one Slack
+   summary) live in a single `nightly-sweep` skill in a platform repository,
+   installed once as an organization plugin. Changing the procedure is one PR,
+   and every repository picks it up.
+2. **Intent: a manifest in each target repository.** A file such as
+   `.devin/sweep.yaml` states what counts as that repository's intent and how
+   far the sweep may reach:
+
+   ```yaml
+   intent_docs: [README.md, docs/architecture.md, docs/decisions.md]
+   scope: [app/, scripts/]            # or named areas in a large codebase
+   baseline:
+     - pytest -q
+     - ruff check .
+   label: sweep
+   budget: {max_findings: 5, acu_cap: 20}
+   slack: engineering-updates
+   ```
+
+   The repository's owners own this file, the same way D-031 puts runtime
+   knowledge in the target repository.
+3. **Trigger: a thin Automation per repository.** Its prompt only names the
+   repository and says to run the `nightly-sweep` skill with that repository's
+   manifest. Schedule, concurrency 1, ACU cap and network allowlist are
+   Automation settings, not prompt text. The PR-lifecycle → Slack companion
+   Automation is created alongside it.
+4. **Registry: a list of onboarded repositories.** A `repos.yaml` in the
+   platform repository lists them. A script or CI job creates or updates each
+   repository's Automations from it through Devin's automation interface, so
+   the list is the source of truth. The exact endpoints are to be confirmed
+   when this is built.
+
+Onboarding a repository then becomes: add it to the registry, commit its
+manifest, and save its environment blueprint.
+
+**What does not change.** Everything D-035 bounds stays bound, per repository:
+explicit scope, one run per schedule, an ACU cap, "no actionable finding" as a
+valid result, no merges, no self-applied `devin-ready`, and nothing taking
+effect without a human merging it. The sweep adds no trust path, in any
+repository.
+
+**Why not one Automation that loops over every repository.** A single run
+would share one ACU cap and one failure domain across repositories, and one
+noisy repository would crowd out the others. Keeping one Automation per
+repository keeps each budget, schedule and Slack summary separate, while the
+skill keeps the procedure the same everywhere.
+
+**Large repositories.** A repository the size of Superset cannot be swept end
+to end in one night. Its manifest has to name `scope` areas, and its
+`baseline` has to be scoped too (changed-file lint and area-specific tests),
+using the environment blueprint's toolchain.
+
+**Revisit when** a second repository has run the sweep for a month. Keep the
+layering if its findings were acted on at a rate similar to this repository's.
+Narrow its manifest if they were not.
