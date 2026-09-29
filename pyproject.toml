@@ -58,6 +58,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 # Placeholders are generated from a fixed set of application states and bound
 # as parameters; no value reaches these strings from a request.
 "app/store.py" = ["S608"]
+# Invented demo history: seeded randomness on purpose, and column names come
+# from the module's own field dict.
+"app/sim_history.py" = ["S311", "S608"]
 "tests/*.py" = ["S105", "S106", "S107"]
 "scripts/*.py" = ["S106"]
 

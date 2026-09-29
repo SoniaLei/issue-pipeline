@@ -53,6 +53,7 @@ from app.devin_client import SimulatedDevinClient  # noqa: E402
 from app.intake import Intake  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.reporting import build_report, render_text  # noqa: E402
+from app.sim_history import seed_history  # noqa: E402
 from app.slack_client import (  # noqa: E402
     BotSlackTransport,
     FakeSlackTransport,
@@ -136,6 +137,14 @@ def main() -> None:
         "--serve",
         action="store_true",
         help="serve /dashboard on 127.0.0.1:8000 over the simulated data afterwards",
+    )
+    parser.add_argument(
+        "--history-days",
+        type=int,
+        default=90,
+        metavar="N",
+        help="after the scripted run, seed N days of invented sim history so the"
+        " dashboard charts have shape (default 90, 0 to skip)",
     )
     args = parser.parse_args()
     if args.live_slack and args.live_slack_bot:
@@ -246,11 +255,20 @@ def main() -> None:
             names = " ".join(f":{name}:" for _, _, name in slack.reactions)
             print(f"     reactions on the PR opened post: {names}")
 
+    add_history(store, args.history_days)
+
     print()
     print_dashboard(store)
 
     if args.serve:
         serve(settings, store)
+
+
+def add_history(store: Store, days: int) -> None:
+    if days <= 0:
+        return
+    seeded = seed_history(store, days=days)
+    print(f"seeded {seeded} simulated runs over the last {days} days")
 
 
 def print_dashboard(store: Store) -> None:
