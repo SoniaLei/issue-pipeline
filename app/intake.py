@@ -431,6 +431,9 @@ class Intake:
             owner = self._run_with_another_pr(repo, pull)
             if owner is not None and action in NOTIFYING_OPEN_ACTIONS:
                 return self._extra_pull_request(conn, owner, pull)
+            ended = self._run_that_ended_without_a_pr(repo, pull)
+            if ended is not None and action in NOTIFYING_OPEN_ACTIONS:
+                return self._late_pull_request(conn, ended, pull)
             # Every other PR on a public repository ends up here. Recorded, in
             # case a run is created later and reconciliation wants it.
             return IntakeResult(False, "PR does not belong to a tracked run")
@@ -689,6 +692,55 @@ class Intake:
             self._notify_scope_prs(conn, task_id, run_id, [url])
         return IntakeResult(
             True, "extra PR recorded as a scope signal", task_id=task_id, run_id=run_id
+        )
+
+    def _run_that_ended_without_a_pr(
+        self, repo: str, pull: dict[str, Any]
+    ) -> sqlite3.Row | None:
+        """The `no_output` run whose recorded branch this PR is on, if any.
+
+        The marker is public text, so it cannot attribute a PR to a session on
+        its own; only the branch the run recorded before the session started
+        can."""
+        run = self._lookup_run(repo, pull)
+        if run is None or State(str(run["state"])) is not State.NO_OUTPUT:
+            return None
+        branch = str((pull.get("head") or {}).get("ref") or "")
+        if not run["branch"] or str(run["branch"]) != branch:
+            return None
+        return run
+
+    def _late_pull_request(
+        self, conn: sqlite3.Connection, run: sqlite3.Row, pull: dict[str, Any]
+    ) -> IntakeResult:
+        """Tell a human, once per PR, that a session opened a PR after its run
+        ended as `no_output`. The run stays terminal and the PR is not
+        attached; re-running is a new run (D-030)."""
+        run_id = str(run["id"])
+        task_id = int(run["task_id"])
+        url = str(pull.get("html_url") or "")
+        if self._notify(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            kind=Kind.NEEDS_HUMAN,
+            reason="late_pr",
+            revision=f"late:{url}",
+            detail=url,
+        ):
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind="pr",
+                reason="late",
+                detail={"number": int(pull["number"]), "url": url},
+            )
+        return IntakeResult(
+            False,
+            "late PR for a run that ended without one; human alerted",
+            task_id=task_id,
+            run_id=run_id,
         )
 
     def _notify_scope_prs(

@@ -298,6 +298,10 @@ def needs_human_text(reason: str | None) -> tuple[str, str]:
             "Session opened more than one PR",
             "check whether the change outgrew its scope",
         ),
+        "late_pr": (
+            "Session opened a PR after its run ended without one",
+            "the pipeline is not tracking this PR — review it by hand or close it",
+        ),
     }
     return mapping.get(reason or "", ("Run needs attention", "inspect the run"))
 

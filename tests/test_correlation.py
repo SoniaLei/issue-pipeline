@@ -274,3 +274,67 @@ def test_a_poll_known_primary_still_catches_an_extra_pr_and_threads_it(
     scope = _scope_notifications(store)
     assert len(scope) == 1
     assert "/pull/92" in str(scope[0]["payload"])
+
+
+def _late_notifications(store: Store) -> list[Any]:
+    return [n for n in store.all_notifications() if n["reason"] == "late_pr"]
+
+
+def test_a_late_pr_on_a_no_output_run_alerts_a_human_once(
+    intake: Intake, store: Store
+) -> None:
+    run_id = queued_run(intake, store)
+    with store.transaction() as conn:
+        store.update_run(conn, run_id, state=State.NO_OUTPUT.value)
+
+    for action in ("opened", "reopened"):
+        payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+        payload["action"] = action
+        result = intake.handle(
+            delivery_id=next_delivery_id(), event="pull_request", payload=payload
+        )
+        assert not result.accepted
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["state"] == State.NO_OUTPUT.value
+    assert run["pr_number"] is None
+    late = _late_notifications(store)
+    assert len(late) == 1
+    assert late[0]["kind"] == "needs_human"
+    assert "/pull/91" in str(late[0]["payload"])
+    events = [e for e in store.events_for_run(run_id) if e["reason"] == "late"]
+    assert len(events) == 1
+
+
+@pytest.mark.parametrize("recorded_branch", [None, "devin/issue-4242-other"])
+def test_a_marker_alone_on_a_no_output_run_does_not_alert(
+    intake: Intake, store: Store, recorded_branch: str | None
+) -> None:
+    run_id = queued_run(intake, store)
+    with store.transaction() as conn:
+        store.update_run(
+            conn, run_id, state=State.NO_OUTPUT.value, branch=recorded_branch
+        )
+
+    payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+    payload["pull_request"]["head"]["ref"] = "someone/copied-marker"
+    intake.handle(delivery_id=next_delivery_id(), event="pull_request", payload=payload)
+
+    assert _late_notifications(store) == []
+
+
+def test_a_fork_naming_a_no_output_run_does_not_alert(
+    intake: Intake, store: Store
+) -> None:
+    run_id = queued_run(intake, store)
+    with store.transaction() as conn:
+        store.update_run(conn, run_id, state=State.NO_OUTPUT.value)
+
+    payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+    payload["pull_request"]["head"]["repo"]["full_name"] = (
+        "stranger/superset-cognition-demo"
+    )
+    intake.handle(delivery_id=next_delivery_id(), event="pull_request", payload=payload)
+
+    assert _late_notifications(store) == []
