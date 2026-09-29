@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -34,8 +35,8 @@ from app.devin_client import (
 from app.intake import Intake
 from app.slack_client import FakeSlackTransport
 from app.states import State
-from app.store import Store
-from app.worker import Worker
+from app.store import Store, utcnow
+from app.worker import PRUNE_INTERVAL_SECONDS, Worker
 from tests.conftest import (
     deliver,
     load_fixture,
@@ -345,3 +346,42 @@ def _issue(number: int) -> dict[str, Any]:
         "repository": {"full_name": "SoniaLei/superset-cognition-demo"},
         "sender": {"login": "SoniaLei"},
     }
+
+
+def test_worker_prunes_deliveries_past_retention(
+    intake: Intake, store: Store, worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deliver(intake, "issues", "issue_labeled.json")
+    deliver(intake, "issues", "issue_labeled.json")
+    old = (utcnow() - timedelta(days=31)).isoformat()
+    store._conn.execute(
+        "UPDATE deliveries SET received_at = ?"
+        " WHERE rowid = (SELECT MIN(rowid) FROM deliveries)",
+        (old,),
+    )
+
+    def count() -> int:
+        return int(store._conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+
+    worker.tick()
+    assert count() == 1
+
+    deliver(intake, "issues", "issue_labeled.json")
+    store._conn.execute("UPDATE deliveries SET received_at = ?", (old,))
+    worker.tick()
+    assert count() == 2, "pruned again inside the interval"
+
+    monkeypatch.setattr(worker, "_pruned_at", -PRUNE_INTERVAL_SECONDS * 2.0)
+    worker.tick()
+    assert count() == 0
+
+    keep = Worker(
+        store,
+        dataclasses.replace(worker.settings, delivery_retention_days=0),
+        worker.devin,
+        worker.slack,
+    )
+    deliver(intake, "issues", "issue_labeled.json")
+    store._conn.execute("UPDATE deliveries SET received_at = ?", (old,))
+    keep.tick()
+    assert count() == 1
