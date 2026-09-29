@@ -14,10 +14,10 @@ remains open.
   and Q-021 (by D-032).
 - **Resolved by API verification:** Q-007.
 - **Resolved, recommendation implemented:** Q-003, Q-008, Q-009, Q-010,
-  Q-012, Q-013 and Q-017.
+  Q-012, Q-013, Q-017 and Q-018.
 - **Still open**, each running on a default. The *Current behaviour* line under
   each question says where that default differs from its recommendation:
-  - Q-011, Q-016, Q-018, Q-019 and Q-020;
+  - Q-011, Q-016, Q-019 and Q-020;
   - Q-022, which waits on D-037.
 
 Two decided values are provisional by design and expected to change: the daily
@@ -419,7 +419,7 @@ deployment.
 
 ---
 
-## Q-018 — What happens when a session opens more than one PR? *(non-blocking)*
+## Q-018 — What happens when a session opens more than one PR? — **RESOLVED: one `scope` alert per extra PR**
 
 `pull_requests` is an array. D-019 makes the first correlated PR primary and
 records the rest.
@@ -430,12 +430,18 @@ change outgrew its scope, which a reviewer would want to know.
 **Recommendation**: yes, as a `needs_human` with reason `scope`. Cheap, and
 scope creep is exactly the thing a review gate exists to catch.
 
-**Current behaviour**: only half done:
+**Resolved** (PR #23):
 
-- The worker records additional PRs from the session poll in `extra_pr_urls`,
-  and the webhook path ignores a second PR for a run that already has one.
-- The `scope` reason text exists in `app/notifications.py`, but nothing raises
-  it, so no notification is sent.
+- An extra PR is recorded in `extra_pr_urls` whether the session poll or a
+  same-repository `pull_request` webhook sees it first. Extras are compared
+  against the stored primary PR, not by position in Devin's list. Fork PRs
+  never count.
+- Each extra PR raises one `needs_human` with reason `scope` (fingerprint
+  `scope:<url>`), as a reply in the primary PR's thread. It waits for that
+  PR's "PR opened" anchor, so it never lands top-level ahead of it.
+- The first correlated PR still owns the lifecycle.
+- Gap: if the primary PR's webhook never arrives, an extra PR seen only by
+  the poll is recorded but never announced.
 
 ---
 
