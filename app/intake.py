@@ -413,6 +413,9 @@ class Intake:
 
         run = self._correlate(repo, pull)
         if run is None:
+            owner = self._run_with_another_pr(repo, pull)
+            if owner is not None and action in NOTIFYING_OPEN_ACTIONS:
+                return self._extra_pull_request(conn, owner, pull)
             # Every other PR on a public repository ends up here. Recorded, in
             # case a run is created later and reconciliation wants it.
             return IntakeResult(False, "PR does not belong to a tracked run")
@@ -591,22 +594,11 @@ class Intake:
         marker alone is not enough — it is public text in a public repository,
         and a stranger can paste it into their own pull request.
         """
-        head = pull.get("head") or {}
-        head_repo = str((head.get("repo") or {}).get("full_name") or "")
-        if head_repo and head_repo.lower() != repo.lower():
-            # A fork. Devin pushes to a branch on the repository itself, so a
-            # PR from elsewhere is somebody else's contribution.
-            return None
-
-        branch = str(head.get("ref") or "")
-        run = self.store.find_run_by_branch(repo, branch) if branch else None
-        if run is None:
-            marker = extract_marker(pull.get("body"))
-            if marker:
-                run = self.store.find_run_in_repo(repo, marker)
+        run = self._lookup_run(repo, pull)
         if run is None:
             return None
 
+        branch = str((pull.get("head") or {}).get("ref") or "")
         if run["branch"] and branch and str(run["branch"]) != branch:
             return None
 
@@ -616,6 +608,65 @@ class Intake:
             # signal for a human, not a second task.
             return None
         return run
+
+    def _lookup_run(self, repo: str, pull: dict[str, Any]) -> sqlite3.Row | None:
+        """The run a same-repository PR names by branch or marker, if any."""
+        head = pull.get("head") or {}
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        if head_repo and head_repo.lower() != repo.lower():
+            # A fork. Devin pushes to a branch on the repository itself, so a
+            # PR from elsewhere is somebody else's contribution.
+            return None
+        branch = str(head.get("ref") or "")
+        run = self.store.find_run_by_branch(repo, branch) if branch else None
+        if run is None:
+            marker = extract_marker(pull.get("body"))
+            if marker:
+                run = self.store.find_run_in_repo(repo, marker)
+        return run
+
+    def _run_with_another_pr(
+        self, repo: str, pull: dict[str, Any]
+    ) -> sqlite3.Row | None:
+        """The run this PR names when that run already owns a different PR."""
+        run = self._lookup_run(repo, pull)
+        if run is None or run["pr_number"] is None:
+            return None
+        if int(run["pr_number"]) == int(pull["number"]):
+            return None
+        return run
+
+    def _extra_pull_request(
+        self, conn: sqlite3.Connection, run: sqlite3.Row, pull: dict[str, Any]
+    ) -> IntakeResult:
+        """Record a run's second PR and tell a human, once per PR."""
+        run_id = str(run["id"])
+        task_id = int(run["task_id"])
+        url = str(pull.get("html_url") or "")
+        extra = json.loads(str(run["extra_pr_urls"] or "[]"))
+        if url and url not in extra:
+            extra.append(url)
+            self.store.update_run(conn, run_id, extra_pr_urls=json.dumps(extra))
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind="pr",
+                reason="extra",
+                detail={"number": int(pull["number"]), "url": url},
+            )
+        self._notify(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            kind=Kind.NEEDS_HUMAN,
+            reason="scope",
+            revision=f"scope:{url}",
+            detail=url,
+        )
+        return IntakeResult(
+            True, "extra PR recorded as a scope signal", task_id=task_id, run_id=run_id
+        )
 
     # -------------------------------------------------------------------- reviews
 

@@ -423,6 +423,19 @@ class Worker:
                 conn, task_id=task_id, run_id=run_id, target=target, reason=reason
             )
 
+        for url in json.loads(fields.get("extra_pr_urls", "[]")):
+            # The fingerprint makes this once per extra PR, whichever of the
+            # poll and the webhook sees it first.
+            self._notify(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                kind=Kind.NEEDS_HUMAN,
+                reason="scope",
+                revision=f"scope:{url}",
+                detail=str(url),
+            )
+
     def _notify_state_change(
         self,
         conn: sqlite3.Connection,

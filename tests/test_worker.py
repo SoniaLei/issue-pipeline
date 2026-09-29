@@ -258,6 +258,9 @@ def test_more_than_one_pr_is_recorded_rather_than_forked(
     assert run is not None
     assert run["pr_url"].endswith("/pull/1")
     assert "pull/2" in str(run["extra_pr_urls"])
+    scope = [n for n in store.all_notifications() if n["reason"] == "scope"]
+    assert len(scope) == 1
+    assert "pull/2" in str(scope[0]["payload"])
 
 
 def test_a_poll_never_moves_a_run_github_already_put_at_pr_open(

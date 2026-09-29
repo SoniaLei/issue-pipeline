@@ -169,3 +169,59 @@ def test_a_new_head_invalidates_previous_check_evidence(
     assert run is not None
     assert run["head_sha"] == "99887766"
     assert run["checks_state"] is None
+
+
+def _second_pr(run_id: str, number: int = 92, fork: bool = False) -> dict[str, Any]:
+    payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+    pull = payload["pull_request"]
+    pull["number"] = number
+    pull["html_url"] = (
+        f"https://github.com/SoniaLei/superset-cognition-demo/pull/{number}"
+    )
+    pull["head"]["ref"] = "devin/follow-up"
+    if fork:
+        pull["head"]["repo"]["full_name"] = "stranger/superset-cognition-demo"
+    return payload
+
+
+def _scope_notifications(store: Store) -> list[Any]:
+    return [n for n in store.all_notifications() if n["reason"] == "scope"]
+
+
+def test_a_second_pr_is_a_scope_signal_sent_once(intake: Intake, store: Store) -> None:
+    run_id = queued_run(intake, store)
+    deliver_pr(intake, "pr_opened.json", run_id)
+
+    for action in ("opened", "reopened"):
+        payload = _second_pr(run_id)
+        payload["action"] = action
+        result = intake.handle(
+            delivery_id=next_delivery_id(), event="pull_request", payload=payload
+        )
+        assert result.accepted
+        assert result.reason == "extra PR recorded as a scope signal"
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert int(run["pr_number"]) == 91
+    assert run["extra_pr_urls"].count("/pull/92") == 1
+    scope = _scope_notifications(store)
+    assert len(scope) == 1
+    assert scope[0]["kind"] == "needs_human"
+    assert "/pull/92" in str(scope[0]["payload"])
+
+
+def test_a_fork_naming_the_run_is_not_a_scope_signal(
+    intake: Intake, store: Store
+) -> None:
+    run_id = queued_run(intake, store)
+    deliver_pr(intake, "pr_opened.json", run_id)
+
+    result = intake.handle(
+        delivery_id=next_delivery_id(),
+        event="pull_request",
+        payload=_second_pr(run_id, fork=True),
+    )
+
+    assert not result.accepted
+    assert _scope_notifications(store) == []
