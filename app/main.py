@@ -121,7 +121,9 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
         return env if env in ENVS else None
 
     @app.get("/api/dashboard")
-    def api_dashboard(env: str | None = Query(default=None)) -> Response:
+    def api_dashboard(
+        env: str | None = Query(default=None), repo: str | None = Query(default=None)
+    ) -> Response:
         chosen = _env(env)
         if chosen is None:
             return JSONResponse({"detail": "env must be live or sim"}, status_code=400)
@@ -134,6 +136,7 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
                     60, int(settings.poll_interval_seconds * 10)
                 ),
                 review_gate_mode=settings.review_gate_mode,
+                repo=(repo or "").strip() or None,
             )
         )
 
