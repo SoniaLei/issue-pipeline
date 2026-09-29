@@ -76,6 +76,10 @@ echo "worker   running                  (log: $LOG_DIR/worker.log)"
 echo "env      ${DEVIN_MODE:-sim} devin / ${SLACK_MODE:-fake} slack"
 
 if [[ "${1:-}" == "--tunnel" ]]; then
+  [[ -n "${DASHBOARD_TOKEN:-}" ]] || {
+    echo "--tunnel makes the dashboard public; set DASHBOARD_TOKEN in .env" >&2
+    exit 1
+  }
   command -v cloudflared >/dev/null || {
     echo "cloudflared not found: https://github.com/cloudflare/cloudflared/releases" >&2
     exit 1

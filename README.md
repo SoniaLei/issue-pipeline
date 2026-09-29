@@ -185,6 +185,15 @@ link once Devin accepts it, the PR once GitHub reports it, checks as suites
 complete, the Slack post state, and the worker and delivery heartbeats under
 *Integration health*.
 
+**Dashboard access.** `/dashboard`, `/api/*` and `/report*` show issue
+numbers, approver logins, session URLs and spend, and are served from the same
+origin as the public webhook. When `DASHBOARD_TOKEN` is set, every path except
+`/webhooks/github` (which is HMAC-signed) and `/health` needs it. Browsers show
+their HTTP Basic prompt (any username, the token as the password), and scripts
+send `Authorization: Bearer <token>`. Live mode refuses to start without it,
+and `scripts/run_live.sh --tunnel` refuses too. In sim mode, leaving it unset
+keeps the local dashboard open and logs a warning.
+
 ## Dashboard
 
 `GET /dashboard` is a self-contained page over the store; `GET /api/dashboard`
