@@ -489,3 +489,9 @@ def test_dashboard_endpoints(
     assert client.get("/api/tasks/999/timeline").status_code == 404
     # Serving the API leaves an API heartbeat behind.
     assert {row["component"] for row in store.heartbeats()} >= {"api", "worker"}
+
+
+def test_github_health_is_labelled_as_spanning_environments(store: Store) -> None:
+    # Deliveries carry no env, so the figure cannot be scoped like the others.
+    board = build_dashboard(store, "live", worker_stale_after_seconds=3600)
+    assert board["health"]["github"]["scope"] == "all environments"

@@ -590,7 +590,10 @@ def _health(
         default=None,
     )
     return {
-        "github": {"last_delivery_at": store.last_delivery_at()},
+        "github": {
+            "scope": "all environments",
+            "last_delivery_at": store.last_delivery_at(),
+        },
         "devin": {"last_poll_at": store.last_poll_at(env)},
         "worker": {
             "last_tick_at": worker_at,
