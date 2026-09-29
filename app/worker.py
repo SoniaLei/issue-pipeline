@@ -54,6 +54,7 @@ from app.notifications import (
 from app.prompts import (
     branch_name,
     build_prompt,
+    same_pr_url,
     session_tags,
     session_title,
 )
@@ -97,14 +98,22 @@ def _snapshot_fields(snapshot: SessionSnapshot) -> dict[str, Any]:
 
 
 def _pull_request_fields(run: sqlite3.Row, snapshot: SessionSnapshot) -> dict[str, Any]:
-    """The first PR owns the lifecycle; any others are recorded, not followed."""
+    """The first PR owns the lifecycle; any others are recorded, not followed.
+
+    The primary is whichever PR the run already has, not the provider's first
+    entry: GitHub may have attached a different one first."""
     fields: dict[str, Any] = {}
+    primary = run["pr_url"] or snapshot.pull_requests[0].url
     if not run["pr_url"]:
-        fields["pr_url"] = snapshot.pull_requests[0].url
-    if len(snapshot.pull_requests) > 1:
-        fields["extra_pr_urls"] = json.dumps(
-            [pr.url for pr in snapshot.pull_requests[1:]]
-        )
+        fields["pr_url"] = primary
+    extra: list[str] = json.loads(str(run["extra_pr_urls"] or "[]"))
+    for pr in snapshot.pull_requests:
+        if not same_pr_url(pr.url, primary) and not any(
+            same_pr_url(pr.url, known) for known in extra
+        ):
+            extra.append(pr.url)
+    if extra:
+        fields["extra_pr_urls"] = json.dumps(extra)
     return fields
 
 
@@ -114,6 +123,14 @@ def _session_finished(insights: SessionInsights) -> bool:
 
 # States a pull-request webhook put the run in; session polls do not leave them.
 GITHUB_OWNED: frozenset[State] = frozenset({State.PR_OPEN, State.AWAITING_REVIEW})
+
+
+# Deliveries are pruned at most this often; the retention window is days.
+PRUNE_INTERVAL_SECONDS = 3600
+# A failed prune is retried after 1, 2 and 4 minutes, then waits for the next
+# interval.
+PRUNE_RETRY_BASE_SECONDS = 60
+PRUNE_MAX_RETRIES = 3
 
 
 class Worker:
@@ -134,6 +151,8 @@ class Worker:
         self.slack = slack
         self.owner = owner or f"{socket.gethostname()}-{id(self)}"
         self._metrics_dirty = False
+        self._next_prune_at = 0.0
+        self._prune_failures = 0
 
     # ------------------------------------------------------------------ main loop
 
@@ -147,6 +166,7 @@ class Worker:
         """Advance at most one run, deliver due notifications, and on a tick
         with no run to advance, make one analytics read."""
         self.store.heartbeat("worker", self.owner)
+        self.prune_deliveries()
         advanced = self.advance_one()
         delivered = self.drain_outbox()
         reviewed = False
@@ -167,6 +187,30 @@ class Worker:
             except Exception:
                 logger.exception("analytics refresh failed")
         return advanced or delivered > 0
+
+    def prune_deliveries(self) -> int:
+        """Drop raw delivery bodies older than DELIVERY_RETENTION_DAYS (D-014),
+        at most once per PRUNE_INTERVAL_SECONDS. Zero or less keeps them all."""
+        now = time.monotonic()
+        if self.settings.delivery_retention_days <= 0 or now < self._next_prune_at:
+            return 0
+        try:
+            removed = self.store.prune_deliveries(self.settings.delivery_retention_days)
+        except sqlite3.Error:
+            self._prune_failures += 1
+            if self._prune_failures > PRUNE_MAX_RETRIES:
+                self._prune_failures = 0
+                delay = PRUNE_INTERVAL_SECONDS
+            else:
+                delay = PRUNE_RETRY_BASE_SECONDS * 2 ** (self._prune_failures - 1)
+            self._next_prune_at = now + delay
+            logger.exception("pruning deliveries failed; next attempt in %ds", delay)
+            return 0
+        self._prune_failures = 0
+        self._next_prune_at = now + PRUNE_INTERVAL_SECONDS
+        if removed:
+            logger.info("pruned %d deliveries", removed)
+        return removed
 
     def advance_one(self) -> bool:
         run = self.store.claim_run(self.owner, self.settings.lease_seconds)
@@ -422,6 +466,21 @@ class Worker:
             self._notify_state_change(
                 conn, task_id=task_id, run_id=run_id, target=target, reason=reason
             )
+
+        # Without the primary's webhook there is no "PR opened" anchor yet; that
+        # webhook sends these once it has queued one. The fingerprint makes it
+        # once per extra PR either way.
+        if run["pr_number"] is not None:
+            for url in json.loads(fields.get("extra_pr_urls", "[]")):
+                self._notify(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    kind=Kind.NEEDS_HUMAN,
+                    reason="scope",
+                    revision=f"scope:{url}",
+                    detail=str(url),
+                )
 
     def _notify_state_change(
         self,

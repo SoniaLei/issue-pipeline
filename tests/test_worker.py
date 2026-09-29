@@ -19,11 +19,14 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
 import pytest
 
+import app.worker as worker_module
 from app.config import Settings
 from app.devin_client import (
     DevinError,
@@ -34,8 +37,8 @@ from app.devin_client import (
 from app.intake import Intake
 from app.slack_client import FakeSlackTransport
 from app.states import State
-from app.store import Store
-from app.worker import Worker
+from app.store import Store, utcnow
+from app.worker import PRUNE_INTERVAL_SECONDS, Worker
 from tests.conftest import (
     deliver,
     load_fixture,
@@ -258,6 +261,43 @@ def test_more_than_one_pr_is_recorded_rather_than_forked(
     assert run is not None
     assert run["pr_url"].endswith("/pull/1")
     assert "pull/2" in str(run["extra_pr_urls"])
+    # No primary webhook yet, so no anchor: the alert waits for it.
+    assert [n for n in store.all_notifications() if n["reason"] == "scope"] == []
+
+
+def test_the_primary_is_the_pr_github_attached_not_the_first_listed(
+    store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    devin = SimulatedDevinClient(
+        script=[
+            {"status": "new"},
+            {
+                "status": "running",
+                "status_detail": "finished",
+                "pull_requests": [
+                    {"pr_url": "https://github.com/x/y/pull/1", "pr_state": "open"},
+                    {"pr_url": "https://github.com/x/y/pull/2", "pr_state": "open"},
+                ],
+            },
+        ]
+    )
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = queued(Intake(store, settings))
+    worker.advance_one()
+    with store.transaction() as conn:
+        store.update_run(
+            conn, run_id, pr_url="https://github.com/x/y/pull/2", pr_number=2
+        )
+    for _ in range(2):
+        worker.advance_one()
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["pr_url"].endswith("/pull/2")
+    assert json.loads(run["extra_pr_urls"]) == ["https://github.com/x/y/pull/1"]
+    scope = [n for n in store.all_notifications() if n["reason"] == "scope"]
+    assert len(scope) == 1
+    assert "Detail: https://github.com/x/y/pull/1" in str(scope[0]["payload"])
 
 
 def test_a_poll_never_moves_a_run_github_already_put_at_pr_open(
@@ -345,3 +385,106 @@ def _issue(number: int) -> dict[str, Any]:
         "repository": {"full_name": "SoniaLei/superset-cognition-demo"},
         "sender": {"login": "SoniaLei"},
     }
+
+
+def _bodies(store: Store) -> int:
+    row = store._conn.execute(
+        "SELECT COUNT(*) FROM deliveries WHERE payload != ''"
+    ).fetchone()
+    return int(row[0])
+
+
+def _age_deliveries(store: Store) -> None:
+    old = (utcnow() - timedelta(days=31)).isoformat()
+    store._conn.execute("UPDATE deliveries SET received_at = ?", (old,))
+
+
+def test_worker_prunes_delivery_bodies_past_retention(
+    intake: Intake, store: Store, worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deliver(intake, "issues", "issue_labeled.json")
+    _age_deliveries(store)
+    deliver(intake, "issues", "issue_labeled.json")
+
+    worker.tick()
+    assert _bodies(store) == 1
+
+    deliver(intake, "issues", "issue_labeled.json")
+    _age_deliveries(store)
+    worker.tick()
+    assert _bodies(store) == 2, "pruned again inside the interval"
+
+    monkeypatch.setattr(worker, "_next_prune_at", 0.0)
+    worker.tick()
+    assert _bodies(store) == 0
+
+    keep = Worker(
+        store,
+        dataclasses.replace(worker.settings, delivery_retention_days=0),
+        worker.devin,
+        worker.slack,
+    )
+    deliver(intake, "issues", "issue_labeled.json")
+    _age_deliveries(store)
+    keep.tick()
+    assert _bodies(store) == 1
+
+
+def test_a_pruned_delivery_is_still_a_duplicate(
+    intake: Intake, store: Store, worker: Worker
+) -> None:
+    payload = load_fixture("issue_labeled.json")
+    first = intake.handle(delivery_id="d-old", event="issues", payload=payload)
+    runs = store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    _age_deliveries(store)
+    worker.tick()
+    assert _bodies(store) == 0
+
+    again = intake.handle(delivery_id="d-old", event="issues", payload=payload)
+    assert first.run_id is not None
+    assert (again.accepted, again.reason) == (False, "duplicate delivery")
+    assert store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == runs
+
+
+def test_a_failed_prune_backs_off_1_2_4_minutes_then_waits_the_interval(
+    intake: Intake, store: Store, worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deliver(intake, "issues", "issue_labeled.json")
+    _age_deliveries(store)
+    real = store.prune_deliveries
+    failing = True
+    attempts: list[float] = []
+    clock = [1000.0]
+
+    def flaky(days: int) -> int:
+        attempts.append(clock[0])
+        if failing:
+            raise sqlite3.OperationalError("database is locked")
+        return real(days)
+
+    monkeypatch.setattr(store, "prune_deliveries", flaky)
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+
+    def tick_at(offset: float) -> None:
+        clock[0] = 1000.0 + offset
+        worker.tick()
+
+    # Fails at 0; retries at +1, +3 and +7 minutes; ticks in between are skipped.
+    for offset in (0, 30, 60, 150, 180, 400, 420):
+        tick_at(offset)
+    assert [at - 1000.0 for at in attempts] == [0, 60, 180, 420]
+
+    # After three failed retries it waits a full interval.
+    tick_at(420 + PRUNE_INTERVAL_SECONDS - 1)
+    assert len(attempts) == 4
+    failing = False
+    tick_at(420 + PRUNE_INTERVAL_SECONDS)
+    assert len(attempts) == 5
+    assert _bodies(store) == 0
+
+    # Success resets the back-off: the next failure retries after 1 minute.
+    failing = True
+    success = 420 + PRUNE_INTERVAL_SECONDS
+    tick_at(success + PRUNE_INTERVAL_SECONDS)
+    tick_at(success + PRUNE_INTERVAL_SECONDS + 60)
+    assert len(attempts) == 7

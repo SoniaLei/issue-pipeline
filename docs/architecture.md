@@ -323,7 +323,9 @@ between webhook and poll produces one row and one notification.
 **`pull_requests` is an array.** A session can open more than one PR. The first
 correlated PR is the run's primary PR and drives the state machine; any
 subsequent one is recorded against the run and reported, but does not create a
-second lifecycle. This is a scope signal worth seeing, not an error.
+second lifecycle. This is a scope signal worth seeing, not an error: each extra
+PR, whether the session poll or a same-repository `pull_request` webhook sees it
+first, sends one `needs_human` with reason `scope` into the run's PR thread.
 
 ## 8. Devin execution contract
 

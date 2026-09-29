@@ -185,6 +185,19 @@ link once Devin accepts it, the PR once GitHub reports it, checks as suites
 complete, the Slack post state, and the worker and delivery heartbeats under
 *Integration health*.
 
+**Dashboard access.** `/dashboard`, `/api/*` and `/report*` show issue
+numbers, approver logins, session URLs and spend, and are served from the same
+origin as the public webhook. When `DASHBOARD_TOKEN` is set, every path except
+`/webhooks/github` (which is HMAC-signed) and `/health` needs it. Browsers show
+their HTTP Basic prompt (any username, the token as the password), and scripts
+send `Authorization: Bearer <token>`. Live mode refuses to start without it,
+and `scripts/run_live.sh --tunnel` refuses too. In sim mode, leaving it unset
+keeps the dashboard open and logs a warning. `compose.yaml` and
+`scripts/run_live.sh` listen on `127.0.0.1` by default, so an untokened
+dashboard is reachable only from that machine. Set `BIND_ADDRESS` (for
+example `0.0.0.0` behind an HTTPS proxy on another host) to expose it;
+`run_live.sh` refuses a non-loopback address without `DASHBOARD_TOKEN`.
+
 ## Dashboard
 
 `GET /dashboard` is a self-contained page over the store; `GET /api/dashboard`
@@ -196,6 +209,15 @@ with the `env` it was created under (`DEVIN_MODE`), and the dashboard reports
 exactly one env at a time — `?env=live` or `?env=sim`, defaulting to the
 service's own mode. A banner names which one is shown; there is no "all" view,
 so a simulated merge can never inflate a live success number.
+
+**One repository or all of them.** The service tracks every repository in
+`REPO_ALLOWLIST`, and `?repo=owner/name` (the repository picker in the header)
+narrows workload, results, speed, throughput, needs attention, Slack health,
+cost and the task table to that repository. Without it the page covers every
+tracked repository in the chosen env. The Devin analytics cross-check always
+spans all repositories, because Devin counts per service user rather than per
+repository; `devin_analytics.scope` says so. A repository with no runs gives an
+empty page rather than an error.
 
 The outcome words are used precisely, and the page states its definitions:
 
@@ -217,7 +239,8 @@ shown as its own fact and is required for merge regardless of any of the above.
 Sections: **current workload** (queued, running, PR opened, awaiting review,
 blocked, failed), **results** (opened / verified / merged), **speed** (median and
 p90 from maintainer approval to first verification, with the sample count),
-**throughput** (verified and merged per UTC day, last 14 days), **needs
+**throughput** (verified and merged per UTC day, last 14 days by default;
+`?days=N` or the header picker sets 1 to 90), **needs
 attention** (blocker, age, next action), **integration health** (last GitHub
 delivery, last Devin poll, worker heartbeat, Slack failures) and the **task
 table** — issue, state, elapsed, tests, PR, Slack status, last update. The

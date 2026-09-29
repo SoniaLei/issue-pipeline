@@ -379,9 +379,13 @@ class Store:
         )
 
     def prune_deliveries(self, retention_days: int) -> int:
+        """Drop the raw body of deliveries past retention. The row stays so a
+        redelivery of the same id is still recognised as a duplicate."""
         cutoff = (utcnow() - timedelta(days=retention_days)).isoformat()
         cursor = self._conn.execute(
-            "DELETE FROM deliveries WHERE received_at < ?", (cutoff,)
+            "UPDATE deliveries SET payload = ''"
+            " WHERE received_at < ? AND payload != ''",
+            (cutoff,),
         )
         return cursor.rowcount
 

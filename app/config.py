@@ -128,6 +128,10 @@ class Settings:
     run_max_seconds: int = DEFAULT_RUN_MAX_SECONDS
     lease_seconds: int = DEFAULT_LEASE_SECONDS
 
+    # Shared operator token for the dashboard, report and API. Required in
+    # live mode; unset in sim mode leaves them open for local use.
+    dashboard_token: str = ""
+
     poll_interval_seconds: float = 2.0
     delivery_retention_days: int = 30
 
@@ -265,6 +269,7 @@ def load_settings() -> Settings:
         run_max_seconds=_env_int("RUN_MAX_SECONDS", DEFAULT_RUN_MAX_SECONDS),
         lease_seconds=_env_int("LEASE_SECONDS", DEFAULT_LEASE_SECONDS),
         delivery_retention_days=_env_int("DELIVERY_RETENTION_DAYS", 30),
+        dashboard_token=os.environ.get("DASHBOARD_TOKEN", ""),
         analytics_enabled=os.environ.get("ANALYTICS_ENABLED", "true").lower()
         not in {"0", "false", "no"},
         insights_refresh_seconds=_env_int(
@@ -289,5 +294,7 @@ def load_settings() -> Settings:
         settings.devin_org_id and settings.devin_api_token
     ):
         raise ConfigError("DEVIN_MODE=live requires DEVIN_ORG_ID and DEVIN_API_TOKEN")
+    if devin_mode == "live" and not settings.dashboard_token:
+        raise ConfigError("DEVIN_MODE=live requires DASHBOARD_TOKEN")
     _check_slack_live(settings)
     return settings

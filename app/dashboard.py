@@ -136,6 +136,7 @@ WORKLOAD_BUCKETS = (
 )
 
 THROUGHPUT_DAYS = 14
+MAX_THROUGHPUT_DAYS = 90
 
 
 def _parse(value: Any) -> datetime | None:
@@ -550,9 +551,10 @@ def _speed(values: list[float]) -> dict[str, Any]:
     }
 
 
-def _throughput(store: Store, env: str, now: datetime) -> list[dict[str, Any]]:
+def _throughput(
+    store: Store, env_runs: set[str], now: datetime, days: int
+) -> list[dict[str, Any]]:
     """Verified and merged counts per UTC day, most recent last."""
-    env_runs = {str(run["id"]) for run in store.list_runs(env)}
     verified: dict[str, set[str]] = defaultdict(set)
     merged: dict[str, set[str]] = defaultdict(set)
     for event in store.all_events():
@@ -564,13 +566,13 @@ def _throughput(store: Store, env: str, now: datetime) -> list[dict[str, Any]]:
             verified[day].add(run_id)
         elif event["kind"] == "state" and event["to_state"] == State.MERGED.value:
             merged[day].add(run_id)
-    days = []
-    for offset in range(THROUGHPUT_DAYS - 1, -1, -1):
+    series = []
+    for offset in range(days - 1, -1, -1):
         day = (now - timedelta(days=offset)).date().isoformat()
-        days.append(
+        series.append(
             {"day": day, "verified": len(verified[day]), "merged": len(merged[day])}
         )
-    return days
+    return series
 
 
 def _health(
@@ -590,7 +592,10 @@ def _health(
         default=None,
     )
     return {
-        "github": {"last_delivery_at": store.last_delivery_at()},
+        "github": {
+            "scope": "all environments",
+            "last_delivery_at": store.last_delivery_at(),
+        },
         "devin": {"last_poll_at": store.last_poll_at(env)},
         "worker": {
             "last_tick_at": worker_at,
@@ -804,26 +809,40 @@ def build_dashboard(
     now: datetime | None = None,
     worker_stale_after_seconds: int = 300,
     review_gate_mode: str = DEFAULT_REVIEW_GATE_MODE,
+    repo: str | None = None,
+    days: int = THROUGHPUT_DAYS,
 ) -> dict[str, Any]:
-    """Everything the overview page shows, for one environment."""
+    """Everything the overview page shows, for one environment.
+
+    ``repo`` narrows every per-run figure to one repository. The Devin
+    analytics cross-check stays across all repositories, because Devin counts
+    per service user, not per repository.
+
+    ``days`` is the length of the throughput series, in UTC days ending today.
+    """
+    if not 1 <= days <= MAX_THROUGHPUT_DAYS:
+        raise ValueError(f"days must be between 1 and {MAX_THROUGHPUT_DAYS}")
     current = now or utcnow()
     rows = store.list_runs(env)
-    runs = [_run_view(store, row, current, review_gate_mode) for row in rows]
+    all_runs = [_run_view(store, row, current, review_gate_mode) for row in rows]
+    # GitHub names are case-insensitive: one entry per repository, under the
+    # first spelling seen.
+    spelling: dict[str, str] = {}
+    repos: dict[str, int] = defaultdict(int)
+    for run in all_runs:
+        key = run["repo"].lower()
+        spelling.setdefault(key, run["repo"])
+        repos[key] += 1
+    wanted = repo.lower() if repo else None
+    runs = [r for r in all_runs if wanted is None or r["repo"].lower() == wanted]
+    chosen_repo = spelling.get(wanted, repo) if wanted else None
 
     workload = {bucket: 0 for bucket in WORKLOAD_BUCKETS}
     for run in runs:
         if run["bucket"] in workload:
             workload[run["bucket"]] += 1
 
-    results = {
-        "pr_opened": sum(1 for r in runs if r["pr"]["number"] is not None),
-        "checks_passed": sum(1 for r in runs if r["checks_passed"]),
-        "verified": sum(1 for r in runs if r["verified"]),
-        "merged": sum(1 for r in runs if r["state"] == State.MERGED.value),
-        "closed_unmerged": sum(
-            1 for r in runs if r["state"] == State.CLOSED_UNMERGED.value
-        ),
-    }
+    results = _results(runs)
 
     speed = {
         "review_ready": _speed(
@@ -877,12 +896,19 @@ def build_dashboard(
     data_as_of = max((p for p in data_points if p), default=None)
 
     health = _health(store, env, runs, current, worker_stale_after_seconds)
-    health["devin_analytics"] = _drift(store, env, runs, results)
+    health["devin_analytics"] = {
+        **_drift(store, env, all_runs, _results(all_runs)),
+        "scope": "all repositories",
+    }
     last_call = store.last_review_call(env)
 
     return {
         "env": env,
         "envs_available": store.count_runs_by_env(),
+        "repo": chosen_repo,
+        "repos_available": [
+            {"repo": spelling[key], "runs": repos[key]} for key in sorted(repos)
+        ],
         "generated_at": current.isoformat(),
         "data_as_of": data_as_of,
         "definitions": DEFINITIONS,
@@ -898,7 +924,8 @@ def build_dashboard(
         "workload": workload,
         "results": results,
         "speed": speed,
-        "throughput": _throughput(store, env, current),
+        "throughput_days": days,
+        "throughput": _throughput(store, {r["run_id"] for r in runs}, current, days),
         "cost": _cost(runs),
         "attention": attention,
         "health": health,
@@ -908,6 +935,18 @@ def build_dashboard(
             "runs": len(runs),
             "acus": sum(float(r["session"]["acus_consumed"] or 0.0) for r in runs),
         },
+    }
+
+
+def _results(runs: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "pr_opened": sum(1 for r in runs if r["pr"]["number"] is not None),
+        "checks_passed": sum(1 for r in runs if r["checks_passed"]),
+        "verified": sum(1 for r in runs if r["verified"]),
+        "merged": sum(1 for r in runs if r["state"] == State.MERGED.value),
+        "closed_unmerged": sum(
+            1 for r in runs if r["state"] == State.CLOSED_UNMERGED.value
+        ),
     }
 
 

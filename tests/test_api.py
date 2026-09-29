@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -26,7 +27,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import Settings
+from app.config import ConfigError, load_settings, Settings
 from app.main import create_app
 from app.reporting import build_report, render_text
 from app.states import check_transition, IllegalTransitionError, is_terminal, State
@@ -125,3 +126,50 @@ def test_illegal_transitions_are_refused() -> None:
         check_transition(State.AWAITING_APPROVAL, State.PR_OPEN)
     assert is_terminal(State.NO_OUTPUT)
     assert not is_terminal(State.PR_OPEN)
+
+
+def test_dashboard_token_guards_everything_but_webhook_and_health(
+    settings: Settings, store: Store
+) -> None:
+    guarded = TestClient(
+        create_app(dataclasses.replace(settings, dashboard_token="s3cret"), store)
+    )
+    for path in ("/dashboard", "/api/dashboard", "/report", "/report.txt"):
+        response = guarded.get(path)
+        assert response.status_code == 401, path
+        assert response.headers["www-authenticate"].startswith("Basic")
+        assert guarded.get(path, auth=("anyone", "wrong")).status_code == 401
+        assert (
+            guarded.get(path, headers={"Authorization": "Bearer wrong"}).status_code
+            == 401
+        )
+        assert guarded.get(path, auth=("anyone", "s3cret")).status_code == 200
+        assert (
+            guarded.get(path, headers={"Authorization": "Bearer s3cret"}).status_code
+            == 200
+        )
+    assert (
+        guarded.get("/report", headers={"Authorization": "Basic !!!"}).status_code
+        == 401
+    )
+    assert guarded.get("/health").status_code == 200
+    assert (
+        post(
+            guarded, "issues", load_fixture("issue_labeled.json"), "d-auth"
+        ).status_code
+        == 200
+    )
+
+
+def test_live_mode_refuses_to_start_without_a_dashboard_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "x")
+    monkeypatch.setenv("DEVIN_MODE", "live")
+    monkeypatch.setenv("DEVIN_ORG_ID", "org")
+    monkeypatch.setenv("DEVIN_API_TOKEN", "tok")
+    monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
+    with pytest.raises(ConfigError, match="DASHBOARD_TOKEN"):
+        load_settings()
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    assert load_settings().dashboard_token == "s3cret"

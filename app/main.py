@@ -23,8 +23,12 @@ webhook that waits on a third party is a webhook GitHub gives up on.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request, Response
@@ -36,13 +40,22 @@ from fastapi.responses import (
 )
 
 from app.config import load_settings, Settings
-from app.dashboard import build_dashboard, build_timeline
+from app.dashboard import (
+    build_dashboard,
+    build_timeline,
+    MAX_THROUGHPUT_DAYS,
+    THROUGHPUT_DAYS,
+)
 from app.dashboard_page import render_page, STATIC_DIR
 from app.intake import Intake, verify_signature
 from app.reporting import build_report, render_text
 from app.store import Store
 
 ENVS = ("live", "sim")
+
+# Authenticated by other means (the webhook's HMAC signature) or deliberately
+# public (liveness probes). Everything else needs DASHBOARD_TOKEN when it is set.
+OPEN_PATHS = frozenset({"/health", "/webhooks/github"})
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +69,8 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     app.state.settings = resolved
     app.state.store = backing
     app.state.intake = intake
+
+    _guard(app, resolved.dashboard_token)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -112,6 +127,55 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     return app
 
 
+def _guard(app: FastAPI, token: str) -> None:
+    """Require DASHBOARD_TOKEN on everything outside OPEN_PATHS."""
+    if not token:
+        logger.warning(
+            "DASHBOARD_TOKEN is not set: /dashboard, /api and /report are open"
+        )
+        return
+
+    @app.middleware("http")
+    async def require_token(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path in OPEN_PATHS or _token_matches(
+            request.headers.get("authorization"), token
+        ):
+            return await call_next(request)
+        return PlainTextResponse(
+            "authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="issue-pipeline"'},
+        )
+
+
+def _token_matches(header: str | None, token: str) -> bool:
+    """`Bearer <token>`, or HTTP Basic with the token as the password (any
+    username), so a browser can use its native prompt."""
+    scheme, _, value = (header or "").partition(" ")
+    if scheme.lower() == "bearer":
+        supplied = value.strip()
+    elif scheme.lower() == "basic":
+        try:
+            decoded = base64.b64decode(value.strip(), validate=True).decode()
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+        supplied = decoded.partition(":")[2]
+    else:
+        return False
+    return hmac.compare_digest(supplied.encode(), token.encode())
+
+
+def _days(requested: str | None) -> int | None:
+    if not requested:
+        return THROUGHPUT_DAYS
+    if not (requested.isascii() and requested.isdigit()) or len(requested) > 3:
+        return None
+    days = int(requested)
+    return days if 1 <= days <= MAX_THROUGHPUT_DAYS else None
+
+
 def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
     """Read-only reporting routes. Nothing here writes to a run."""
 
@@ -121,10 +185,20 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
         return env if env in ENVS else None
 
     @app.get("/api/dashboard")
-    def api_dashboard(env: str | None = Query(default=None)) -> Response:
+    def api_dashboard(
+        env: str | None = Query(default=None),
+        repo: str | None = Query(default=None),
+        days: str | None = Query(default=None),
+    ) -> Response:
         chosen = _env(env)
         if chosen is None:
             return JSONResponse({"detail": "env must be live or sim"}, status_code=400)
+        window = _days(days)
+        if window is None:
+            return JSONResponse(
+                {"detail": f"days must be 1 to {MAX_THROUGHPUT_DAYS}"},
+                status_code=400,
+            )
         store.heartbeat("api", "api")
         return JSONResponse(
             build_dashboard(
@@ -134,6 +208,8 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
                     60, int(settings.poll_interval_seconds * 10)
                 ),
                 review_gate_mode=settings.review_gate_mode,
+                repo=(repo or "").strip() or None,
+                days=window,
             )
         )
 
