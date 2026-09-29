@@ -33,11 +33,13 @@ Two processes run under Docker Compose against a shared database volume:
 | Process | Responsibility |
 | --- | --- |
 | `api` | Receives webhooks, validates and persists them, serves the report and health endpoints. Performs no external calls on the request path. |
-| `worker` | Claims queued work under a lease, creates and polls Devin sessions, reconciles GitHub state, drains the notification outbox. |
+| `worker` | Claims queued work under a lease, creates and polls Devin sessions, recovers orphaned sessions by tag, drains the notification outbox. |
 
 GitHub remains the source of truth for issues, pull requests, checks, reviews and
 merges. The database holds our own task state and a cache of the last observed
-GitHub state; on any disagreement, GitHub wins and reconciliation corrects us.
+GitHub state; on any disagreement, GitHub wins. The service makes no GitHub API
+calls, so it learns GitHub state only from webhooks, and a missed delivery is not
+repaired automatically (see *Reconciliation* in §6).
 
 ### Webhook directions
 
@@ -117,7 +119,8 @@ attempted and what it cost stays intact.
 ```
 
 Terminal states: `merged`, `closed_unmerged`, `cancelled`, `failed`, `no_output`,
-`expired`. Everything else is live and is visited by reconciliation.
+`expired`. Everything else is live, and the worker keeps polling its Devin
+session.
 
 ### State table
 
@@ -279,10 +282,13 @@ Two consequences worth stating plainly:
   transaction as the state change that produced them, then delivered by the
   worker with retries. This is what makes "state changed but Slack never heard"
   impossible.
-- **Reconciliation loop.** On an interval, every live task is compared against
-  current GitHub and Devin state and corrected. This is the safety net for
-  missed, dropped or out-of-order deliveries, and it is how the system recovers
-  after being down.
+- **Reconciliation (partial).** The intended design compares every live task
+  against current GitHub and Devin state on an interval, as the safety net for
+  missed, dropped or out-of-order deliveries and for recovery after downtime.
+  Only the Devin half is built: the worker polls each live session, and an
+  ambiguous session-create is recovered by tag lookup (§8). There is no GitHub
+  half. A missed or unmatched GitHub delivery is not re-fetched or re-evaluated;
+  it stays in `deliveries` for a human to inspect (§7).
 - SQLite in WAL mode with a busy timeout, on a persistent volume. Move to
   PostgreSQL before running multiple hosts.
 
@@ -316,8 +322,9 @@ copy it into their own PR body.
 The worker records the run's branch when it starts the session, before Devin
 can push, so a webhook that arrives before the session poll still matches. A
 `pull_request` event that matches no run is recorded in `deliveries`
-(`accepted = 0`, with its reason) and is not re-evaluated later. Its body stays
-there for a human to inspect until `DELIVERY_RETENTION_DAYS` clears it (Q-012).
+(`accepted = 0`, with its reason) and is not re-evaluated later, because
+reconciliation has no GitHub half (§6). Its body stays there for a human to
+inspect until `DELIVERY_RETENTION_DAYS` clears it (Q-012).
 
 The two sources take different routes (D-007). Only the webhook, through
 `Intake._correlate`, writes `pr_number` and `head_sha` and queues "PR opened".

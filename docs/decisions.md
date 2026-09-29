@@ -424,6 +424,9 @@ evaluated, and the results are announced:
 What still stands: checks drive no state transition. `awaiting_review` is
 unreachable, and "awaiting review" is derived at report time (D-030).
 
+*The original v1 decision follows, kept for history. Its notification list
+is replaced by D-036.*
+
 Deriving "review-ready" from checks means handling which checks are required,
 re-runs, in-progress suites, and pull requests from forks. Each is a source of
 wrong notifications, and wrong notifications train people to ignore the channel.
