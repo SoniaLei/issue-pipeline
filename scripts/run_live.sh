@@ -41,6 +41,11 @@ source .env
 set +a
 
 PORT="${PORT:-8000}"
+BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
+if [[ "$BIND_ADDRESS" != "127.0.0.1" && -z "${DASHBOARD_TOKEN:-}" ]]; then
+  echo "BIND_ADDRESS=$BIND_ADDRESS exposes the dashboard; set DASHBOARD_TOKEN in .env" >&2
+  exit 1
+fi
 PYTHON="${PYTHON:-python}"
 LOG_DIR="${LOG_DIR:-data/logs}"
 mkdir -p "$(dirname "${DATABASE_PATH:-data/pipeline.db}")" "$LOG_DIR"
@@ -53,7 +58,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$PYTHON" -m uvicorn app.main:get_app --factory --host 0.0.0.0 --port "$PORT" \
+"$PYTHON" -m uvicorn app.main:get_app --factory --host "$BIND_ADDRESS" --port "$PORT" \
   >"$LOG_DIR/api.log" 2>&1 &
 pids+=("$!")
 
@@ -76,6 +81,10 @@ echo "worker   running                  (log: $LOG_DIR/worker.log)"
 echo "env      ${DEVIN_MODE:-sim} devin / ${SLACK_MODE:-fake} slack"
 
 if [[ "${1:-}" == "--tunnel" ]]; then
+  [[ -n "${DASHBOARD_TOKEN:-}" ]] || {
+    echo "--tunnel makes the dashboard public; set DASHBOARD_TOKEN in .env" >&2
+    exit 1
+  }
   command -v cloudflared >/dev/null || {
     echo "cloudflared not found: https://github.com/cloudflare/cloudflared/releases" >&2
     exit 1

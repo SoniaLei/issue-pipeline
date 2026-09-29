@@ -23,8 +23,12 @@ webhook that waits on a third party is a webhook GitHub gives up on.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import FastAPI, Header, Query, Request, Response
@@ -49,6 +53,10 @@ from app.store import Store
 
 ENVS = ("live", "sim")
 
+# Authenticated by other means (the webhook's HMAC signature) or deliberately
+# public (liveness probes). Everything else needs DASHBOARD_TOKEN when it is set.
+OPEN_PATHS = frozenset({"/health", "/webhooks/github"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +69,8 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     app.state.settings = resolved
     app.state.store = backing
     app.state.intake = intake
+
+    _guard(app, resolved.dashboard_token)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -115,6 +125,46 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
 
     _mount_dashboard(app, resolved, backing)
     return app
+
+
+def _guard(app: FastAPI, token: str) -> None:
+    """Require DASHBOARD_TOKEN on everything outside OPEN_PATHS."""
+    if not token:
+        logger.warning(
+            "DASHBOARD_TOKEN is not set: /dashboard, /api and /report are open"
+        )
+        return
+
+    @app.middleware("http")
+    async def require_token(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path in OPEN_PATHS or _token_matches(
+            request.headers.get("authorization"), token
+        ):
+            return await call_next(request)
+        return PlainTextResponse(
+            "authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="issue-pipeline"'},
+        )
+
+
+def _token_matches(header: str | None, token: str) -> bool:
+    """`Bearer <token>`, or HTTP Basic with the token as the password (any
+    username), so a browser can use its native prompt."""
+    scheme, _, value = (header or "").partition(" ")
+    if scheme.lower() == "bearer":
+        supplied = value.strip()
+    elif scheme.lower() == "basic":
+        try:
+            decoded = base64.b64decode(value.strip(), validate=True).decode()
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+        supplied = decoded.partition(":")[2]
+    else:
+        return False
+    return hmac.compare_digest(supplied.encode(), token.encode())
 
 
 def _days(requested: str | None) -> int | None:
