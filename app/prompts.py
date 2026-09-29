@@ -39,6 +39,13 @@ def run_marker(run_id: str) -> str:
     return f"{MARKER_PREFIX}{run_id}{MARKER_SUFFIX}"
 
 
+def same_pr_url(a: str | None, b: str | None) -> bool:
+    """Whether two PR URLs name the same pull request."""
+    if not a or not b:
+        return False
+    return a.rstrip("/").lower() == b.rstrip("/").lower()
+
+
 def extract_marker(body: str | None) -> str | None:
     """Pull a run ID out of a PR body, if one is present.
 

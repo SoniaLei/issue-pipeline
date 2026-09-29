@@ -31,7 +31,7 @@ from typing import Any
 
 from app.config import Settings
 from app.notifications import build_payload, destination_is_operator, fingerprint, Kind
-from app.prompts import extract_marker
+from app.prompts import extract_marker, same_pr_url
 from app.review_gate import (
     finding_kind,
     gate_state,
@@ -100,6 +100,17 @@ def derive_checks_state(suites: list[sqlite3.Row]) -> str:
     if all(c in PASSING_CONCLUSIONS for c in conclusions):
         return "passed"
     return "unknown"
+
+
+def _primary_is_another_pr(run: sqlite3.Row, pull: dict[str, Any]) -> bool:
+    """Whether the run's primary PR, known by number from its webhook or by URL
+    from a session poll, is a different PR from `pull`. Only for PRs
+    `_correlate` refused: a poll's URL never stops GitHub attaching a PR."""
+    if run["pr_number"] is not None:
+        return int(run["pr_number"]) != int(pull["number"])
+    primary = run["pr_url"]
+    url = str(pull.get("html_url") or "")
+    return bool(primary) and bool(url) and not same_pr_url(primary, url)
 
 
 @dataclass(frozen=True)
@@ -413,6 +424,9 @@ class Intake:
 
         run = self._correlate(repo, pull)
         if run is None:
+            owner = self._run_with_another_pr(repo, pull)
+            if owner is not None and action in NOTIFYING_OPEN_ACTIONS:
+                return self._extra_pull_request(conn, owner, pull)
             # Every other PR on a public repository ends up here. Recorded, in
             # case a run is created later and reconciliation wants it.
             return IntakeResult(False, "PR does not belong to a tracked run")
@@ -534,6 +548,15 @@ class Intake:
                     else f"{action}:{head_sha}"
                 ),
             )
+            run = self.store.get_run(run_id)
+            if run is not None:
+                extra = json.loads(str(run["extra_pr_urls"]))
+                self._notify_scope_prs(
+                    conn,
+                    task_id,
+                    run_id,
+                    [url for url in extra if not same_pr_url(url, fields["pr_url"])],
+                )
         return IntakeResult(True, f"PR {action}", task_id=task_id, run_id=run_id)
 
     def _pull_request_closed(
@@ -591,22 +614,11 @@ class Intake:
         marker alone is not enough — it is public text in a public repository,
         and a stranger can paste it into their own pull request.
         """
-        head = pull.get("head") or {}
-        head_repo = str((head.get("repo") or {}).get("full_name") or "")
-        if head_repo and head_repo.lower() != repo.lower():
-            # A fork. Devin pushes to a branch on the repository itself, so a
-            # PR from elsewhere is somebody else's contribution.
-            return None
-
-        branch = str(head.get("ref") or "")
-        run = self.store.find_run_by_branch(repo, branch) if branch else None
-        if run is None:
-            marker = extract_marker(pull.get("body"))
-            if marker:
-                run = self.store.find_run_in_repo(repo, marker)
+        run = self._lookup_run(repo, pull)
         if run is None:
             return None
 
+        branch = str((pull.get("head") or {}).get("ref") or "")
         if run["branch"] and branch and str(run["branch"]) != branch:
             return None
 
@@ -616,6 +628,74 @@ class Intake:
             # signal for a human, not a second task.
             return None
         return run
+
+    def _lookup_run(self, repo: str, pull: dict[str, Any]) -> sqlite3.Row | None:
+        """The run a same-repository PR names by branch or marker, if any."""
+        head = pull.get("head") or {}
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        if head_repo and head_repo.lower() != repo.lower():
+            # A fork. Devin pushes to a branch on the repository itself, so a
+            # PR from elsewhere is somebody else's contribution.
+            return None
+        branch = str(head.get("ref") or "")
+        run = self.store.find_run_by_branch(repo, branch) if branch else None
+        if run is None:
+            marker = extract_marker(pull.get("body"))
+            if marker:
+                run = self.store.find_run_in_repo(repo, marker)
+        return run
+
+    def _run_with_another_pr(
+        self, repo: str, pull: dict[str, Any]
+    ) -> sqlite3.Row | None:
+        """The run this PR names when that run already owns a different PR."""
+        run = self._lookup_run(repo, pull)
+        if run is None or not _primary_is_another_pr(run, pull):
+            return None
+        return run
+
+    def _extra_pull_request(
+        self, conn: sqlite3.Connection, run: sqlite3.Row, pull: dict[str, Any]
+    ) -> IntakeResult:
+        """Record a run's second PR and tell a human, once per PR.
+
+        Until the primary PR's own webhook has queued the run's "PR opened"
+        anchor, the alert waits for it (see `_notify_scope_prs`), so it lands in
+        that PR's thread rather than top-level."""
+        run_id = str(run["id"])
+        task_id = int(run["task_id"])
+        url = str(pull.get("html_url") or "")
+        extra = json.loads(str(run["extra_pr_urls"] or "[]"))
+        if url and url not in extra:
+            extra.append(url)
+            self.store.update_run(conn, run_id, extra_pr_urls=json.dumps(extra))
+            self.store.record_event(
+                conn,
+                run_id=run_id,
+                task_id=task_id,
+                kind="pr",
+                reason="extra",
+                detail={"number": int(pull["number"]), "url": url},
+            )
+        if run["pr_number"] is not None:
+            self._notify_scope_prs(conn, task_id, run_id, [url])
+        return IntakeResult(
+            True, "extra PR recorded as a scope signal", task_id=task_id, run_id=run_id
+        )
+
+    def _notify_scope_prs(
+        self, conn: sqlite3.Connection, task_id: int, run_id: str, urls: list[str]
+    ) -> None:
+        for url in urls:
+            self._notify(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                kind=Kind.NEEDS_HUMAN,
+                reason="scope",
+                revision=f"scope:{url}",
+                detail=url,
+            )
 
     # -------------------------------------------------------------------- reviews
 

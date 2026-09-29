@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 from datetime import timedelta
 from typing import Any
@@ -260,6 +261,43 @@ def test_more_than_one_pr_is_recorded_rather_than_forked(
     assert run is not None
     assert run["pr_url"].endswith("/pull/1")
     assert "pull/2" in str(run["extra_pr_urls"])
+    # No primary webhook yet, so no anchor: the alert waits for it.
+    assert [n for n in store.all_notifications() if n["reason"] == "scope"] == []
+
+
+def test_the_primary_is_the_pr_github_attached_not_the_first_listed(
+    store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    devin = SimulatedDevinClient(
+        script=[
+            {"status": "new"},
+            {
+                "status": "running",
+                "status_detail": "finished",
+                "pull_requests": [
+                    {"pr_url": "https://github.com/x/y/pull/1", "pr_state": "open"},
+                    {"pr_url": "https://github.com/x/y/pull/2", "pr_state": "open"},
+                ],
+            },
+        ]
+    )
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = queued(Intake(store, settings))
+    worker.advance_one()
+    with store.transaction() as conn:
+        store.update_run(
+            conn, run_id, pr_url="https://github.com/x/y/pull/2", pr_number=2
+        )
+    for _ in range(2):
+        worker.advance_one()
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["pr_url"].endswith("/pull/2")
+    assert json.loads(run["extra_pr_urls"]) == ["https://github.com/x/y/pull/1"]
+    scope = [n for n in store.all_notifications() if n["reason"] == "scope"]
+    assert len(scope) == 1
+    assert "Detail: https://github.com/x/y/pull/1" in str(scope[0]["payload"])
 
 
 def test_a_poll_never_moves_a_run_github_already_put_at_pr_open(
