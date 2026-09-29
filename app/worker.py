@@ -116,6 +116,14 @@ def _session_finished(insights: SessionInsights) -> bool:
 GITHUB_OWNED: frozenset[State] = frozenset({State.PR_OPEN, State.AWAITING_REVIEW})
 
 
+# Deliveries are pruned at most this often; the retention window is days.
+PRUNE_INTERVAL_SECONDS = 3600
+# A failed prune is retried after 1, 2 and 4 minutes, then waits for the next
+# interval.
+PRUNE_RETRY_BASE_SECONDS = 60
+PRUNE_MAX_RETRIES = 3
+
+
 class Worker:
     """One iteration of work: advance a run, then drain the outbox."""
 
@@ -134,6 +142,8 @@ class Worker:
         self.slack = slack
         self.owner = owner or f"{socket.gethostname()}-{id(self)}"
         self._metrics_dirty = False
+        self._next_prune_at = 0.0
+        self._prune_failures = 0
 
     # ------------------------------------------------------------------ main loop
 
@@ -147,6 +157,7 @@ class Worker:
         """Advance at most one run, deliver due notifications, and on a tick
         with no run to advance, make one analytics read."""
         self.store.heartbeat("worker", self.owner)
+        self.prune_deliveries()
         advanced = self.advance_one()
         delivered = self.drain_outbox()
         reviewed = False
@@ -167,6 +178,30 @@ class Worker:
             except Exception:
                 logger.exception("analytics refresh failed")
         return advanced or delivered > 0
+
+    def prune_deliveries(self) -> int:
+        """Drop raw delivery bodies older than DELIVERY_RETENTION_DAYS (D-014),
+        at most once per PRUNE_INTERVAL_SECONDS. Zero or less keeps them all."""
+        now = time.monotonic()
+        if self.settings.delivery_retention_days <= 0 or now < self._next_prune_at:
+            return 0
+        try:
+            removed = self.store.prune_deliveries(self.settings.delivery_retention_days)
+        except sqlite3.Error:
+            self._prune_failures += 1
+            if self._prune_failures > PRUNE_MAX_RETRIES:
+                self._prune_failures = 0
+                delay = PRUNE_INTERVAL_SECONDS
+            else:
+                delay = PRUNE_RETRY_BASE_SECONDS * 2 ** (self._prune_failures - 1)
+            self._next_prune_at = now + delay
+            logger.exception("pruning deliveries failed; next attempt in %ds", delay)
+            return 0
+        self._prune_failures = 0
+        self._next_prune_at = now + PRUNE_INTERVAL_SECONDS
+        if removed:
+            logger.info("pruned %d deliveries", removed)
+        return removed
 
     def advance_one(self) -> bool:
         run = self.store.claim_run(self.owner, self.settings.lease_seconds)
