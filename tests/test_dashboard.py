@@ -576,3 +576,32 @@ def test_repo_picker_folds_names_that_differ_only_in_case(
     assert entry["repo"].lower() == REPO.lower()
     assert board["repo"] == entry["repo"]
     assert board["totals"]["tasks"] == 2
+
+
+def test_throughput_window_is_adjustable(
+    client: TestClient, intake: Intake, worker: Worker, store: Store
+) -> None:
+    run_id = run_to_pr(intake, worker, store)
+    send(intake, "pull_request", "pr_merged.json", run_id)
+    today = utcnow().date().isoformat()
+    later = utcnow() + timedelta(days=20)
+
+    default = build_dashboard(store, "sim", now=later)
+    assert default["throughput_days"] == 14
+    assert len(default["throughput"]) == 14
+    assert all(d["merged"] == 0 for d in default["throughput"])
+
+    wide = build_dashboard(store, "sim", now=later, days=30)
+    assert wide["throughput_days"] == 30
+    assert len(wide["throughput"]) == 30
+    assert wide["throughput"][-21] == {"day": today, "verified": 0, "merged": 1}
+    with pytest.raises(ValueError, match="days"):
+        build_dashboard(store, "sim", days=91)
+
+    api = client.get("/api/dashboard?env=sim&days=7").json()
+    assert api["throughput_days"] == 7
+    assert len(api["throughput"]) == 7
+    assert api["throughput"][-1]["merged"] == 1
+    assert len(client.get("/api/dashboard?env=sim").json()["throughput"]) == 14
+    for bad in ("0", "91", "abc", "-3", "\u00b2", "9" * 5000):
+        assert client.get(f"/api/dashboard?days={bad}").status_code == 400

@@ -226,7 +226,8 @@ shown as its own fact and is required for merge regardless of any of the above.
 Sections: **current workload** (queued, running, PR opened, awaiting review,
 blocked, failed), **results** (opened / verified / merged), **speed** (median and
 p90 from maintainer approval to first verification, with the sample count),
-**throughput** (verified and merged per UTC day, last 14 days), **needs
+**throughput** (verified and merged per UTC day, last 14 days by default;
+`?days=N` or the header picker sets 1 to 90), **needs
 attention** (blocker, age, next action), **integration health** (last GitHub
 delivery, last Devin poll, worker heartbeat, Slack failures) and the **task
 table** — issue, state, elapsed, tests, PR, Slack status, last update. The

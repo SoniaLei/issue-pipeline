@@ -136,6 +136,7 @@ WORKLOAD_BUCKETS = (
 )
 
 THROUGHPUT_DAYS = 14
+MAX_THROUGHPUT_DAYS = 90
 
 
 def _parse(value: Any) -> datetime | None:
@@ -551,7 +552,7 @@ def _speed(values: list[float]) -> dict[str, Any]:
 
 
 def _throughput(
-    store: Store, env_runs: set[str], now: datetime
+    store: Store, env_runs: set[str], now: datetime, days: int
 ) -> list[dict[str, Any]]:
     """Verified and merged counts per UTC day, most recent last."""
     verified: dict[str, set[str]] = defaultdict(set)
@@ -565,13 +566,13 @@ def _throughput(
             verified[day].add(run_id)
         elif event["kind"] == "state" and event["to_state"] == State.MERGED.value:
             merged[day].add(run_id)
-    days = []
-    for offset in range(THROUGHPUT_DAYS - 1, -1, -1):
+    series = []
+    for offset in range(days - 1, -1, -1):
         day = (now - timedelta(days=offset)).date().isoformat()
-        days.append(
+        series.append(
             {"day": day, "verified": len(verified[day]), "merged": len(merged[day])}
         )
-    return days
+    return series
 
 
 def _health(
@@ -809,13 +810,18 @@ def build_dashboard(
     worker_stale_after_seconds: int = 300,
     review_gate_mode: str = DEFAULT_REVIEW_GATE_MODE,
     repo: str | None = None,
+    days: int = THROUGHPUT_DAYS,
 ) -> dict[str, Any]:
     """Everything the overview page shows, for one environment.
 
     ``repo`` narrows every per-run figure to one repository. The Devin
     analytics cross-check stays across all repositories, because Devin counts
     per service user, not per repository.
+
+    ``days`` is the length of the throughput series, in UTC days ending today.
     """
+    if not 1 <= days <= MAX_THROUGHPUT_DAYS:
+        raise ValueError(f"days must be between 1 and {MAX_THROUGHPUT_DAYS}")
     current = now or utcnow()
     rows = store.list_runs(env)
     all_runs = [_run_view(store, row, current, review_gate_mode) for row in rows]
@@ -918,7 +924,8 @@ def build_dashboard(
         "workload": workload,
         "results": results,
         "speed": speed,
-        "throughput": _throughput(store, {r["run_id"] for r in runs}, current),
+        "throughput_days": days,
+        "throughput": _throughput(store, {r["run_id"] for r in runs}, current, days),
         "cost": _cost(runs),
         "attention": attention,
         "health": health,

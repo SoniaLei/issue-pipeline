@@ -36,7 +36,12 @@ from fastapi.responses import (
 )
 
 from app.config import load_settings, Settings
-from app.dashboard import build_dashboard, build_timeline
+from app.dashboard import (
+    build_dashboard,
+    build_timeline,
+    MAX_THROUGHPUT_DAYS,
+    THROUGHPUT_DAYS,
+)
 from app.dashboard_page import render_page, STATIC_DIR
 from app.intake import Intake, verify_signature
 from app.reporting import build_report, render_text
@@ -112,6 +117,15 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     return app
 
 
+def _days(requested: str | None) -> int | None:
+    if not requested:
+        return THROUGHPUT_DAYS
+    if not (requested.isascii() and requested.isdigit()) or len(requested) > 3:
+        return None
+    days = int(requested)
+    return days if 1 <= days <= MAX_THROUGHPUT_DAYS else None
+
+
 def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
     """Read-only reporting routes. Nothing here writes to a run."""
 
@@ -122,11 +136,19 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
 
     @app.get("/api/dashboard")
     def api_dashboard(
-        env: str | None = Query(default=None), repo: str | None = Query(default=None)
+        env: str | None = Query(default=None),
+        repo: str | None = Query(default=None),
+        days: str | None = Query(default=None),
     ) -> Response:
         chosen = _env(env)
         if chosen is None:
             return JSONResponse({"detail": "env must be live or sim"}, status_code=400)
+        window = _days(days)
+        if window is None:
+            return JSONResponse(
+                {"detail": f"days must be 1 to {MAX_THROUGHPUT_DAYS}"},
+                status_code=400,
+            )
         store.heartbeat("api", "api")
         return JSONResponse(
             build_dashboard(
@@ -137,6 +159,7 @@ def _mount_dashboard(app: FastAPI, settings: Settings, store: Store) -> None:
                 ),
                 review_gate_mode=settings.review_gate_mode,
                 repo=(repo or "").strip() or None,
+                days=window,
             )
         )
 
