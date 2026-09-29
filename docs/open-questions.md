@@ -7,10 +7,18 @@ non-answer still leaves a defensible default.
 Blocking questions must be answered before the code that depends on them is
 written. Non-blocking ones have a working default and can be revisited.
 
-**Status**: no blocking question remains open. Q-001, Q-002, Q-004, Q-005,
-Q-006, Q-014 and Q-015 are decided; Q-007 is resolved by API verification;
-Q-003 is reduced to a routing choice with a recommended default. The remainder
-are non-blocking and running on their recommendations.
+**Status** (reviewed against the code on 2026-09-29): no blocking question
+remains open.
+
+- **Decided:** Q-001, Q-002, Q-004, Q-005 (concurrency), Q-006, Q-014, Q-015,
+  and Q-021 (by D-032).
+- **Resolved by API verification:** Q-007.
+- **Resolved, recommendation implemented:** Q-003, Q-008, Q-009, Q-010 and
+  Q-017.
+- **Still open**, each running on a default. The *Current behaviour* line under
+  each question says where that default differs from its recommendation:
+  - Q-011, Q-012 (tracked in issue #9), Q-013, Q-016, Q-018, Q-019 and Q-020;
+  - Q-022, which waits on D-037.
 
 Two decided values are provisional by design and expected to change: the daily
 session cap (10, never explicitly confirmed) and the ACU ceiling (20, a
@@ -78,7 +86,7 @@ register.
 
 ---
 
-## Q-003 — What exactly counts as "blocked"? *(blocking — narrowed)*
+## Q-003 — What exactly counts as "blocked"? — **RESOLVED: operator conditions route separately**
 
 The conditions are no longer ambiguous: v3's `status_detail` distinguishes them
 directly. What remains is a routing choice, not a detection problem.
@@ -106,8 +114,19 @@ maintainer-facing. The routing table already supports it and the split costs
 nothing now. v1 still covers only the session-side conditions; the GitHub-side
 three arrive with check evaluation (D-011).
 
-**Blocks**: the notification taxonomy in `notifications.py` and the destination
-map.
+**Resolved.** The recommendation is implemented:
+
+- The `capacity`, `session_error` and `uncertain_create` reasons
+  (`OPERATOR_REASONS` in `app/notifications.py`) go to `OPERATOR_DESTINATION`
+  (default `automation-alerts`), via `Settings.destination_for` in
+  `app/config.py`.
+- Everything else goes to the repository's destination or
+  `engineering-updates`.
+- On the GitHub side, failed checks and a human's `changes_requested` review
+  are announced in the PR's thread (D-036).
+
+Merge conflicts are still not detected, because the service never reads
+`mergeable` state.
 
 ---
 
@@ -163,15 +182,17 @@ Requested permissions, least-privilege for v1:
 | Issues | Read & write | intake, label state; write only if Q-020 lands |
 | Pull requests | Read | correlation, draft/merge state |
 | Contents | Read | baseline revision, setup files |
-| Checks / Commit statuses | Read | deferred to check evaluation (D-011) |
+| Checks / Commit statuses | Read | current-head check suites for verification (D-030, D-033) |
 | Metadata | Read | mandatory |
 
 No write to Contents and no merge permission — the App must be incapable of
 merging, not merely instructed not to (D-005 rationale, applied to credentials).
 Devin pushes its branch under its own GitHub authentication, not the App's.
 
-Events subscribed: `issues`, `pull_request`, `pull_request_review`, and
-`check_suite` / `status` once verification lands.
+Events subscribed: `issues`, `pull_request`, `pull_request_review`,
+`pull_request_review_comment` (Devin Review findings) and `check_suite`
+(`SUPPORTED_EVENTS` in `app/intake.py`). The legacy `status` event is not
+consumed.
 
 **Recorded in**: D-027.
 
@@ -198,7 +219,7 @@ Q-014.
 
 ---
 
-## Q-008 — What is the grace period before `no_output`? *(non-blocking)*
+## Q-008 — What is the grace period before `no_output`? — **RESOLVED: 5 minutes, configurable**
 
 A session can report `finished` marginally before its PR is visible to us.
 Declaring `no_output` too eagerly produces a false "needs human" notification;
@@ -209,9 +230,12 @@ no correlated PR, then `no_output`. Note `finished` is a detail under `running`,
 not a terminal status — a poll that reads only `status` never reaches this
 condition at all.
 
+**Resolved.** Implemented as recommended: `NO_OUTPUT_GRACE_SECONDS`, default
+300, is applied by `Worker._grace_verdict` in `app/worker.py`.
+
 ---
 
-## Q-009 — One Slack channel or per-repository routing? *(non-blocking)*
+## Q-009 — One Slack channel or per-repository routing? — **RESOLVED: per-repository map with a default**
 
 The design says "configured Slack channels", plural. Routing per repository is
 cheap now (a config map, with the channel stored on the outbox row) and
@@ -223,9 +247,14 @@ rather than optional: a destination must never be derivable from issue text
 (D-023). Q-003 adds a second axis — operator conditions to a separate
 destination from maintainer conditions.
 
+**Resolved.** Implemented as recommended. `REPO_DESTINATIONS` maps a repository
+to a destination key, with `DEFAULT_DESTINATION` as the fallback.
+`SLACK_DESTINATIONS` and `SLACK_CHANNELS` resolve a key to a webhook URL or
+channel ID, and the chosen key is stored on each outbox row.
+
 ---
 
-## Q-010 — Who can trigger a rerun, and how? *(non-blocking)*
+## Q-010 — Who can trigger a rerun, and how? — **RESOLVED: re-apply the label**
 
 Runs in `no_output`, `expired`, `failed` or `cancelled` are terminal, and a
 retry needs a new run ID from an explicit action. The trigger is unspecified.
@@ -236,6 +265,14 @@ retry needs a new run ID from an explicit action. The trigger is unspecified.
 **Recommendation**: label re-application for v1. It reuses the authorization
 path exactly, and an operator endpoint is a second authorization surface to
 secure.
+
+**Resolved.** Implemented as recommended; there is no rerun endpoint. When an
+authorized maintainer applies `devin-ready` to a task with no active run,
+`Intake._approve` in `app/intake.py` creates a new queued run. Re-applying it
+while a run is active only reinstates a withdrawn approval, and never starts a
+second run. That reinstatement is covered by
+`test_relabel_by_a_maintainer_reinstates_approval_without_a_second_run`. The
+new-run-after-a-terminal-run path has no dedicated test yet.
 
 ---
 
@@ -248,6 +285,9 @@ pipeline close the issue, comment on it, or leave it alone?
 GitHub's `Fixes #N` linkage or to a human. Writing to a public issue is a
 visible action and should be conservative.
 
+**Current behaviour**: the pipeline never writes to GitHub, so the issue is
+left alone. Open, together with Q-020.
+
 ---
 
 ## Q-012 — Delivery retention window? *(non-blocking)*
@@ -256,6 +296,10 @@ visible action and should be conservative.
 a public repository. Retention has a storage cost and a tidiness cost.
 
 **Recommendation**: 30 days, pruned by the worker.
+
+**Current behaviour**: `DELIVERY_RETENTION_DAYS` (default 30) is read and
+`Store.prune_deliveries` exists, but nothing calls it, so deliveries are kept
+forever. Tracked in issue #9.
 
 ---
 
@@ -266,6 +310,11 @@ Session URLs in particular should not be public.
 
 **Recommendation**: bind it to localhost, or put it behind a shared secret. Do
 not expose it unauthenticated alongside the public webhook endpoint.
+
+**Current behaviour**: not followed. `/report`, `/report.txt`, `/dashboard` and
+`/api/*` have no authentication and are served by the same app as `/webhook`.
+`scripts/run_live.sh` binds `0.0.0.0`, and with `--tunnel` all of them are
+public. This needs a call before the service is hosted.
 
 ---
 
@@ -330,9 +379,13 @@ maintained alongside the service.
 **Recommendation**: playbook. Confirm who owns it — it is the closest thing the
 pipeline has to a quality standard, and it should not be edited casually.
 
+**Current behaviour**: `DEVIN_PLAYBOOK_ID` is optional and is passed when set.
+`app/prompts.py` also restates the contract, so a deployment without a
+playbook still carries it. Who owns the playbook is still unconfirmed.
+
 ---
 
-## Q-017 — Which secrets does a session actually need? *(non-blocking)*
+## Q-017 — Which secrets does a session actually need? — **RESOLVED: explicit list, empty by default**
 
 D-021 requires an explicit `secret_ids` list because omitting it grants all
 organization secrets. That needs a per-repository answer.
@@ -340,6 +393,12 @@ organization secrets. That needs a per-repository answer.
 **Recommendation**: start with an empty list and add only what the repository's
 setup genuinely fails without. A public repository's test suite usually needs
 nothing.
+
+**Resolved.** Implemented as recommended. `DEVIN_SECRET_IDS` is empty by
+default, and the create call always sends `secret_ids`, as an empty list if
+nothing is set (`app/devin_client.py`). That list is never omitted, so a session
+never inherits every organization secret (D-021). Any additions are per
+deployment.
 
 ---
 
@@ -354,6 +413,13 @@ change outgrew its scope, which a reviewer would want to know.
 **Recommendation**: yes, as a `needs_human` with reason `scope`. Cheap, and
 scope creep is exactly the thing a review gate exists to catch.
 
+**Current behaviour**: only half done:
+
+- The worker records additional PRs from the session poll in `extra_pr_urls`,
+  and the webhook path ignores a second PR for a run that already has one.
+- The `scope` reason text exists in `app/notifications.py`, but nothing raises
+  it, so no notification is sent.
+
 ---
 
 ## Q-019 — Retention and visibility of `structured_output`? *(non-blocking)*
@@ -366,6 +432,10 @@ at all.
 
 **Recommendation**: report only, except `reproduction_note` on a
 `not_reproducible` outcome, which is the whole content of that notification.
+
+**Current behaviour**: structured output is stored on the run and shown only in
+the report and the dashboard. No Slack message includes it, not even
+`reproduction_note`.
 
 ---
 
@@ -380,9 +450,11 @@ people outside Slack, which on a public repository is everyone. Deliberately
 not a status feed. Related to Q-011 (post-merge comment); if both land, they
 should be one consistent voice.
 
+**Current behaviour**: the pipeline makes no GitHub writes. Open.
+
 ---
 
-## Q-021 — Which consumption source is authoritative for reporting? *(non-blocking)*
+## Q-021 — Which consumption source is authoritative for reporting? — **DECIDED: labelled precedence (D-032)**
 
 Two now exist. `acus_consumed` on the session response is live but reflects the
 session's current state; the consumption endpoints are billing-aligned and
@@ -400,6 +472,14 @@ pipeline-wide spend view and reconcile against billing. Do not sum
 `acus_consumed` across runs and call it the pipeline's spend: the day boundary
 is PST, so the two will not agree, and the endpoint is the one that matches the
 invoice.
+
+**Decided by D-032**, which refines the recommendation:
+
+- The dashboard shows billing-grade daily consumption when it exists, then the
+  insights total, then the poll's `acus_consumed`, and names the source it used.
+- Unpriced sessions are counted under *awaiting cost* instead of as zero.
+- `acus_consumed` is still recorded on every run for the Q-015 tightening
+  procedure.
 
 ---
 
