@@ -209,3 +209,91 @@ def test_reopen_by_a_maintainer_re_approves_a_labelled_issue(
     )
     assert not result.accepted
     assert store.active_run_for_task(int(result.task_id or 0)) is None
+
+
+def _issue_event(action: str, updated_at: str | None, **issue: object) -> dict:
+    payload = load_fixture("issue_labeled.json")
+    payload["action"] = action
+    payload.pop("label", None)
+    if updated_at is not None:
+        payload["issue"]["updated_at"] = updated_at
+    payload["issue"].update(issue)
+    return payload
+
+
+def test_a_close_overtaken_by_its_reopen_does_not_cancel(
+    intake: Intake, store: Store
+) -> None:
+    labeled = load_fixture("issue_labeled.json")
+    labeled["issue"]["updated_at"] = "2026-09-28T10:00:00Z"
+    queued = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=labeled
+    )
+    assert queued.accepted
+    assert queued.run_id
+
+    # GitHub delivers the reopen (10:02) before the close (10:01) it followed.
+    reopened = _issue_event("reopened", "2026-09-28T10:02:00Z", state="open")
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=reopened
+    )
+    assert result.accepted
+    late_close = _issue_event("closed", "2026-09-28T10:01:00Z", state="closed")
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=late_close
+    )
+    assert not result.accepted
+    assert result.reason.startswith("stale delivery")
+
+    run = store.get_run(str(queued.run_id))
+    assert run is not None
+    assert run["state"] == State.QUEUED.value
+    task = store.get_task(int(run["task_id"]))
+    assert task is not None
+    assert task["issue_state"] == "open"
+    assert task["issue_updated_at"] == "2026-09-28T10:02:00Z"
+
+    # A close that really is later still cancels.
+    close = _issue_event("closed", "2026-09-28T10:03:00Z", state="closed")
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=close
+    )
+    assert result.accepted
+    run = store.get_run(str(queued.run_id))
+    assert run is not None
+    assert run["state"] == State.CANCELLED.value
+
+
+def test_a_label_overtaken_by_its_removal_does_not_approve(
+    intake: Intake, store: Store
+) -> None:
+    opened = _issue_event("opened", "2026-09-28T10:00:00Z", labels=[])
+    intake.handle(delivery_id=next_delivery_id(), event="issues", payload=opened)
+
+    # `unlabeled` (10:02) arrives first; the `labeled` (10:01) it undid follows.
+    unlabeled = _issue_event("unlabeled", "2026-09-28T10:02:00Z", labels=[])
+    unlabeled["label"] = {"name": "devin-ready"}
+    intake.handle(delivery_id=next_delivery_id(), event="issues", payload=unlabeled)
+    labeled = load_fixture("issue_labeled.json")
+    labeled["issue"]["updated_at"] = "2026-09-28T10:01:00Z"
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=labeled
+    )
+    assert not result.accepted
+    assert result.reason.startswith("stale delivery")
+    assert store.active_run_for_task(int(result.task_id or 0)) is None
+
+
+def test_deliveries_without_timestamps_are_applied_in_arrival_order(
+    intake: Intake, store: Store
+) -> None:
+    queued = deliver(intake, "issues", "issue_labeled.json")
+    closed = _issue_event("closed", None, state="closed")
+    assert "updated_at" not in closed["issue"]
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=closed
+    )
+    assert result.accepted
+    run = store.get_run(str(queued.run_id))
+    assert run is not None
+    assert run["state"] == State.CANCELLED.value
