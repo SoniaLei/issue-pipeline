@@ -1,0 +1,28 @@
+{
+  "profile_id": "csprof-2f17d866c09f4abb98cbc8fa2b0360dc",
+  "name": "Deps, code and secrets (from nightly scan)",
+  "description": "Ported from the \"Nightly security scan (authorized repos)\" automation and its !security_scan playbook. Covers known-vulnerable dependencies (Python + npm), high-risk code reachable from untrusted callers, and committed secrets. Reports high/critical only and respects each repo's SECURITY.md / AGENTS.md rules.",
+  "visibility": "org",
+  "org_id": "org-319ec3944f4f4ba199cd7806b6899a5b",
+  "scan_type": "security",
+  "mode": "discover",
+  "include_globs": null,
+  "exclude_globs": [
+    "**/node_modules/**",
+    "**/tests/**",
+    "**/test/**",
+    "**/migrations/**"
+  ],
+  "scan_paths": null,
+  "threat_model_guidance": "Scan the repository's default branch for three classes of risk:\n1. Known-vulnerable dependencies. Python: requirements*.txt, requirements/*.txt, pyproject.toml, poetry.lock, uv.lock, Pipfile.lock. Node: every package-lock.json outside node_modules, production dependencies only (omit dev). In large monorepos (e.g. Apache Superset) prioritise the production sets (requirements/base.txt, the app's package-lock.json) over development ones. Record any other ecosystem found (Go, Maven, Cargo, ...) as \"not covered\".\n2. High-risk code patterns (injection, unsafe deserialization, command execution, auth/permission bypass, SSRF, etc.) where the flagged input can actually reach the sink from a caller that the repository's own security model treats as untrusted.\n3. Secrets committed to the repository history (API keys, tokens, private keys, credentials).\nBefore assessing anything, read SECURITY.md, AGENTS.md and CONTRIBUTING.md if present and use their role/capability model and attacker principals as the threat model.",
+  "investigation_guidance": "Dependencies: for Python use pip-audit against pinned requirements (export lockfile-based projects first); pip-audit reports no severity, so resolve each advisory's GHSA alias via https://api.osv.dev/v1/vulns/<id> and read database_specific.severity, or compute the CVSS base score from the OSV vector when there is no GHSA alias. For Node use `npm audit --package-lock-only --omit=dev` from each lockfile's directory, using the repo's declared npm version (packageManager / engines.npm) when set; never run npm install or npm audit fix. For transitive npm packages, identify the direct dependency that pulls it in.\nCode: bandit-style high-severity/high-confidence hits are only candidates; read the code and confirm an untrusted caller can reach the flagged input.\nSecrets: gitleaks-style scan of git history with redaction. Never copy, print or unredact a secret value.",
+  "triage_guidance": "Report only high and critical findings; drop anything below high. Group every advisory for one package into a single finding (dedupe repeated advisory IDs). Drop pattern-only code matches that no untrusted caller can reach \u2014 e.g. on Apache Superset, bandit B324 md5 calls used for non-security hashing (file fingerprints, UUID namespaces, function signatures) are not findings. Drop secret hits in test fixtures, docs, or documented example values. If the repository's AGENTS.md / SECURITY.md requires a finding to name the violated role/capability row and the attacker principal and you cannot name both (typical for dependency advisories), keep it but label it as a \"security question\" rather than a confirmed vulnerability.",
+  "validation_guidance": null,
+  "validation_severities": null,
+  "report_guidance": "For each finding state the severity and: for a dependency, package + installed version + advisory IDs + fixed version (and the direct dependency for transitive npm packages); for code, path + line range + why it is exploitable and by which principal; for a secret, only the rule, file, line and commit (never the value). Include the suggested remediation (upgrade target, code change, or \"rotate the credential, then remove it from history\"). Per repository, list ecosystems scanned and not covered, and any tool or step that failed (a failure is not \"no findings\").",
+  "communication_guidance": null,
+  "remediation_guidance": "Follow the repository's AGENTS.md, SECURITY.md and CONTRIBUTING.md. For leaked secrets, recommend rotation first and never rewrite git history. Never print a secret value in a PR, commit, log or message. Keep dependency fixes to the minimal upgrade that clears the advisory.",
+  "ingestion_source_guidance": null,
+  "post_ingestion_guidance": null,
+  "type_config": null
+}
