@@ -159,7 +159,7 @@ def test_later_events_by_a_maintainer_do_not_adopt_an_untrusted_label(
 ) -> None:
     rejected = deliver(intake, "issues", "issue_labeled_untrusted.json")
     assert not rejected.accepted
-    for action, label in (("edited", None), ("labeled", "bug"), ("reopened", None)):
+    for action, label in (("edited", None), ("labeled", "bug")):
         payload = load_fixture("issue_labeled.json")
         payload["action"] = action
         if label is None:
@@ -172,3 +172,40 @@ def test_later_events_by_a_maintainer_do_not_adopt_an_untrusted_label(
         assert "queued" not in result.reason, action
         run = store.active_run_for_task(int(rejected.task_id or 0))
         assert run is None or run["state"] == State.AWAITING_APPROVAL.value, action
+
+
+def test_reopen_by_a_maintainer_re_approves_a_labelled_issue(
+    intake: Intake, store: Store
+) -> None:
+    queued = deliver(intake, "issues", "issue_labeled.json")
+    closed = load_fixture("issue_labeled.json")
+    closed["action"] = "closed"
+    closed.pop("label", None)
+    intake.handle(delivery_id=next_delivery_id(), event="issues", payload=closed)
+    first = store.get_run(str(queued.run_id))
+    assert first is not None
+    assert first["state"] == State.CANCELLED.value
+
+    reopened = load_fixture("issue_labeled.json")
+    reopened["action"] = "reopened"
+    reopened.pop("label", None)
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=reopened
+    )
+    assert result.accepted
+    assert result.reason == "run queued from reopened"
+    run = store.active_run_for_task(int(result.task_id or 0))
+    assert run is not None
+    assert run["state"] == State.QUEUED.value
+    assert run["approved_by"] == "SoniaLei"
+    assert run["id"] != first["id"]
+
+    # The same reopen by someone outside the allowlist is recorded, not acted on.
+    reopened["sender"] = {"login": "drive-by"}
+    with store.transaction() as conn:
+        store.update_run(conn, str(run["id"]), state=State.CANCELLED.value)
+    result = intake.handle(
+        delivery_id=next_delivery_id(), event="issues", payload=reopened
+    )
+    assert not result.accepted
+    assert store.active_run_for_task(int(result.task_id or 0)) is None

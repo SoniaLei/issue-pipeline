@@ -1031,3 +1031,40 @@ using the environment blueprint's toolchain.
 **Revisit when** a second repository has run the sweep for a month. Keep the
 layering if its findings were acted on at a rate similar to this repository's.
 Narrow its manifest if they were not.
+
+---
+
+## D-038 — Which issue events carry an approval decision
+
+**Status**: accepted (maintainer decision on issue #10)
+
+D-001 says the actor is checked, not the label. That still leaves the question
+of *which* events are read as that actor deciding to spend. Issue #10 showed the
+risk of getting it wrong: if any later event on a labelled issue re-runs the
+gate, an untrusted `devin-ready` is adopted as approval by the next unrelated
+maintainer action — an edit, a `bug` label, a reopen.
+
+The events that authorize a run on an issue carrying `devin-ready` are:
+
+- `labeled` with `devin-ready` — the sender put the label there.
+- `opened` with the label already present — the author opened it that way.
+- `reopened` — the sender chose to bring this issue back into play, label and
+  all. A closed issue's run was cancelled or finished; reopening it is a
+  decision about this issue, so an allowlisted maintainer's reopen re-approves
+  without having to remove and re-apply the label.
+
+`edited`, `unlabeled` of another label, and `labeled` with any other label are
+not decisions about spend and never authorize, whoever sends them. A reopen by
+someone outside the allowlist is recorded like a drive-by `opened` and starts
+nothing.
+
+**Why reopen counts.** The maintainer's expectation was the natural one: "I
+reopened it, it still says `devin-ready`, so Devin should pick it back up."
+Requiring a remove-and-re-apply of the label to express that is a hidden rule.
+The sender is still checked, so the untrusted-label case in issue #10 stays
+closed: an outsider's reopen does not spend, and a maintainer's reopen is the
+maintainer's own act.
+
+**Revisit if** reopen is used for bookkeeping unrelated to wanting work done
+(a triage bot that reopens stale issues, say). Then reopen should drop back to
+"awaiting approval" and the label must be re-applied.
