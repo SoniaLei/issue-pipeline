@@ -236,7 +236,14 @@ def _checks_view(store: Store, run: sqlite3.Row) -> dict[str, Any]:
         if head
         else []
     )
-    return {"state": state, "head_sha": head, "suites": suites}
+    return {
+        "state": state,
+        "head_sha": head,
+        "suites": suites,
+        # What the base branch's protection requires, as last read from the
+        # API (D-041). Shown beside the suites; `state` does not use it.
+        "required": _json(run["required_checks"]) or [],
+    }
 
 
 def _tests_view(store: Store, run: sqlite3.Row) -> dict[str, Any]:

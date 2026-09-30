@@ -33,13 +33,15 @@ Two processes run under Docker Compose against a shared database volume:
 | Process | Responsibility |
 | --- | --- |
 | `api` | Receives webhooks, validates and persists them, serves the report and health endpoints. Performs no external calls on the request path. |
-| `worker` | Claims queued work under a lease, creates and polls Devin sessions, recovers orphaned sessions by tag, drains the notification outbox. |
+| `worker` | Claims queued work under a lease, creates and polls Devin sessions, recovers orphaned sessions by tag, drains the notification outbox, and when idle re-reads one active run's issue and PR from the GitHub API (§6). |
 
 GitHub remains the source of truth for issues, pull requests, checks, reviews and
 merges. The database holds our own task state and a cache of the last observed
-GitHub state; on any disagreement, GitHub wins. The service makes no GitHub API
-calls, so it learns GitHub state only from webhooks, and a missed delivery is not
-repaired automatically (see *Reconciliation* in §6).
+GitHub state; on any disagreement, GitHub wins. The service learns GitHub state
+from webhooks first, and with `GITHUB_MODE=live` also from read-only API
+re-reads that repair missed deliveries (see *Reconciliation* in §6, D-041). The
+REST arrow in the diagram is `GET` only: the service never merges, pushes,
+approves or comments.
 
 ### Webhook directions
 
@@ -247,10 +249,11 @@ against the actor, not the label:
   the newest one already applied to the task is recorded as stale and changes
   nothing (D-040). Without this, a `closed` overtaken by the `reopened` that
   followed it would cancel the run the reopen had just approved.
-- The issue is *not* re-fetched from the API before starting. There is no
-  GitHub API client yet (§6, §14 item 7); the ordered webhook snapshot is what the
-  worker starts from, and an issue closed or unlabelled after that snapshot
-  is caught only if its delivery arrives before the session is created.
+- The issue is *not* re-fetched from the API immediately before starting. The
+  ordered webhook snapshot is what the worker starts from; an issue closed or
+  unlabelled after that snapshot is caught if its delivery arrives, or the
+  reconciler's next read lands (§6, D-041), before the session is created.
+  The window is bounded by `RECONCILE_INTERVAL_SECONDS`, not closed.
 - The approving actor and the time of approval are stored on the run.
 - An issue comment never authorizes work, from anyone.
 
@@ -296,17 +299,30 @@ Two consequences worth stating plainly:
   transaction as the state change that produced them, then delivered by the
   worker with retries. This is what makes "state changed but Slack never heard"
   impossible.
-- **Reconciliation (partial).** The intended design compares every live task
-  against current GitHub and Devin state on an interval, as the safety net for
-  missed, dropped or out-of-order deliveries and for recovery after downtime.
-  Only the Devin half is built: the worker polls each live session, and an
-  ambiguous session-create is recovered by tag lookup (§8). There is no GitHub
-  half. A missed or unmatched GitHub delivery is not re-fetched or re-evaluated;
-  it stays in `deliveries` for a human to inspect (§7). Out-of-order delivery
-  of `issues` events is handled without the API: the payload's own
-  `issue.updated_at` orders them, and an overtaken delivery is recorded as
-  stale rather than applied (§5, D-040). Out-of-order `pull_request` events
-  are covered by the terminal-state rule (§11).
+- **Reconciliation.** Every live run is compared against current Devin and
+  GitHub state on an interval, as the safety net for missed, dropped or
+  out-of-order deliveries and for recovery after downtime. The Devin half is
+  the session poll and tag-based orphan recovery (§8). The GitHub half
+  (`app/reconcile.py`, D-041) runs on worker ticks that found no queued work,
+  plus once at startup for every active run: it fetches the run's issue
+  (state, labels, events for the actor), discovers the PR by the recorded
+  branch, then reads the PR (state, merged, draft, head), the check suites for
+  the current head, the reviews and the base branch's required checks. Each
+  difference from what the run recorded is turned into the webhook payload
+  GitHub would have sent and replayed through `Intake.handle` under a
+  deterministic `reconcile:` delivery id, so dedupe, D-040 ordering, terminal
+  protection, revocation and notifications all happen in the one place they
+  already live. A snapshot never authorizes spend: a `devin-ready` label seen
+  on re-read is replayed only with the actor from the issue's event log, for
+  the allowlist to judge (§5). Terminal runs are never re-read. One run per
+  idle tick, oldest read first, spaced by `RECONCILE_INTERVAL_SECONDS`;
+  `runs.reconciled_at` is the bookkeeping and leaves `updated_at` alone. A
+  read failure is logged, written to the `reconciler` heartbeat and skipped
+  until the next interval; it never blocks run advancement, the review gate
+  or the outbox. `GITHUB_MODE=off` (default) is webhook-only; sim and tests
+  use `SimulatedGitHubClient`. Out-of-order `issues` deliveries are ordered
+  by the payload's own `issue.updated_at` (§5, D-040); out-of-order
+  `pull_request` events by the terminal-state rule (§11).
 - SQLite in WAL mode with a busy timeout, on a persistent volume. Move to
   PostgreSQL before running multiple hosts.
 
@@ -340,9 +356,11 @@ copy it into their own PR body.
 The worker records the run's branch when it starts the session, before Devin
 can push, so a webhook that arrives before the session poll still matches. A
 `pull_request` event that matches no run is recorded in `deliveries`
-(`accepted = 0`, with its reason) and is not re-evaluated later, because
-reconciliation has no GitHub half (§6). Its body stays there for a human to
-inspect until `DELIVERY_RETENTION_DAYS` clears it (Q-012).
+(`accepted = 0`, with its reason) and is not re-evaluated as a delivery. If
+the PR is on a run's recorded branch, the reconciler finds it on its next read
+by that branch and replays it as `opened` (§6, D-041); a PR on any other branch
+stays unmatched, and its body stays in `deliveries` for a human to inspect
+until `DELIVERY_RETENTION_DAYS` clears it (Q-012).
 
 The two sources take different routes (D-007). Only the webhook, through
 `Intake._correlate`, writes `pr_number` and `head_sha` and queues "PR opened".
@@ -873,6 +891,8 @@ CREATE TABLE IF NOT EXISTS runs (
     extra_pr_urls         TEXT NOT NULL DEFAULT '[]',
 
     failure_reason        TEXT,
+    reconciled_at         TEXT,               -- last GitHub re-read (D-041)
+    required_checks       TEXT,               -- base protection, JSON list (observed)
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL
 );
@@ -923,7 +943,8 @@ CREATE TABLE IF NOT EXISTS run_events (
     task_id     INTEGER NOT NULL REFERENCES tasks(id),
     at          TEXT NOT NULL,
     kind        TEXT NOT NULL,             -- state|session|pr|checks|verified|
-                                           -- review|review_gate|insights
+                                           -- review|review_gate|insights|
+                                           -- reconcile|protection
     from_state  TEXT,
     to_state    TEXT,
     reason      TEXT,
@@ -966,7 +987,7 @@ CREATE TABLE IF NOT EXISTS head_checks (
 -- Liveness of the processes that are supposed to be running. A dashboard
 -- that cannot tell "nothing happened" from "nobody is looking" is useless.
 CREATE TABLE IF NOT EXISTS heartbeats (
-    component   TEXT PRIMARY KEY,          -- worker | api
+    component   TEXT PRIMARY KEY,          -- worker | api | reconciler
     owner       TEXT,
     at          TEXT NOT NULL,
     detail      TEXT
@@ -1089,8 +1110,9 @@ Points the DDL alone does not make obvious:
   terminal, PR-open actions for it are ignored. A late `issues` delivery must
   not replay a state the issue has already left: the payload's
   `issue.updated_at` is compared with the newest one applied to the task and
-  an older snapshot is recorded as stale (§5, D-040). Neither rule re-fetches
-  from GitHub; that safety net is the missing reconciliation half (§6).
+  an older snapshot is recorded as stale (§5, D-040). Reconciliation (§6)
+  replays through these same rules, and reads active runs only, so a re-read
+  cannot move a terminal run either.
 - Simulated and live data are visibly separated by the `env` column, and the
   report never mixes them in one figure.
 
@@ -1165,7 +1187,8 @@ ceiling — not as an enforcement path.
 4. Outbox and notification formatting, against a local fake Slack endpoint.
 5. Live Slack transport, to an owner-authorized destination.
 6. Live Devin adapter behind the same interface, with `max_acu_limit` set.
-7. Reconciliation loop, including tag-based orphan recovery.
+7. Reconciliation loop: tag-based orphan recovery (Devin half), then the
+   read-only GitHub client and active-run re-read (GitHub half, D-041).
 8. Report endpoint.
 
 Steps 1–4 spend nothing, touch nobody's channel and cover the majority of the
@@ -1178,8 +1201,10 @@ rather than a test helper.
 - Acting on review comments automatically — Devin Review findings included;
   they are shown, and a human decides.
 - Narrowing "checks passed" and "review clear" to what branch protection
-  requires (needs the App to read protection). Today it is all suites GitHub
-  reported plus the Devin Review verdict on the current head (D-030, D-033).
+  requires. The required contexts are now read and recorded per run
+  (`runs.required_checks`, D-041) but not consumed: verification is still all
+  suites GitHub reported plus the Devin Review verdict on the current head
+  (D-030, D-033), and changing that is a separate gate decision.
 - Slack interactive actions, message updates, Events API subscription.
 - Follow-up instructions to an existing session from a reviewer.
 - Similar-bug discovery, feature implementation, deployment verification.
