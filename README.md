@@ -60,7 +60,7 @@ Build-order steps 1–4, which is everything that needs no credential:
 | 4. Outbox, notification formatting, fake Slack transport | done |
 | 5. Live Slack transport | done — webhook verified against a real channel; bot transport (threads + reactions, D-036) implemented, awaiting a token |
 | 6. Live Devin adapter | implemented, needs a service-user token |
-| 7. Reconciliation loop | partial — poll and tag-based orphan recovery |
+| 7. Reconciliation loop | done — Devin half (poll, tag-based orphan recovery); GitHub half (read-only client, active-run re-read and replay, startup catch-up, D-041) implemented, needs a read-only token for live |
 | 8. Report endpoint | done |
 | 9. Dashboard: workload, results, speed, throughput, health, run timeline | done |
 | 10. Devin analytics: cost & efficiency, provider cross-check | done |
@@ -92,8 +92,9 @@ python scripts/run_simulation.py
 
 Replays `issue_opened` → `issue_labeled` → a simulated Devin session →
 `pull_request.opened` → `check_suite` (queued, then passed) → a simulated
-Devin Review (requested, run, clear verdict) → `pull_request_review` →
-`pull_request.closed(merged)` and prints the task
+Devin Review (requested, run, clear verdict) → `pull_request_review` → a
+merge whose webhook is *lost*, learned instead by the startup reconciliation
+pass from a simulated GitHub API (D-041), and prints the task
 state, the Slack messages that would have been sent and the dashboard's
 summary. No network. Add `--serve` to keep the store alive and browse
 `/dashboard` over that simulated run afterwards.
@@ -160,8 +161,20 @@ the ones it can check are present:
    *Pull requests*, *Pull request reviews*, *Pull request review comments*
    and *Check suites*. Review comments carry Devin Review's inline findings
    (the per-kind counts on the dashboard); without them only the review's
-   total arrives. The service never calls the GitHub API, so the webhook
-   needs no token; it only needs to be delivered.
+   total arrives. The webhook itself needs no token; it only needs to be
+   delivered.
+
+   Optionally, **`GITHUB_MODE=live`** with a read-only `GITHUB_TOKEN` (an
+   App installation token or a fine-grained token with *read* on Issues,
+   Pull requests, Checks and Contents/Metadata for the allowlisted
+   repositories). The worker then re-reads every active run's issue and PR
+   from the API every `RECONCILE_INTERVAL_SECONDS` and once at startup, and
+   replays what the webhooks missed — a close, a label change, a PR Devin
+   opened, a merge, a new head, check suites, reviews — through the same
+   intake as a webhook (D-041). Without it, a delivery lost while the
+   service or its tunnel was down is never repaired. The token cannot merge,
+   push, approve or deploy: the client only issues `GET`s, and the App still
+   has no merge permission (D-027).
 
 3. **A Devin service user**, org-scoped, holding `UseDevinSessions` (create)
    and `ViewOrgSessions` (get, list); the same token is used for the

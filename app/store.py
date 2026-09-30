@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS runs (
     extra_pr_urls         TEXT NOT NULL DEFAULT '[]',
 
     failure_reason        TEXT,
+    reconciled_at         TEXT,               -- last GitHub re-read (D-041)
+    required_checks       TEXT,               -- base protection, JSON list (observed)
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL
 );
@@ -319,6 +321,8 @@ class Store:
             ("outbox", "reaction", "TEXT"),
             ("outbox", "reaction_error", "TEXT"),
             ("tasks", "issue_updated_at", "TEXT"),
+            ("runs", "reconciled_at", "TEXT"),
+            ("runs", "required_checks", "TEXT"),
         ):
             present = {
                 str(row["name"])
@@ -1045,6 +1049,33 @@ class Store:
             (repo, *sorted(s.value for s in ACTIVE)),
         ).fetchone()
         return int(row["n"])
+
+    def reconcile_candidate(self, env: str, due_before: str) -> sqlite3.Row | None:
+        """The active run whose GitHub state has gone longest without a re-read.
+
+        Never re-read, then oldest read first; nothing that was read after
+        ``due_before``. Active runs only: a terminal run has nothing GitHub
+        could still move (§11).
+        """
+        placeholders = ", ".join("?" for _ in ACTIVE)
+        return self._conn.execute(
+            f"""
+            SELECT runs.*, tasks.repo AS task_repo, tasks.issue_number,
+                   tasks.issue_title, tasks.issue_state, tasks.labels,
+                   tasks.issue_updated_at
+            FROM runs JOIN tasks ON tasks.id = runs.task_id
+            WHERE runs.env = ? AND runs.state IN ({placeholders})
+              AND (runs.reconciled_at IS NULL OR runs.reconciled_at < ?)
+            ORDER BY runs.reconciled_at IS NOT NULL, runs.reconciled_at, runs.created_at
+            LIMIT 1
+            """,
+            (env, *sorted(s.value for s in ACTIVE), due_before),
+        ).fetchone()
+
+    def mark_reconciled(self, conn: sqlite3.Connection, run_id: str, at: str) -> None:
+        """Record a GitHub re-read without touching ``updated_at``: a read
+        that changed nothing is not activity on the run."""
+        conn.execute("UPDATE runs SET reconciled_at = ? WHERE id = ?", (at, run_id))
 
     def count_sessions_started_since(self, repo: str, since: datetime) -> int:
         row = self._conn.execute(

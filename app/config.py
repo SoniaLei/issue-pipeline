@@ -57,6 +57,10 @@ DEFAULT_REVIEW_GATE_MODE = "required"
 DEFAULT_REVIEW_POLL_SECONDS = 60
 DEFAULT_REVIEW_MAX_ATTEMPTS = 5
 
+# GitHub reconciliation (D-041). Each active run's issue and PR are re-read
+# from the API at most this often; one run per idle worker tick.
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 300
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment cannot produce a usable configuration."""
@@ -149,6 +153,14 @@ class Settings:
     review_poll_seconds: int = DEFAULT_REVIEW_POLL_SECONDS
     review_max_attempts: int = DEFAULT_REVIEW_MAX_ATTEMPTS
 
+    # GitHub reconciliation. `off`: webhooks only. `live`: the worker re-reads
+    # each active run's issue, PR, check suites and reviews from the REST API
+    # with a read-only token and applies what changed through the intake.
+    github_mode: str = "off"
+    github_api_base: str = "https://api.github.com"
+    github_token: str = ""
+    reconcile_interval_seconds: int = DEFAULT_RECONCILE_INTERVAL_SECONDS
+
     def repo_allowed(self, full_name: str) -> bool:
         return full_name.lower() in self.repo_allowlist
 
@@ -227,6 +239,7 @@ def load_settings() -> Settings:
         DEFAULT_REVIEW_GATE_MODE,
         frozenset({"off", "advisory", "required"}),
     )
+    github_mode = _choice("GITHUB_MODE", "off", frozenset({"off", "live"}))
 
     settings = Settings(
         github_webhook_secret=secret,
@@ -288,6 +301,12 @@ def load_settings() -> Settings:
         review_max_attempts=_env_int(
             "REVIEW_MAX_ATTEMPTS", DEFAULT_REVIEW_MAX_ATTEMPTS
         ),
+        github_mode=github_mode,
+        github_api_base=os.environ.get("GITHUB_API_BASE", "https://api.github.com"),
+        github_token=os.environ.get("GITHUB_TOKEN", ""),
+        reconcile_interval_seconds=_env_int(
+            "RECONCILE_INTERVAL_SECONDS", DEFAULT_RECONCILE_INTERVAL_SECONDS
+        ),
     )
 
     if devin_mode == "live" and not (
@@ -296,5 +315,7 @@ def load_settings() -> Settings:
         raise ConfigError("DEVIN_MODE=live requires DEVIN_ORG_ID and DEVIN_API_TOKEN")
     if devin_mode == "live" and not settings.dashboard_token:
         raise ConfigError("DEVIN_MODE=live requires DASHBOARD_TOKEN")
+    if github_mode == "live" and not settings.github_token:
+        raise ConfigError("GITHUB_MODE=live requires GITHUB_TOKEN")
     _check_slack_live(settings)
     return settings
