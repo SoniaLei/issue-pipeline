@@ -1069,6 +1069,53 @@ maintainer's own act.
 (a triage bot that reopens stale issues, say). Then reopen should drop back to
 "awaiting approval" and the label must be re-applied.
 
+---
+
+## D-039 — The nightly security scan runs on Devin security scans; its configuration is kept here
+
+**Status**: accepted (maintainer decision, 2026-09-30)
+
+**Context.** The first nightly security scan was one Automation whose session
+ran pip-audit, bandit and gitleaks itself, filed issues and posted to Slack.
+Devin security scans now cover the scanning part natively, with a reusable
+profile, incremental "scan new commits" runs and tracked findings. What
+security scans do not do is file GitHub issues with our fingerprint markers,
+skip ones that are already filed, or post the Slack report.
+
+**Decision.** Split the work into three parts:
+
+1. **Find: Devin security scans.** One scan per repository with the org-wide
+   profile "Deps, code and secrets (from nightly scan)". A 03:23 London
+   Automation runs `scan_new_commits` on each scan.
+2. **Report: a reporter session at 05:23 London.** It reads each scan's open
+   high and critical findings through the Code Scans API. It re-audits the
+   dependencies, because an incremental scan does not see a new advisory
+   against a lockfile that hasn't changed. It files issues using the same
+   `<!-- security-scan: ... -->` fingerprints as before, so issues that
+   already exist still match. It posts one Slack message in the same Block
+   Kit layout.
+3. **Configuration as code in this repository** (`devin/security-scan/`,
+   `.agents/skills/security-scan-report/`). Terraform manages the playbook and
+   both Automations. The profile has no Terraform resource or write API, so
+   `profile.json` is a snapshot, and `scripts/check_scan_profile.py` reports
+   drift.
+
+The reporter finds its repositories through the profile. To add a repository,
+start a scan with the profile and add the scan ID to `main.tf`. The same
+layering as D-037 applies: one procedure, per-repository scope, and a thin
+schedule.
+
+**What does not change.** It is report-only: no remediation, no dependency
+upgrades, and no closing or relabelling of issues. Findings enter through
+GitHub issues and go through the `devin-ready` gate like any other request
+(architecture §8, "Repository-wide scans are not this"). Secrets are
+referenced by name and never committed.
+
+**Supersedes** the original "Nightly security scan (authorized repos)"
+Automation, which is now disabled.
+
+---
+
 ## D-040 — Issue deliveries are ordered by GitHub's snapshot, not by arrival
 
 **Status**: accepted (closes the finding Devin Review raised on PR #28)
