@@ -231,6 +231,12 @@ against the actor, not the label:
 - The `sender` of the label event must be in an explicit maintainer allowlist.
   Repository-permission checking (`write` / `maintain` / `admin`) is written
   behind the same interface but disabled in v1, so the switch is configuration.
+- Only three events are read as that actor's decision: `labeled` with
+  `devin-ready`, `opened` with the label already present, and `reopened` by an
+  allowlisted maintainer (D-038). `edited` and unrelated label events on an
+  issue that already carries the label never re-run the gate, so a label
+  applied by someone without authority is not adopted by a later maintainer
+  action.
 - Eligibility beyond that is purely mechanical: repository allowlisted, issue
   open, label present. There is no content check on the issue body in v1 —
   applying the label *is* the maintainer asserting the issue is specified

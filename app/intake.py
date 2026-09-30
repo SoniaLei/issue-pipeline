@@ -224,9 +224,10 @@ class Intake:
         approved = self.settings.approval_label in labels
         sender = str((payload.get("sender") or {}).get("login", ""))
         added = str((payload.get("label") or {}).get("name", ""))
-        # Only the event that applies the label (or opens the issue with it)
-        # carries the actor who put it there (D-001).
-        authorizing = action == "opened" or (
+        # Only an event whose sender is deciding about *this* issue can
+        # authorize: applying the label, opening or reopening the issue with it
+        # (D-001, D-038). `edited` and unrelated labels carry no such decision.
+        authorizing = action in {"opened", "reopened"} or (
             action == "labeled" and added == self.settings.approval_label
         )
 
