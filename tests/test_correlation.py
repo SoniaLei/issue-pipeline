@@ -338,3 +338,31 @@ def test_a_fork_naming_a_no_output_run_does_not_alert(
     intake.handle(delivery_id=next_delivery_id(), event="pull_request", payload=payload)
 
     assert _late_notifications(store) == []
+
+
+@pytest.mark.parametrize("closing", ["pr_merged.json", "pr_closed_unmerged.json"])
+@pytest.mark.parametrize(
+    ("event", "fixture"),
+    [
+        ("check_suite", "check_suite_success.json"),
+        ("check_suite", "check_suite_failure.json"),
+        ("pull_request_review", "devin_review_findings.json"),
+    ],
+)
+def test_a_late_head_fact_after_the_pr_closed_announces_nothing(
+    intake: Intake, store: Store, closing: str, event: str, fixture: str
+) -> None:
+    run_id = queued_run(intake, store)
+    deliver_pr(intake, "pr_opened.json", run_id)
+    clean = substitute_run_id(load_fixture("devin_review_clean.json"), run_id)
+    intake.handle(
+        delivery_id=next_delivery_id(), event="pull_request_review", payload=clean
+    )
+    deliver_pr(intake, closing, run_id)
+    before = [row["kind"] for row in store.all_notifications()]
+
+    payload = substitute_run_id(load_fixture(fixture), run_id)
+    late = intake.handle(delivery_id=next_delivery_id(), event=event, payload=payload)
+
+    assert late.accepted
+    assert [row["kind"] for row in store.all_notifications()] == before
