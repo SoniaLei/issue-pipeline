@@ -14,7 +14,7 @@ Turn the latest Devin security-scan findings for one repository into GitHub issu
 - Optional: a Slack incoming-webhook secret name for the summary. Without one, the summary is only the session's final message.
 
 ## Procedure
-1. **Read the rules.** Clone the default branch (`git clone --filter=blob:none`). Read `SECURITY.md`, `AGENTS.md` and `CONTRIBUTING.md` if present. Every issue you file must meet any requirements they set for findings from automated tools.
+1. **Read the rules.** Clone the default branch (`git clone --filter=blob:none`). Read `SECURITY.md`, `AGENTS.md` and `CONTRIBUTING.md` if present. Every issue you file must meet any requirements they set for findings from automated tools. Also call `GET /repos/<owner>/<name>`. If `private` is false and `SECURITY.md` (or `AGENTS.md`) asks for vulnerabilities to be reported privately rather than in public issues, treat the repository as *private-reporting* (step 7).
 2. **Find the scan.** Call `GET https://api.devin.ai/v3/organizations/org-319ec3944f4f4ba199cd7806b6899a5b/code-scans/scans?repo_name=<owner/name>` with `Authorization: Bearer $DEVIN_CODE_SCANS_API_TOKEN`. Pick the newest scan whose `profile.profile_id` is `csprof-2f17d866c09f4abb98cbc8fa2b0360dc`. If there is none, report "not scanned: no Devin security scan for this repo". If its `status` is `running` or `pending`, still read its findings, and note "scan still running" in the summary.
 3. **Pull findings.** Call `GET .../code-scans/findings?scan_id=<scan_id>&status=open&severity=critical&severity=high&first=200`, following `end_cursor` until `has_next_page` is false. If the API returns 401 or 403, report "Devin findings: not read (<status>)". Do not treat that as "no findings".
 4. **Dependency re-check.** Incremental scans only cover new commits, so also audit dependencies. Keep high and critical only.
@@ -37,6 +37,7 @@ Turn the latest Devin security-scan findings for one repository into GitHub issu
    - a link to the Devin finding (`<scan url>`, finding `<finding_id>`) or the scanner command that found it;
    - the fingerprint marker on its own line.
    For a secret, give only the rule, file, line and commit, and recommend rotating it first. If a GitHub call fails, report the finding as "not filed: <short error>".
+   In a private-reporting repository, never file a public issue for a code or secret finding. Report it as "not filed: private reporting per SECURITY.md (<<scan url>|Devin finding>)" so a maintainer can open a private security advisory. Dependency advisories are already public, so file them as usual.
 8. **Summarize.** Report, per repository:
    - the ecosystems covered and not covered;
    - findings kept, grouped as Python / Frontend-npm / Code / Secrets;
@@ -47,7 +48,8 @@ Turn the latest Devin security-scan findings for one repository into GitHub issu
 9. **Validate.** List the repository's open issues again. Confirm every issue you opened carries its fingerprint marker, and that no fingerprint appears on two open issues.
 
 ## Specifications
-- Every kept high or critical finding is either skipped as already tracked or has exactly one open issue with its fingerprint marker.
+- Every kept high or critical finding is either skipped as already tracked, has exactly one open issue with its fingerprint marker, or (a code or secret finding in a private-reporting repository) is reported as not filed.
+- No public issue describes a code or secret finding in a private-reporting repository.
 - Nothing below high is filed.
 - No commits, branches, PRs, label creation, dependency changes or history rewrites.
 - No secret value appears in any issue, log, Slack message or session output.
