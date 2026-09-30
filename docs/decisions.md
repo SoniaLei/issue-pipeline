@@ -1068,3 +1068,42 @@ maintainer's own act.
 **Revisit if** reopen is used for bookkeeping unrelated to wanting work done
 (a triage bot that reopens stale issues, say). Then reopen should drop back to
 "awaiting approval" and the label must be re-applied.
+
+## D-040 — Issue deliveries are ordered by GitHub's snapshot, not by arrival
+
+**Status**: accepted (closes the finding Devin Review raised on PR #28)
+
+GitHub does not promise to deliver webhooks in the order the events happened.
+D-038 made a maintainer's `reopened` re-approve a labelled issue, which sharpened
+an existing hole: if the `closed` that preceded that reopen arrives *after* it,
+the intake cancels the run the reopen just queued, and the issue is open with
+no work on it. The mirror case exists for labels — `unlabeled` overtaken by the
+`labeled` it undid would approve an issue whose label is already gone.
+
+The intended safety net is reconciliation against the GitHub API (§6), which
+does not exist yet. Waiting for it leaves a spend-control gap open, so the
+intake now uses what every `issues` payload already carries: the issue as it
+was when the event fired, with its `updated_at`. The task records the newest
+`issue.updated_at` it has applied; a delivery whose snapshot is strictly older
+is recorded in `deliveries` as `stale delivery: …` and changes nothing.
+
+Rules, in order of what they protect:
+
+- Strictly older only. Equal timestamps are applied in arrival order: GitHub's
+  clock has second resolution, and two events in the same second have no
+  better ordering available. Missing timestamps (fixtures, hand-replayed
+  payloads) are never stale.
+- Only `issues` events. `pull_request` events already cannot move a terminal
+  run backwards (§11), and checks and reviews are keyed by head SHA, which is
+  its own ordering.
+- Recorded, not dropped. A stale delivery keeps its row and reason, like every
+  other rejected delivery, so an operator can see that ordering happened.
+
+**What this is not.** It is not reconciliation. A delivery that never arrives
+is still never re-fetched, and the worker still starts a session from the
+webhook snapshot rather than from a fresh API read (§5). Those need the GitHub
+API client, which remains build-order item 7 (§14).
+
+**Revisit if** GitHub ever delivers a snapshot whose `updated_at` moves
+backwards for a real state change, or when the API client lands and re-fetch
+can replace the comparison.

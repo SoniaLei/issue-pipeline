@@ -241,8 +241,16 @@ against the actor, not the label:
   open, label present. There is no content check on the issue body in v1 —
   applying the label *is* the maintainer asserting the issue is specified
   enough (D-016).
-- The issue is re-fetched from the API before starting and must still be open and
-  still carry the label. A webhook is a hint; the API is the truth.
+- Deliveries are applied in the order GitHub's snapshots say they happened,
+  not the order they arrived. Every `issues` payload carries the issue as it
+  was when the event fired; a delivery whose `issue.updated_at` is older than
+  the newest one already applied to the task is recorded as stale and changes
+  nothing (D-040). Without this, a `closed` overtaken by the `reopened` that
+  followed it would cancel the run the reopen had just approved.
+- The issue is *not* re-fetched from the API before starting. There is no
+  GitHub API client yet (§6, §14 item 7); the ordered webhook snapshot is what the
+  worker starts from, and an issue closed or unlabelled after that snapshot
+  is caught only if its delivery arrives before the session is created.
 - The approving actor and the time of approval are stored on the run.
 - An issue comment never authorizes work, from anyone.
 
@@ -294,7 +302,11 @@ Two consequences worth stating plainly:
   Only the Devin half is built: the worker polls each live session, and an
   ambiguous session-create is recovered by tag lookup (§8). There is no GitHub
   half. A missed or unmatched GitHub delivery is not re-fetched or re-evaluated;
-  it stays in `deliveries` for a human to inspect (§7).
+  it stays in `deliveries` for a human to inspect (§7). Out-of-order delivery
+  of `issues` events is handled without the API: the payload's own
+  `issue.updated_at` orders them, and an overtaken delivery is recorded as
+  stale rather than applied (§5, D-040). Out-of-order `pull_request` events
+  are covered by the terminal-state rule (§11).
 - SQLite in WAL mode with a busy timeout, on a persistent volume. Move to
   PostgreSQL before running multiple hosts.
 
@@ -816,6 +828,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     issue_title  TEXT NOT NULL DEFAULT '',
     issue_state  TEXT NOT NULL DEFAULT 'open',
     labels       TEXT NOT NULL DEFAULT '[]',
+    issue_updated_at TEXT,   -- issue.updated_at of the newest applied event
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     UNIQUE (repo, issue_number)
@@ -1071,9 +1084,13 @@ Points the DDL alone does not make obvious:
 - **A review-provider failure is that head's problem.** It is recorded on the
   row, capped by `REVIEW_MAX_ATTEMPTS`, shown as `unavailable`, and never
   stops the worker or affects another run.
-- **Fetch current GitHub state before acting on a delayed event.** A late
-  `pull_request` delivery must not move a merged PR back to open. This is the
-  rule that makes out-of-order delivery survivable.
+- **A delayed delivery never moves state backwards.** A late `pull_request`
+  delivery must not move a merged or closed run back to open: once a run is
+  terminal, PR-open actions for it are ignored. A late `issues` delivery must
+  not replay a state the issue has already left: the payload's
+  `issue.updated_at` is compared with the newest one applied to the task and
+  an older snapshot is recorded as stale (§5, D-040). Neither rule re-fetches
+  from GitHub; that safety net is the missing reconciliation half (§6).
 - Simulated and live data are visibly separated by the `env` column, and the
   report never mixes them in one figure.
 
@@ -1167,8 +1184,8 @@ rather than a test helper.
 - Follow-up instructions to an existing session from a reviewer.
 - Similar-bug discovery, feature implementation, deployment verification.
 
-Threading is the one later-release item worth designing for now: see
-`decisions.md`, D-009.
+Threading was the one later-release item designed for from the start (D-009);
+it shipped as the bot transport in D-036.
 
 ## 16. Documentation, DeepWiki and the overnight sweep (D-034, D-035)
 

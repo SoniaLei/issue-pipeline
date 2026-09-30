@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     issue_title  TEXT NOT NULL DEFAULT '',
     issue_state  TEXT NOT NULL DEFAULT 'open',
     labels       TEXT NOT NULL DEFAULT '[]',
+    issue_updated_at TEXT,   -- issue.updated_at of the newest applied event
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     UNIQUE (repo, issue_number)
@@ -317,6 +318,7 @@ class Store:
             ("outbox", "thread_ts", "TEXT"),
             ("outbox", "reaction", "TEXT"),
             ("outbox", "reaction_error", "TEXT"),
+            ("tasks", "issue_updated_at", "TEXT"),
         ):
             present = {
                 str(row["name"])
@@ -400,16 +402,19 @@ class Store:
         title: str,
         issue_state: str,
         labels: list[str],
+        issue_updated_at: str | None = None,
     ) -> int:
         conn.execute(
             """
             INSERT INTO tasks (repo, issue_number, issue_title, issue_state, labels,
-                               created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                               issue_updated_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (repo, issue_number) DO UPDATE SET
                 issue_title = excluded.issue_title,
                 issue_state = excluded.issue_state,
                 labels      = excluded.labels,
+                issue_updated_at = COALESCE(excluded.issue_updated_at,
+                                            tasks.issue_updated_at),
                 updated_at  = excluded.updated_at
             """,
             (
@@ -418,6 +423,7 @@ class Store:
                 title,
                 issue_state,
                 json.dumps(sorted(labels)),
+                issue_updated_at,
                 now_iso(),
                 now_iso(),
             ),

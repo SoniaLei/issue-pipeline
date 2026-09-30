@@ -27,6 +27,7 @@ import hmac
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from app.config import Settings
@@ -129,6 +130,36 @@ def _labels(issue: dict[str, Any]) -> list[str]:
     return [str(label["name"]) for label in issue.get("labels") or []]
 
 
+def _github_time(value: Any) -> datetime | None:
+    """Parse a GitHub timestamp (``2026-09-28T23:11:17Z``); None if absent or odd."""
+    if not value:
+        return None
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def predates(delivered: Any, recorded: Any) -> bool:
+    """Whether a delivery's issue snapshot is older than the one already applied.
+
+    Every ``issues`` payload carries the issue as it was when the event fired,
+    including its ``updated_at``. A delivery whose snapshot is strictly older
+    than the newest one applied to the task was overtaken in transit, and
+    acting on it would replay a state GitHub has already left. Equal or
+    missing timestamps are not stale: GitHub's clock has second resolution and
+    fixtures may carry none, and in both cases arrival order is all there is.
+    """
+    a, b = _github_time(delivered), _github_time(recorded)
+    return a is not None and b is not None and a < b
+
+
 class Intake:
     """Applies a verified GitHub delivery to durable state."""
 
@@ -212,6 +243,18 @@ class Intake:
             return IntakeResult(False, "no issue in payload")
         issue_number = int(issue["number"])
         labels = _labels(issue)
+        issue_updated_at = str(issue.get("updated_at") or "") or None
+        known = self.store.find_task(repo, issue_number)
+        if known is not None and predates(issue_updated_at, known["issue_updated_at"]):
+            # Overtaken in transit: a `closed` arriving after the `reopened`
+            # that followed it, a `labeled` after its `unlabeled`. The task
+            # already reflects the later snapshot; this one is kept in
+            # `deliveries` for inspection and changes nothing.
+            return IntakeResult(
+                False,
+                f"stale delivery: issue {action} predates the recorded issue state",
+                task_id=int(known["id"]),
+            )
         task_id = self.store.upsert_task(
             conn,
             repo=repo,
@@ -219,6 +262,7 @@ class Intake:
             title=str(issue.get("title") or ""),
             issue_state=str(issue.get("state") or "open"),
             labels=labels,
+            issue_updated_at=issue_updated_at,
         )
 
         approved = self.settings.approval_label in labels
