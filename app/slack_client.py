@@ -32,7 +32,7 @@ top-level message rather than lose a notification.
 The bot can also look a message up in channel history (``conversations.history``,
 scopes ``channels:history`` / ``groups:history``). That is how a run whose
 "PR opened" post went out through a webhook, and so has no stored ``ts``, still
-gets a thread (D-041).
+gets a thread (D-042).
 """
 
 from __future__ import annotations

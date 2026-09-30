@@ -257,7 +257,7 @@ def test_an_old_database_gains_the_anchor_columns(tmp_path: Path) -> None:
     reopened.close()
 
 
-# ------------------------------------------------ webhook-era anchor (D-041)
+# ------------------------------------------------ webhook-era anchor (D-042)
 
 
 def _webhook_era_anchor(store: Store, settings: Settings) -> tuple[str, Any]:

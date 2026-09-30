@@ -50,8 +50,10 @@ sys.path.insert(0, str(ROOT))
 from app.config import Settings  # noqa: E402
 from app.dashboard import build_dashboard  # noqa: E402
 from app.devin_client import SimulatedDevinClient  # noqa: E402
+from app.github_client import SimulatedGitHubClient  # noqa: E402
 from app.intake import Intake  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.reconcile import Reconciler  # noqa: E402
 from app.reporting import build_report, render_text  # noqa: E402
 from app.sim_history import seed_history  # noqa: E402
 from app.slack_client import (  # noqa: E402
@@ -235,12 +237,24 @@ def main() -> None:
         payload=fixture("pr_review_approved.json", run_id),
     )
 
-    print("9. a human merges it")
-    intake.handle(
-        delivery_id="sim-9",
-        event="pull_request",
-        payload=fixture("pr_merged.json", run_id),
+    print(
+        "9. a human merges it while the service is down; the webhook is lost,"
+        " startup reconciliation reads GitHub and records the merge"
     )
+    merged = fixture("pr_merged.json", run_id)
+    github = SimulatedGitHubClient()
+    github.set_issue(
+        REPO,
+        {
+            **fixture("issue_labeled.json")["issue"],
+            "state": "closed",
+            "closed_by": merged["sender"],
+            "updated_at": "2026-09-20T12:00:00Z",
+        },
+    )
+    github.set_pull(REPO, merged["pull_request"])
+    worker.reconciler = Reconciler(store, settings, intake, github, owner="simulation")
+    worker.catch_up_github()
     worker.tick()
 
     print()

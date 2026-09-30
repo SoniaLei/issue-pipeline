@@ -645,10 +645,14 @@ Slack rows in the timeline are durable (`run_events`, `outbox`) and written at
 the moment they happen, not reconstructed.
 
 **What "verified" is not yet.** It is "all suites GitHub reported", not "the
-suites branch protection requires". Narrowing it means reading branch
-protection through the App and is a later uplift; until then a repository with
-an optional, flaky suite will under-report verification, which is the safe
-direction to be wrong in.
+suites branch protection requires". Since D-041 the reconciler *reads* the base
+branch's required status checks and records them on the run
+(`runs.required_checks`, a `protection` timeline event), but the gate does not
+yet consume them: GitHub reports check *suites* by app, protection names check
+*contexts* by job, and matching the two needs check-run reads that are a
+separate, deliberate gate change. Until then a repository with an optional,
+flaky suite will under-report verification, which is the safe direction to be
+wrong in, and the recorded list shows an operator what the narrowing would use.
 
 **Freshness.** `data_as_of` is the newest write across runs, deliveries,
 outbox and heartbeats — a store-side fact. `generated_at` is when the report
@@ -822,9 +826,9 @@ fix in the same PR, dismiss with a reason on GitHub, or open a follow-up issue
 — is a human decision. Nothing merges automatically, including any remediation
 PR a scan might propose.
 
-**Revisit when** GitHub's branch protection can be read through the App
-(D-030), so "checks passed" and "review clear" can both be narrowed to what
-protection actually requires; and if the review API begins to expose findings
+**Revisit when** the required contexts the reconciler now records (D-041) are
+matched to check runs, so "checks passed" and "review clear" can both be
+narrowed to what protection actually requires (D-030); and if the review API begins to expose findings
 directly, in which case GitHub's review remains the verdict and the API's copy
 becomes a cross-check (D-032).
 
@@ -916,7 +920,7 @@ actually acted on.
 ## D-036 — The "PR opened" post is the run's Slack anchor; the rest of the PR's life is a thread and reactions on it
 
 **Status**: accepted (maintainer decision); its scope list is extended by
-D-041
+D-042
 
 **Decision.** With a bot token (`SLACK_TRANSPORT=bot`) the worker keeps the
 channel and `ts` that `chat.postMessage` returns for a run's *PR opened*
@@ -1148,17 +1152,120 @@ Rules, in order of what they protect:
   other rejected delivery, so an operator can see that ordering happened.
 
 **What this is not.** It is not reconciliation. A delivery that never arrives
-is still never re-fetched, and the worker still starts a session from the
-webhook snapshot rather than from a fresh API read (§5). Those need the GitHub
-API client, which remains build-order item 7 (§14).
+is not repaired by ordering; that is D-041, which re-reads GitHub on an
+interval and replays the difference *through this same comparison*, so the two
+rules compose rather than compete. The worker still starts a session from the
+webhook snapshot rather than from a fresh API read (§5); with `GITHUB_MODE=live`
+the reconciler's pass narrows that window to one interval but does not close
+it.
 
 **Revisit if** GitHub ever delivers a snapshot whose `updated_at` moves
-backwards for a real state change, or when the API client lands and re-fetch
-can replace the comparison.
+backwards for a real state change.
 
 ---
 
-## D-041 — A webhook-era "PR opened" post is looked up in channel history and adopted as the anchor
+## D-041 — GitHub reconciliation re-reads active runs and replays the difference through the intake
+
+**Status**: accepted (build-order item 7, GitHub half; the Devin half is §8)
+
+Webhooks are hints, not history. GitHub retries a failed delivery for a short
+window and then stops; a service that was down, or whose tunnel URL had
+changed, never learns what happened in that gap. In practice every restart of
+the live service so far has meant a new URL, and the first live run left a
+run at `pr_open` after its PR was closed until the delivery was replayed by
+hand. D-040 orders the deliveries that do arrive; nothing recovered the ones
+that did not.
+
+The service now has a read-only GitHub client (`app/github_client.py`) and a
+reconciler (`app/reconcile.py`) the worker runs on every tick, plus once at
+startup:
+
+- **Scope: active runs only.** A run in a terminal state is never re-read,
+  so nothing learned late can move it (§11). The candidate is the active run
+  whose `reconciled_at` is oldest or null; at most one run per tick, busy or
+  idle (a session being polled keeps every tick busy for hours, and it is
+  exactly that run's issue whose revocation or closed PR must not go unread
+  meanwhile), and `RECONCILE_INTERVAL_SECONDS` (default 300) spaces the reads
+  per run, which bounds the API cost. `reconciled_at` is bookkeeping and
+  does not touch `updated_at`, so a no-op read is invisible to the dashboard's
+  freshness and to `data_as_of`.
+- **Startup catch-up.** `Worker.run_forever` first reads every active run once
+  regardless of its last read time: due means read before boot, and a run
+  the pass reads is stamped after boot, so each is read exactly once. What happened while the service was down
+  is exactly what no webhook will say.
+- **Replay, not repair.** The reconciler compares the fetched issue and PR
+  with what the run recorded and, for each difference, builds the webhook
+  payload GitHub *would* have sent and hands it to `Intake.handle` under a
+  deterministic delivery id (`reconcile:<repo>:<object>:<number>:<action>:
+  <revision>`). The intake stays the single place where state changes,
+  revocation, terminal protection, D-040 ordering and notifications are
+  decided; reconciliation adds no second copy of any rule, and a replayed
+  delivery is deduplicated, recorded and shown exactly like a real one. A
+  `reconcile` timeline event lists what was replayed.
+- **Authorization is never inferred from a snapshot.** A re-read that shows
+  `devin-ready` on an issue whose run awaits approval does *not* approve it.
+  The reconciler looks the corresponding `labeled`/`reopened`/`unlabeled`
+  event up in the issue's event list to find the actor, and only if an event
+  exists does it replay it, with that actor as `sender`, for D-001/D-038 to
+  judge as usual. No event, no actor, no spend. Removal of the label, by
+  contrast, is replayed whoever did it, because revocation was never
+  actor-gated.
+- **What is compared.** Issue `state`, `closed_by` and labels; PR discovery by
+  the run's recorded branch (`GET /pulls?head=owner:branch&state=all`, D-019);
+  PR `state`, `merged`, `merge_commit_sha`, `draft` and `head.sha`; check
+  suites for the *current* head only; reviews, where a Devin Review verdict
+  already stored for that head is skipped, a human `commented` review is
+  ignored, and only the latest human approved/changes-requested verdict is
+  replayed. A new head invalidates checks and review evidence through the
+  ordinary `synchronize` path (D-030). A PR found already closed is replayed
+  in the order GitHub lived it — `opened` if never correlated, `synchronize`
+  if the head moved, then its suites and reviews, then `closed` — because a
+  terminal run is never read again, so the evidence the merge was judged on
+  has to be recorded before the run becomes terminal. Suites are fed failing
+  and pending first, passing last, so a partial replay can never verify a
+  head the full answer does not. A revision (`updated_at`) is part of every
+  replayed PR and suite delivery id, so a rerun that returns to the same
+  conclusion, or a second draft toggle on one head, is a new observation
+  while a repeat of the same read stays a duplicate.
+- **Event history has a horizon.** The live client reads at most 1,000 issue
+  events (oldest first). An issue busier than that logs a warning and its
+  newest label events may be unseen; the failure direction is no actor found
+  and therefore no spend, never spend on a guessed actor.
+- **Branch protection is observed, not yet gated.** The base branch's
+  `required_status_checks` are read and stored on the run
+  (`runs.required_checks`, `protection` event) so the gap between "all suites
+  reported" and "what protection requires" is visible per run. The verification
+  gate is unchanged (D-030, D-033); narrowing it is a separate decision. An
+  unprotected base, a 404, or a token that cannot see protection details all
+  read as "nothing required".
+- **Failure isolation.** A GitHub read error still marks the run reconciled
+  (so one broken issue cannot pin the loop to itself; it is retried after the
+  interval like any other), is recorded in the `reconciler` heartbeat, and
+  never stops run advancement, the review gate or the outbox. Timeouts, `5xx`
+  and `429` are logged as warnings; `401`/`403` and other `4xx` as errors,
+  since those are configuration, not weather.
+- **Credential.** `GITHUB_MODE=live` requires `GITHUB_TOKEN`, an App
+  installation token or a fine-grained token with *read* on Issues, Pull
+  requests, Checks and Contents/Metadata. The client issues only `GET`s;
+  there is no code path that could merge, push, approve, comment or deploy,
+  and the App's permissions still exclude merge (D-027). `GITHUB_MODE=off`
+  (the default) keeps the webhook-only behaviour; simulation and tests use
+  `SimulatedGitHubClient` and stay network- and credential-free (D-010).
+
+**What this does not do.** It does not re-fetch the issue immediately before
+session creation (§5); the window between approval and spend is bounded by the
+interval, not closed. It does not discover a PR Devin opened on a branch other
+than the one the run recorded. It does not read anything for runs this service
+did not start, so Automation-started sessions remain outside the dashboard
+(D-030). It does not consume `required_checks` for verification (above).
+
+**Revisit when** the service has a permanent host and App credentials: at that
+point the pre-spend re-fetch (§5) is one extra `get_issue` in the worker, and
+the required-contexts match can be built on check-run reads.
+
+---
+
+## D-042 — A webhook-era "PR opened" post is looked up in channel history and adopted as the anchor
 
 **Status**: accepted (maintainer request)
 

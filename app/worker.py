@@ -58,6 +58,7 @@ from app.prompts import (
     session_tags,
     session_title,
 )
+from app.reconcile import Reconciler
 from app.slack_client import SlackTransport
 from app.states import check_transition, is_terminal, State
 from app.store import now_iso, Store, utcnow
@@ -67,7 +68,7 @@ logger = logging.getLogger(__name__)
 MAX_NOTIFICATION_ATTEMPTS = 6
 BASE_BACKOFF_SECONDS = 5.0
 # How far either side of a webhook-era "PR opened" row's `sent_at` to search
-# channel history for the post itself (D-041).
+# channel history for the post itself (D-042).
 ANCHOR_LOOKUP_WINDOW_SECONDS = 120.0
 
 # States where the run has stopped making progress on its own and someone has
@@ -147,11 +148,13 @@ class Worker:
         slack: SlackTransport,
         *,
         owner: str | None = None,
+        reconciler: Reconciler | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
         self.devin = devin
         self.slack = slack
+        self.reconciler = reconciler
         self.owner = owner or f"{socket.gethostname()}-{id(self)}"
         self._metrics_dirty = False
         self._next_prune_at = 0.0
@@ -160,6 +163,7 @@ class Worker:
     # ------------------------------------------------------------------ main loop
 
     def run_forever(self) -> None:  # pragma: no cover - loop driver
+        self.catch_up_github()
         while True:
             worked = self.tick()
             if not worked:
@@ -173,7 +177,17 @@ class Worker:
         advanced = self.advance_one()
         delivered = self.drain_outbox()
         reviewed = False
-        if not advanced:
+        # GitHub reconciliation re-reads one active run whose issue and PR are
+        # due a look (D-041). Every tick, not only idle ones: a session that is
+        # being polled would otherwise keep the worker busy for its whole life
+        # and its own issue's revocation or PR would go unread. The interval
+        # bounds the cost, and a failing read must never stop runs advancing.
+        try:
+            reconciled = self.reconcile_github()
+        except Exception:
+            reconciled = False
+            logger.exception("GitHub reconciliation failed")
+        if not advanced and not reconciled:
             # The review gate reads and requests a provider review of the
             # PR's current head. Like analytics it runs on an idle tick and a
             # failing provider must not stop runs from advancing.
@@ -181,7 +195,12 @@ class Worker:
                 reviewed = self.refresh_review_gate()
             except Exception:
                 logger.exception("review gate refresh failed")
-        if self.settings.analytics_enabled and not advanced and not reviewed:
+        if (
+            self.settings.analytics_enabled
+            and not advanced
+            and not reconciled
+            and not reviewed
+        ):
             # Analytics are observation, not control: they wait for an idle
             # tick so a slow provider endpoint delays no run, and a broken
             # one must never stop runs from advancing.
@@ -189,7 +208,26 @@ class Worker:
                 self.refresh_analytics()
             except Exception:
                 logger.exception("analytics refresh failed")
-        return advanced or delivered > 0
+        return advanced or delivered > 0 or reconciled
+
+    def reconcile_github(self) -> bool:
+        """One GitHub re-read, when configured and a run is due one."""
+        if self.reconciler is None:
+            return False
+        return self.reconciler.reconcile_one()
+
+    def catch_up_github(self) -> int:
+        """Startup pass over every active run (D-041). A GitHub outage at
+        boot is logged, not fatal: the interval pass retries."""
+        if self.reconciler is None:
+            return 0
+        try:
+            looked = self.reconciler.catch_up()
+        except Exception:
+            logger.exception("GitHub startup reconciliation failed")
+            return 0
+        logger.info("startup reconciliation re-read %d active run(s)", looked)
+        return looked
 
     def prune_deliveries(self) -> int:
         """Drop raw delivery bodies older than DELIVERY_RETENTION_DAYS (D-014),
@@ -950,7 +988,7 @@ class Worker:
         Channel history around ``sent_at`` is searched for that exact text
         carrying the run id; a hit is stored on the row, which makes it the
         anchor from then on. A miss (no history scope, message deleted, outside
-        the window) leaves the follow-up top-level, as before (D-041).
+        the window) leaves the follow-up top-level, as before (D-042).
         """
         row = self.store.unanchored_pr_opened(run_id, destination)
         if row is None:
@@ -1000,6 +1038,8 @@ class Worker:
 def build_worker(settings: Settings, store: Store) -> Worker:
     """Assemble a worker from configuration."""
     from app.devin_client import LiveDevinClient, SimulatedDevinClient
+    from app.github_client import LiveGitHubClient
+    from app.intake import Intake
     from app.slack_client import (
         BotSlackTransport,
         FakeSlackTransport,
@@ -1022,7 +1062,13 @@ def build_worker(settings: Settings, store: Store) -> Worker:
         slack = BotSlackTransport(settings.slack_bot_token)
     else:
         slack = LiveSlackTransport()
-    return Worker(store, settings, devin, slack)
+    reconciler: Reconciler | None = None
+    if settings.github_mode == "live":
+        github = LiveGitHubClient(
+            base_url=settings.github_api_base, token=settings.github_token
+        )
+        reconciler = Reconciler(store, settings, Intake(store, settings), github)
+    return Worker(store, settings, devin, slack, reconciler=reconciler)
 
 
 def main() -> None:  # pragma: no cover - entry point
