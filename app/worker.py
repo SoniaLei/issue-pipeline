@@ -173,15 +173,17 @@ class Worker:
         self.prune_deliveries()
         advanced = self.advance_one()
         delivered = self.drain_outbox()
-        reconciled = reviewed = False
-        if not advanced:
-            # GitHub reconciliation re-reads one active run whose issue and PR
-            # are due a look (D-041). Idle ticks only: a slow GitHub delays no
-            # run, and a failing read must never stop runs from advancing.
-            try:
-                reconciled = self.reconcile_github()
-            except Exception:
-                logger.exception("GitHub reconciliation failed")
+        reviewed = False
+        # GitHub reconciliation re-reads one active run whose issue and PR are
+        # due a look (D-041). Every tick, not only idle ones: a session that is
+        # being polled would otherwise keep the worker busy for its whole life
+        # and its own issue's revocation or PR would go unread. The interval
+        # bounds the cost, and a failing read must never stop runs advancing.
+        try:
+            reconciled = self.reconcile_github()
+        except Exception:
+            reconciled = False
+            logger.exception("GitHub reconciliation failed")
         if not advanced and not reconciled:
             # The review gate reads and requests a provider review of the
             # PR's current head. Like analytics it runs on an idle tick and a

@@ -314,8 +314,12 @@ Two consequences worth stating plainly:
   protection, revocation and notifications all happen in the one place they
   already live. A snapshot never authorizes spend: a `devin-ready` label seen
   on re-read is replayed only with the actor from the issue's event log, for
-  the allowlist to judge (§5). Terminal runs are never re-read. One run per
-  idle tick, oldest read first, spaced by `RECONCILE_INTERVAL_SECONDS`;
+  the allowlist to judge (§5); an event log longer than the client reads
+  (1,000 events, oldest first) names nobody. Terminal runs are never re-read,
+  so a PR found already closed is replayed as GitHub lived it — open,
+  head, suites, reviews, then closed — before the run turns terminal. One run
+  per tick (busy or idle), oldest read first, spaced by
+  `RECONCILE_INTERVAL_SECONDS`;
   `runs.reconciled_at` is the bookkeeping and leaves `updated_at` alone. A
   read failure is logged, written to the `reconciler` heartbeat and skipped
   until the next interval; it never blocks run advancement, the review gate

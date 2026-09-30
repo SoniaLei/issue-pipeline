@@ -51,7 +51,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.config import Settings
-from app.github_client import GitHubClient, GitHubError
+from app.github_client import GitHubClient, GitHubError, MAX_PAGES, PAGE_SIZE
 from app.intake import HUMAN_REVIEW_OUTCOMES, Intake
 from app.review_gate import is_review_bot
 from app.states import can_transition, is_terminal, State
@@ -60,6 +60,8 @@ from app.store import now_iso, Store, utcnow
 logger = logging.getLogger(__name__)
 
 DELIVERY_PREFIX = "reconcile"
+# The live client reads at most this many issue events (oldest first).
+MAX_ISSUE_EVENTS = MAX_PAGES * PAGE_SIZE
 
 # What a fetched pull's draft flag becoming true/false would have been
 # delivered as. Neither announces anything; `ready_for_review` does.
@@ -72,6 +74,19 @@ def _labels(issue: dict[str, Any]) -> list[str]:
 
 def _login(obj: Any) -> str:
     return str(((obj or {}).get("login")) or "")
+
+
+def _as_open(pull: dict[str, Any]) -> dict[str, Any]:
+    """The snapshot as the ``opened``/``synchronize`` webhook carried it: a
+    PR is open when it opens, whatever became of it since."""
+    return {**pull, "state": "open"}
+
+
+def _is_successful_suite(suite: dict[str, Any]) -> bool:
+    return (
+        str(suite.get("status") or "") == "completed"
+        and str(suite.get("conclusion") or "") == "success"
+    )
 
 
 class Reconciler:
@@ -94,17 +109,22 @@ class Reconciler:
 
     # ------------------------------------------------------------------ driver
 
-    def reconcile_one(self, now: datetime | None = None) -> bool:
+    def reconcile_one(
+        self, now: datetime | None = None, *, due_before: str | None = None
+    ) -> bool:
         """Reconcile the active run longest without a read, if one is due.
 
-        Returns whether a run was looked at. A failing read is logged and the
-        run is still marked as read, so one broken issue cannot pin the
-        reconciler to itself; it is retried after the interval like any other.
+        Due means last read before ``due_before``, which defaults to one
+        interval ago. Returns whether a run was looked at. A failing read is
+        logged and the run is still marked as read, so one broken issue
+        cannot pin the reconciler to itself; it is retried after the interval
+        like any other.
         """
-        now = now or utcnow()
-        due_before = (
-            now - timedelta(seconds=self.settings.reconcile_interval_seconds)
-        ).isoformat()
+        if due_before is None:
+            now = now or utcnow()
+            due_before = (
+                now - timedelta(seconds=self.settings.reconcile_interval_seconds)
+            ).isoformat()
         run = self.store.reconcile_candidate(self.settings.env, due_before)
         if run is None:
             return False
@@ -128,11 +148,11 @@ class Reconciler:
         """Startup pass: re-read every active run once, whatever its last
         read time. What happened while the service was down is exactly what
         no webhook will tell it. Returns the number of runs looked at."""
-        # Fixed horizon: everything read before boot is due, everything read
-        # during this pass (stamped after it) is not, so the pass terminates.
-        horizon = utcnow() + timedelta(seconds=self.settings.reconcile_interval_seconds)
+        # Everything read before boot is due; everything this pass reads is
+        # stamped at or after boot and so is not, which is what ends the loop.
+        boot = now_iso()
         looked = 0
-        while self.reconcile_one(now=horizon):
+        while self.reconcile_one(due_before=boot):
             looked += 1
         return looked
 
@@ -226,9 +246,20 @@ class Reconciler:
         self, repo: str, number: int, event: str, label: str | None = None
     ) -> tuple[str, str | None]:
         """Who last did ``event`` to the issue, from its event log, with the
-        event's id. Empty when the log has no such event."""
+        event's id. Empty when the log has no such event, or is too long to
+        be read whole: the log is oldest first, so a truncated one could name
+        an earlier actor for the latest label, and nobody spends on that."""
         found: dict[str, Any] | None = None
-        for item in self.github.list_issue_events(repo, number):
+        events = self.github.list_issue_events(repo, number)
+        if len(events) >= MAX_ISSUE_EVENTS:
+            logger.warning(
+                "issue %s#%s has %d+ events; the newest are unread, no actor taken",
+                repo,
+                number,
+                MAX_ISSUE_EVENTS,
+            )
+            return "", None
+        for item in events:
             if str(item.get("event") or "") != event:
                 continue
             if (
@@ -251,7 +282,7 @@ class Reconciler:
             if pull is None:
                 return applied
             head = str((pull.get("head") or {}).get("sha") or "")
-            if self._deliver_pull(repo, pull, "opened", head):
+            if self._deliver_pull(repo, _as_open(pull), "opened", head):
                 applied.append("pr.opened")
             run_after = self.store.get_run(run_id)
             if run_after is None or run_after["pr_number"] is None:
@@ -279,25 +310,29 @@ class Reconciler:
         run_id = str(run["id"])
         applied: list[str] = []
         head = str((pull.get("head") or {}).get("sha") or "")
-        if str(pull.get("state") or "") == "closed":
-            if str(run["pr_state"] or "") != "closed" and self._deliver_pull(
-                repo, pull, "closed", head
-            ):
-                applied.append("pr.merged" if pull.get("merged") else "pr.closed")
-            return applied
+        closed = str(pull.get("state") or "") == "closed"
 
+        # Everything GitHub would have delivered while the PR was open comes
+        # first, as it did in reality: the final head, its checks and its
+        # reviews are the evidence a merge is judged by, and once the run is
+        # terminal it is never read again.
         if head and head != str(run["head_sha"] or ""):
-            if self._deliver_pull(repo, pull, "synchronize", head):
+            if self._deliver_pull(repo, _as_open(pull), "synchronize", head):
                 applied.append("pr.synchronize")
-        elif bool(pull.get("draft")) != bool(run["pr_draft"]):
+        elif not closed and bool(pull.get("draft")) != bool(run["pr_draft"]):
             action = _DRAFT_ACTIONS[bool(pull.get("draft"))]
             if self._deliver_pull(repo, pull, action, head):
                 applied.append(f"pr.{action}")
 
-        applied += self._reconcile_protection(run, repo, pull)
+        if not closed:
+            applied += self._reconcile_protection(run, repo, pull)
         if head:
             applied += self._reconcile_checks(run_id, repo, head)
         applied += self._reconcile_reviews(run_id, repo, int(pull["number"]), pull)
+
+        if closed and str(run["pr_state"] or "") != "closed":
+            if self._deliver_pull(repo, pull, "closed", head):
+                applied.append("pr.merged" if pull.get("merged") else "pr.closed")
         return applied
 
     def _deliver_pull(
@@ -310,8 +345,13 @@ class Reconciler:
             "sender": {"login": _login(pull.get("merged_by") or pull.get("user"))},
         }
         number = int(pull["number"])
+        # The head alone cannot tell two draft toggles apart; the snapshot's
+        # own timestamp can, while a repeat of the same read stays a duplicate.
+        revision = f"{head}:{pull.get('updated_at') or '-'}"
         result = self.intake.handle(
-            delivery_id=f"{DELIVERY_PREFIX}:{repo}:pull_request:{number}:{action}:{head}",
+            delivery_id=(
+                f"{DELIVERY_PREFIX}:{repo}:pull_request:{number}:{action}:{revision}"
+            ),
             event="pull_request",
             payload=payload,
         )
@@ -372,7 +412,13 @@ class Reconciler:
             for row in self.store.checks_for_head(run_id, head)
         }
         applied: list[str] = []
-        for suite in self.github.list_check_suites(repo, head):
+        # The intake judges the head after every suite it stores. Fed one at a
+        # time, a passing suite could be the only one it knows and verify the
+        # head before the failing or pending one arrives; so those go first.
+        suites = sorted(
+            self.github.list_check_suites(repo, head), key=_is_successful_suite
+        )
+        for suite in suites:
             suite_id = str(suite.get("id") or "")
             status = str(suite.get("status") or "queued")
             conclusion = suite.get("conclusion")
@@ -382,7 +428,7 @@ class Reconciler:
             result = self.intake.handle(
                 delivery_id=(
                     f"{DELIVERY_PREFIX}:{repo}:check_suite:{suite_id}:{status}"
-                    f":{conclusion or '-'}"
+                    f":{conclusion or '-'}:{suite.get('updated_at') or '-'}"
                 ),
                 event="check_suite",
                 payload={

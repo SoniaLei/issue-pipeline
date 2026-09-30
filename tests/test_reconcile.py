@@ -20,6 +20,7 @@ and what it must never do on its own."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -35,7 +36,7 @@ from app.github_client import (
 )
 from app.intake import Intake
 from app.prompts import branch_name
-from app.reconcile import Reconciler
+from app.reconcile import MAX_ISSUE_EVENTS, Reconciler
 from app.slack_client import FakeSlackTransport
 from app.states import State
 from app.store import Store, utcnow
@@ -78,11 +79,14 @@ def pull_snapshot(run_id: str, **overrides: Any) -> dict[str, Any]:
     return pull
 
 
-def suite(suite_id: int, conclusion: str | None = "success") -> dict[str, Any]:
+def suite(
+    suite_id: int, conclusion: str | None = "success", updated_at: str = T0
+) -> dict[str, Any]:
     return {
         "id": suite_id,
         "status": "completed" if conclusion else "in_progress",
         "conclusion": conclusion,
+        "updated_at": updated_at,
         "app": {"slug": "github-actions"},
         "url": f"https://api.github.com/repos/{REPO}/check-suites/{suite_id}",
     }
@@ -227,19 +231,25 @@ def test_a_label_the_api_shows_does_not_approve_without_its_actor(
     reconciler.reconcile_one()
     assert run_state(store, run_id) == State.AWAITING_APPROVAL.value
 
-    # Applied by a maintainer: the same decision a webhook would have carried.
+    # An event log too long to read whole (oldest first, so the newest label
+    # events are the unread ones) names nobody, even if an old entry would.
+    maintainer_labeled = {
+        "id": 9003,
+        "event": "labeled",
+        "label": {"name": "devin-ready"},
+        "actor": {"login": "SoniaLei"},
+    }
+    padding = [{"id": 1000 + i, "event": "mentioned"} for i in range(MAX_ISSUE_EVENTS)]
     github.set_issue(
-        REPO,
-        issue_snapshot(updated_at=T1),
-        events=[
-            {
-                "id": 9003,
-                "event": "labeled",
-                "label": {"name": "devin-ready"},
-                "actor": {"login": "SoniaLei"},
-            }
-        ],
+        REPO, issue_snapshot(updated_at=T1), events=[maintainer_labeled, *padding]
     )
+    with store.transaction() as conn:
+        store.mark_reconciled(conn, run_id, "2000-01-01T00:00:00+00:00")
+    reconciler.reconcile_one()
+    assert run_state(store, run_id) == State.AWAITING_APPROVAL.value
+
+    # Applied by a maintainer: the same decision a webhook would have carried.
+    github.set_issue(REPO, issue_snapshot(updated_at=T1), events=[maintainer_labeled])
     with store.transaction() as conn:
         store.mark_reconciled(conn, run_id, "2000-01-01T00:00:00+00:00")
     reconciler.reconcile_one()
@@ -355,6 +365,99 @@ def test_missed_close_without_merge_is_not_success(
     assert run_state(store, run_id) == State.CLOSED_UNMERGED.value
 
 
+def test_a_pr_opened_and_closed_while_down_lands_terminal(
+    intake: Intake,
+    store: Store,
+    github: SimulatedGitHubClient,
+    reconciler: Reconciler,
+) -> None:
+    """Discovery finds the PR already merged: it opened, then closed, and
+    the run must end where GitHub says it did, not at `pr_open`."""
+    run_id = running_run(intake, store)
+    github.set_issue(REPO, issue_snapshot())
+    github.set_pull(
+        REPO,
+        pull_snapshot(
+            run_id,
+            state="closed",
+            merged=True,
+            merge_commit_sha="feedface00",
+            merged_by={"login": "SoniaLei"},
+        ),
+        check_suites=[suite(7001)],
+    )
+
+    reconciler.reconcile_one()
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["state"] == State.MERGED.value
+    assert run["pr_number"] == 91
+    assert run["merged_sha"] == "feedface00"
+    assert run["checks_state"] == "passed"
+    assert notification_kinds(store)[-2:] == ["pr_opened", "pr_merged"]
+
+
+def test_a_late_merge_still_records_the_final_head_and_its_evidence(
+    intake: Intake,
+    store: Store,
+    settings: Settings,
+    github: SimulatedGitHubClient,
+    reconciler: Reconciler,
+) -> None:
+    """A PR that moved to a new head, passed its checks and merged while the
+    service was down: the terminal run keeps what GitHub judged it on."""
+    run_id = pr_open_run(intake, store)
+    github.set_issue(REPO, issue_snapshot())
+    github.set_pull(
+        REPO,
+        pull_snapshot(
+            run_id,
+            state="closed",
+            merged=True,
+            merge_commit_sha="feedface00",
+            head={
+                "ref": branch_name(ISSUE, run_id),
+                "sha": "e5f6a7b8",
+                "repo": {"full_name": REPO},
+            },
+        ),
+        check_suites=[suite(7001), suite(7002)],
+    )
+
+    due = store.reconcile_candidate(settings.env, "9999")
+    assert due is not None
+    applied = reconciler.reconcile_run(due)
+
+    assert applied[:1] == ["pr.synchronize"]
+    assert applied[-1] == "pr.merged"
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["state"] == State.MERGED.value
+    assert run["head_sha"] == "e5f6a7b8"
+    assert run["checks_head_sha"] == "e5f6a7b8"
+    assert run["checks_state"] == "passed"
+    assert len(store.checks_for_head(run_id, "e5f6a7b8")) == 2
+
+
+def test_draft_toggles_on_one_head_are_each_replayed(
+    intake: Intake,
+    store: Store,
+    github: SimulatedGitHubClient,
+    reconciler: Reconciler,
+) -> None:
+    run_id = pr_open_run(intake, store)
+    github.set_issue(REPO, issue_snapshot())
+    for draft, stamp in ((True, T0), (False, T1), (True, "2026-09-20T12:00:00Z")):
+        github.set_pull(REPO, pull_snapshot(run_id, draft=draft, updated_at=stamp))
+        with store.transaction() as conn:
+            store.mark_reconciled(conn, run_id, "2000-01-01T00:00:00+00:00")
+        reconciler.reconcile_one()
+        run = store.get_run(run_id)
+        assert run is not None
+        assert bool(run["pr_draft"]) is draft
+
+
 def test_a_new_head_invalidates_checks_and_review_evidence(
     intake: Intake,
     store: Store,
@@ -420,6 +523,59 @@ def test_failed_checks_read_from_the_api_notify_once(
     assert notification_kinds(store).count("checks_failed") == 1
     kinds = [row["kind"] for row in store.events_for_run(run_id)]
     assert kinds.count("reconcile") == 1
+
+
+def test_a_partial_read_never_verifies_a_head(
+    store: Store,
+    settings: Settings,
+    github: SimulatedGitHubClient,
+) -> None:
+    """GitHub answers with the whole suite list at once; fed to the intake
+    one by one, the passing suite must not be judged before the failing one."""
+    ungated = replace(settings, review_gate_mode="off")
+    intake = Intake(store, ungated)
+    reconciler = Reconciler(store, ungated, intake, github)
+    run_id = pr_open_run(intake, store)
+    github.set_issue(REPO, issue_snapshot())
+    github.set_pull(
+        REPO,
+        pull_snapshot(run_id),
+        check_suites=[suite(7001), suite(7002, conclusion="failure"), suite(7003)],
+    )
+
+    reconciler.reconcile_one()
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["checks_state"] == "failed"
+    kinds = notification_kinds(store)
+    assert "verified" not in kinds
+    assert "verified" not in [row["kind"] for row in store.events_for_run(run_id)]
+    assert kinds.count("checks_failed") == 1
+
+
+def test_a_rerun_suite_is_followed_through_pending_back_to_success(
+    intake: Intake,
+    store: Store,
+    github: SimulatedGitHubClient,
+    reconciler: Reconciler,
+) -> None:
+    run_id = pr_open_run(intake, store)
+    github.set_issue(REPO, issue_snapshot())
+    states: list[str] = []
+    for suites in (
+        [suite(7001, updated_at=T0)],
+        [suite(7001, conclusion=None, updated_at=T1)],
+        [suite(7001, updated_at="2026-09-20T12:00:00Z")],
+    ):
+        github.set_pull(REPO, pull_snapshot(run_id), check_suites=suites)
+        with store.transaction() as conn:
+            store.mark_reconciled(conn, run_id, "2000-01-01T00:00:00+00:00")
+        reconciler.reconcile_one()
+        run = store.get_run(run_id)
+        assert run is not None
+        states.append(str(run["checks_state"]))
+    assert states == ["passed", "pending", "passed"]
 
 
 def test_reviews_are_replayed_for_bot_verdicts_and_the_latest_human_verdict(
@@ -659,7 +815,7 @@ def test_an_api_failure_is_recorded_and_does_not_pin_the_reconciler(
     assert run_state(store, str(healthy)) == State.QUEUED.value
 
 
-def test_worker_reconciles_only_on_idle_ticks_and_survives_errors(
+def test_worker_reconciles_on_busy_ticks_too_and_survives_errors(
     intake: Intake,
     store: Store,
     settings: Settings,
@@ -667,19 +823,45 @@ def test_worker_reconciles_only_on_idle_ticks_and_survives_errors(
     devin: SimulatedDevinClient,
     slack: FakeSlackTransport,
 ) -> None:
+    """A session being polled keeps every tick busy; its own issue must
+    still be re-read, or a revocation could go unseen for the session's
+    whole life."""
+    first = queued_run(intake)
+    second = deliver(
+        intake,
+        "issues",
+        "issue_labeled.json",
+        issue=issue_snapshot(number=4300, updated_at=T0),
+    ).run_id
+    github.set_issue(REPO, issue_snapshot())
+    github.set_issue(REPO, issue_snapshot(number=4300, state="closed", updated_at=T1))
+    with store.transaction() as conn:
+        store.mark_reconciled(conn, first, "2000-01-01T00:00:00+00:00")
+    worker = Worker(
+        store,
+        settings,
+        devin,
+        slack,
+        owner="test-worker",
+        reconciler=Reconciler(store, settings, intake, github),
+    )
+    # A busy tick: the first run starts a session, and GitHub is still read
+    # (never-read runs first), so the second issue's close is seen before
+    # that run can spend.
+    assert worker.tick() is True
+    assert ("issue", REPO, "4300") in github.calls
+    assert run_state(store, first) != State.QUEUED.value
+    assert run_state(store, str(second)) == State.CANCELLED.value
+
     class Exploding(SimulatedGitHubClient):
         def get_issue(self, repo: str, number: int) -> dict[str, Any]:
             raise RuntimeError("boom")
 
-    run_id = queued_run(intake)
-    reconciler = Reconciler(store, settings, intake, Exploding())
-    worker = Worker(
-        store, settings, devin, slack, owner="test-worker", reconciler=reconciler
-    )
-    # Busy tick: the queued run advances, no GitHub read happens.
-    assert worker.tick() is True
-    assert store.get_run(run_id) is not None
-    assert worker.catch_up_github() == 0  # the error is logged, not raised
+    worker.reconciler = Reconciler(store, settings, intake, Exploding())
+    with store.transaction() as conn:
+        store.mark_reconciled(conn, first, "2000-01-01T00:00:00+00:00")
+    assert worker.tick() is True  # the error is logged, not raised
+    assert worker.catch_up_github() == 0
 
     without = Worker(store, settings, devin, slack, owner="test-worker-2")
     assert without.reconcile_github() is False

@@ -1176,19 +1176,21 @@ hand. D-040 orders the deliveries that do arrive; nothing recovered the ones
 that did not.
 
 The service now has a read-only GitHub client (`app/github_client.py`) and a
-reconciler (`app/reconcile.py`) the worker runs when it has no queued work,
-plus once at startup:
+reconciler (`app/reconcile.py`) the worker runs on every tick, plus once at
+startup:
 
 - **Scope: active runs only.** A run in a terminal state is never re-read,
   so nothing learned late can move it (§11). The candidate is the active run
-  whose `reconciled_at` is oldest or null; one run per idle tick, so
-  reconciliation never starves real work, and `RECONCILE_INTERVAL_SECONDS`
-  (default 300) spaces the reads per run. `reconciled_at` is bookkeeping and
+  whose `reconciled_at` is oldest or null; at most one run per tick, busy or
+  idle (a session being polled keeps every tick busy for hours, and it is
+  exactly that run's issue whose revocation or closed PR must not go unread
+  meanwhile), and `RECONCILE_INTERVAL_SECONDS` (default 300) spaces the reads
+  per run, which bounds the API cost. `reconciled_at` is bookkeeping and
   does not touch `updated_at`, so a no-op read is invisible to the dashboard's
   freshness and to `data_as_of`.
 - **Startup catch-up.** `Worker.run_forever` first reads every active run once
-  regardless of its last read time (a fixed horizon, so runs stamped during
-  the pass are not re-read by it). What happened while the service was down
+  regardless of its last read time: due means read before boot, and a run
+  the pass reads is stamped after boot, so each is read exactly once. What happened while the service was down
   is exactly what no webhook will say.
 - **Replay, not repair.** The reconciler compares the fetched issue and PR
   with what the run recorded and, for each difference, builds the webhook
@@ -1214,7 +1216,20 @@ plus once at startup:
   already stored for that head is skipped, a human `commented` review is
   ignored, and only the latest human approved/changes-requested verdict is
   replayed. A new head invalidates checks and review evidence through the
-  ordinary `synchronize` path (D-030).
+  ordinary `synchronize` path (D-030). A PR found already closed is replayed
+  in the order GitHub lived it — `opened` if never correlated, `synchronize`
+  if the head moved, then its suites and reviews, then `closed` — because a
+  terminal run is never read again, so the evidence the merge was judged on
+  has to be recorded before the run becomes terminal. Suites are fed failing
+  and pending first, passing last, so a partial replay can never verify a
+  head the full answer does not. A revision (`updated_at`) is part of every
+  replayed PR and suite delivery id, so a rerun that returns to the same
+  conclusion, or a second draft toggle on one head, is a new observation
+  while a repeat of the same read stays a duplicate.
+- **Event history has a horizon.** The live client reads at most 1,000 issue
+  events (oldest first). An issue busier than that logs a warning and its
+  newest label events may be unseen; the failure direction is no actor found
+  and therefore no spend, never spend on a guessed actor.
 - **Branch protection is observed, not yet gated.** The base branch's
   `required_status_checks` are read and stored on the run
   (`runs.required_checks`, `protection` event) so the gap between "all suites
