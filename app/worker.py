@@ -66,6 +66,9 @@ logger = logging.getLogger(__name__)
 
 MAX_NOTIFICATION_ATTEMPTS = 6
 BASE_BACKOFF_SECONDS = 5.0
+# How far either side of a webhook-era "PR opened" row's `sent_at` to search
+# channel history for the post itself (D-041).
+ANCHOR_LOOKUP_WINDOW_SECONDS = 120.0
 
 # States where the run has stopped making progress on its own and someone has
 # to look at it.
@@ -912,6 +915,8 @@ class Worker:
                     run_id, destination
                 ):
                     continue
+                if anchor is None:
+                    anchor = self._recover_anchor(run_id, destination, target)
             thread_ts = str(anchor["slack_ts"]) if anchor is not None else None
 
             payload: dict[str, Any] = json.loads(str(row["payload"]))
@@ -935,6 +940,42 @@ class Worker:
             delay = result.retry_after or BASE_BACKOFF_SECONDS * (2 ** (attempts - 1))
             self.store.mark_notification_retry(outbox_id, result.detail, delay)
         return sent
+
+    def _recover_anchor(
+        self, run_id: str, destination: str, target: str
+    ) -> sqlite3.Row | None:
+        """Adopt a "PR opened" post that went out through a webhook.
+
+        The row knows what was posted and when, but not the message's ``ts``.
+        Channel history around ``sent_at`` is searched for that exact text
+        carrying the run id; a hit is stored on the row, which makes it the
+        anchor from then on. A miss (no history scope, message deleted, outside
+        the window) leaves the follow-up top-level, as before (D-041).
+        """
+        row = self.store.unanchored_pr_opened(run_id, destination)
+        if row is None:
+            return None
+        text = str(json.loads(str(row["payload"])).get("text") or "")
+        sent = datetime.fromisoformat(str(row["sent_at"])).timestamp()
+        result = self.slack.find_message(
+            target,
+            text=text,
+            contains=f"`{run_id}`",
+            oldest=sent - ANCHOR_LOOKUP_WINDOW_SECONDS,
+            latest=sent + ANCHOR_LOOKUP_WINDOW_SECONDS,
+        )
+        if not result.ok or not result.ts:
+            logger.info(
+                "no Slack anchor found for run %s in %s: %s",
+                run_id,
+                destination,
+                result.detail,
+            )
+            return None
+        self.store.set_notification_identity(
+            int(row["id"]), channel=target, ts=result.ts
+        )
+        return self.store.slack_anchor(run_id, destination)
 
     def _react_on_anchor(
         self, outbox_id: int, anchor: sqlite3.Row, kind: Kind, reason: str | None

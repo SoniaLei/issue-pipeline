@@ -187,7 +187,9 @@ the ones it can check are present:
      so the channel reads one line per PR. Follow-ups wait for a retrying
      anchor and fall back to top-level if it never delivered; a reaction
      that fails is shown in the run's timeline, never retried, and never
-     touches the run (D-036).
+     touches the run (D-036). Add `channels:history` (`groups:history` for
+     private channels) so a run whose *PR opened* went out through a webhook
+     before the switch is found in the channel and threaded too (D-041).
 
 Then a maintainer in `MAINTAINER_ALLOWLIST` applies `devin-ready` to an issue,
 and `/dashboard?env=live` shows the run from `queued` onwards: the session
