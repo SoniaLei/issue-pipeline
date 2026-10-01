@@ -554,6 +554,35 @@ def test_a_partial_read_never_verifies_a_head(
     assert kinds.count("checks_failed") == 1
 
 
+@pytest.mark.parametrize("passing", ["neutral", "skipped"])
+def test_a_partial_read_never_verifies_a_head_on_a_non_success_pass(
+    store: Store,
+    settings: Settings,
+    github: SimulatedGitHubClient,
+    passing: str,
+) -> None:
+    """A neutral or skipped suite counts as passing, so it waits behind the
+    failing one like a successful suite does."""
+    ungated = replace(settings, review_gate_mode="off")
+    intake = Intake(store, ungated)
+    reconciler = Reconciler(store, ungated, intake, github)
+    run_id = pr_open_run(intake, store)
+    github.set_issue(REPO, issue_snapshot())
+    github.set_pull(
+        REPO,
+        pull_snapshot(run_id),
+        check_suites=[suite(7001, conclusion=passing), suite(7002, "failure")],
+    )
+
+    reconciler.reconcile_one()
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert run["checks_state"] == "failed"
+    assert "verified" not in notification_kinds(store)
+    assert "verified" not in [row["kind"] for row in store.events_for_run(run_id)]
+
+
 def test_a_rerun_suite_is_followed_through_pending_back_to_success(
     intake: Intake,
     store: Store,
