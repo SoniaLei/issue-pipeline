@@ -919,7 +919,8 @@ actually acted on.
 
 ## D-036 — The "PR opened" post is the run's Slack anchor; the rest of the PR's life is a thread and reactions on it
 
-**Status**: accepted (maintainer decision)
+**Status**: accepted (maintainer decision); its scope list is extended by
+D-042
 
 **Decision.** With a bot token (`SLACK_TRANSPORT=bot`) the worker keeps the
 channel and `ts` that `chat.postMessage` returns for a run's *PR opened*
@@ -1261,3 +1262,40 @@ did not start, so Automation-started sessions remain outside the dashboard
 **Revisit when** the service has a permanent host and App credentials: at that
 point the pre-spend re-fetch (§5) is one extra `get_issue` in the worker, and
 the required-contexts match can be built on check-run reads.
+
+---
+
+## D-042 — A webhook-era "PR opened" post is looked up in channel history and adopted as the anchor
+
+**Status**: accepted (maintainer request)
+
+**Context.** D-036 threads a run's follow-ups under its *PR opened* post, using
+the `ts` that `chat.postMessage` returns. A run whose PR opened while the
+service was on `SLACK_TRANSPORT=webhook` has a sent `pr_opened` row with no
+`ts`, so after a switch to `bot` every later message for that PR went out
+top-level and nothing reacted to the post the channel already had. That is
+exactly the channel D-036 set out to avoid, for every PR in flight at the
+switch.
+
+**Decision.** When a follow-up has no anchor and the run's `pr_opened` row was
+sent without a Slack identity, the worker searches the destination channel's
+history (`conversations.history`, ±120 s around the row's `sent_at`) for a
+top-level message whose text is the row's stored text and whose blocks carry
+the run id. A hit is written to the row (`slack_channel`, `slack_ts`) and the
+row becomes the anchor for this and every later follow-up. A miss — no history
+scope, message deleted or edited, outside the window, webhook transport — is
+the D-036 fallback: the follow-up goes top-level and nothing is dropped.
+
+**Why this match.** The title alone repeats across re-runs of one issue; the
+run id does not. The window keeps the read to one page and stops an older post
+with the same text from being adopted. Only the stored payload and the
+configured channel are used, so issue or PR content still cannot steer where
+a message goes.
+
+**Scope.** `channels:history` (and `groups:history` for private channels) on
+the bot token. This widens D-036's "`chat:write` and `reactions:write` and
+nothing else": the bot may now read the channels it posts to. It is optional;
+without it the behaviour is D-036's.
+
+**Revisit when** anchors need to survive a post being deleted and reposted, or
+when the lookup should also cover webhook-era posts older than the window.

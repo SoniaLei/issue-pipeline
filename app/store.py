@@ -1250,6 +1250,32 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def unanchored_pr_opened(self, run_id: str, destination: str) -> sqlite3.Row | None:
+        """The run's `pr_opened` message that was delivered without a Slack
+        identity (webhook transport), if any: a candidate to look up (D-042)."""
+        return self._conn.execute(
+            """
+            SELECT * FROM outbox
+            WHERE run_id = ? AND destination = ? AND kind = 'pr_opened'
+              AND state = 'sent' AND slack_ts IS NULL AND sent_at IS NOT NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (run_id, destination),
+        ).fetchone()
+
+    def set_notification_identity(
+        self, outbox_id: int, *, channel: str, ts: str
+    ) -> None:
+        """Record the Slack identity of a message found after it was sent."""
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE outbox SET slack_channel = ?, slack_ts = ?
+                WHERE id = ? AND slack_ts IS NULL
+                """,
+                (channel, ts, outbox_id),
+            )
+
     def mark_notification_retry(
         self, outbox_id: int, error: str, retry_after_seconds: float
     ) -> None:

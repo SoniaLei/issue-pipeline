@@ -20,6 +20,7 @@ post (D-036); the webhook transport keeps working without either."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -256,6 +257,81 @@ def test_an_old_database_gains_the_anchor_columns(tmp_path: Path) -> None:
     reopened.close()
 
 
+# ------------------------------------------------ webhook-era anchor (D-042)
+
+
+def _webhook_era_anchor(store: Store, settings: Settings) -> tuple[str, Any]:
+    """A run whose "PR opened" post went out through an incoming webhook."""
+    devin = SimulatedDevinClient(script=load_script("simulated_session_events.json"))
+    webhook = Worker(
+        store, settings, devin, FakeSlackTransport(threads=False), owner="webhook"
+    )
+    run_id = run_to_pr(Intake(store, settings), webhook, store)
+    webhook.drain_outbox()
+    anchor = _by_kind(store, "pr_opened")
+    assert anchor["state"] == "sent"
+    assert anchor["slack_ts"] is None
+    return run_id, anchor
+
+
+def _as_posted(anchor: Any, ts: str, **over: Any) -> dict[str, Any]:
+    payload = json.loads(str(anchor["payload"]))
+    return {"ts": ts, "text": payload["text"], "blocks": payload["blocks"], **over}
+
+
+def test_a_webhook_era_anchor_is_found_in_history_and_threaded_under(
+    store: Store, settings: Settings
+) -> None:
+    run_id, anchor = _webhook_era_anchor(store, settings)
+    channel = "https://slack.invalid/engineering"
+    ts = f"{time.time():.6f}"
+    other_run = _as_posted(anchor, f"{time.time() - 1:.6f}", blocks=[])
+    reply = _as_posted(anchor, f"{time.time() - 2:.6f}", thread_ts="1.0")
+    slack = FakeSlackTransport(
+        history=[
+            (channel, other_run),
+            (channel, reply),
+            (channel, _as_posted(anchor, ts)),
+        ]
+    )
+    devin = SimulatedDevinClient(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, settings, devin, slack, owner="bot")
+    intake = Intake(store, settings)
+
+    send(intake, "check_suite", "check_suite_failure.json", run_id)
+    send(intake, "pull_request", "pr_merged.json", run_id)
+    assert worker.drain_outbox() == 2
+
+    adopted = _by_kind(store, "pr_opened")
+    assert adopted["slack_channel"] == channel
+    assert adopted["slack_ts"] == ts
+    assert slack.thread_of == [ts, ts]
+    assert slack.reactions == [
+        (channel, ts, "red_circle"),
+        (channel, ts, "white_check_mark"),
+    ]
+    assert slack.lookups == 1
+
+
+def test_a_webhook_era_anchor_not_in_history_leaves_follow_ups_top_level(
+    store: Store, settings: Settings
+) -> None:
+    run_id, anchor = _webhook_era_anchor(store, settings)
+    long_ago = _as_posted(anchor, f"{time.time() - 3600:.6f}")
+    slack = FakeSlackTransport(
+        history=[("https://slack.invalid/engineering", long_ago)]
+    )
+    devin = SimulatedDevinClient(script=load_script("simulated_session_events.json"))
+    worker = Worker(store, settings, devin, slack, owner="bot")
+
+    send(Intake(store, settings), "pull_request", "pr_merged.json", run_id)
+    assert worker.drain_outbox() == 1
+    assert slack.thread_of == [None]
+    assert slack.reactions == []
+    assert _by_kind(store, "pr_opened")["slack_ts"] is None
+    assert _by_kind(store, "pr_merged")["state"] == "sent"
+
+
 # ------------------------------------------------------------ webhook transport
 
 
@@ -374,6 +450,50 @@ def test_already_reacted_counts_as_done() -> None:
         "name": "white_check_mark",
     }
     assert seen[0].url.path == "/api/reactions.add"
+
+
+def test_find_message_reads_history_and_skips_replies_and_other_runs() -> None:
+    wanted = {"text": ":inbox_tray: PR opened: x", "blocks": [{"t": "Run: `r1`"}]}
+    client, seen = _api(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {**wanted, "ts": "1712.0003", "thread_ts": "1712.0001"},
+                    {**wanted, "ts": "1712.0002", "blocks": [{"t": "Run: `r2`"}]},
+                    {**wanted, "ts": "1712.0001", "thread_ts": "1712.0001"},
+                ],
+            },
+        )
+    )
+    result = client.find_message(
+        "C0ENG", text=wanted["text"], contains="`r1`", oldest=1700.0, latest=1800.0
+    )
+    assert result.ok
+    assert result.ts == "1712.0001"
+    assert result.channel == "C0ENG"
+    request = seen[0]
+    assert request.method == "GET"
+    assert request.url.path == "/api/conversations.history"
+    assert request.url.params["channel"] == "C0ENG"
+    assert request.url.params["oldest"] == "1700.000000"
+    assert request.url.params["latest"] == "1800.000000"
+    assert request.url.params["inclusive"] == "true"
+
+
+def test_find_message_without_history_scope_is_a_permanent_miss() -> None:
+    client, _ = _api(
+        lambda request: httpx.Response(
+            200, json={"ok": False, "error": "missing_scope"}
+        )
+    )
+    result = client.find_message(
+        "C0ENG", text="t", contains="`r1`", oldest=0.0, latest=1.0
+    )
+    assert not result.ok
+    assert not result.retryable
+    assert result.detail == "missing_scope"
 
 
 # ------------------------------------------------------------- re-approval

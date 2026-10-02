@@ -28,10 +28,16 @@ into an issue; what the key resolves to differs:
 
 A transport reports whether it can thread so the caller can fall back to a
 top-level message rather than lose a notification.
+
+The bot can also look a message up in channel history (``conversations.history``,
+scopes ``channels:history`` / ``groups:history``). That is how a run whose
+"PR opened" post went out through a webhook, and so has no stored ``ts``, still
+gets a thread (D-042).
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -66,6 +72,21 @@ class SlackTransport(Protocol):
     ) -> SendResult: ...
 
     def react(self, channel: str, ts: str, name: str) -> SendResult: ...
+
+    def find_message(
+        self, channel: str, *, text: str, contains: str, oldest: float, latest: float
+    ) -> SendResult: ...
+
+
+def matches_message(message: dict[str, Any], *, text: str, contains: str) -> bool:
+    """A top-level message whose text is ``text`` and whose body mentions
+    ``contains`` somewhere (the run id, which the title alone does not pin)."""
+    thread_ts = message.get("thread_ts")
+    if thread_ts and thread_ts != message.get("ts"):
+        return False
+    if message.get("text") != text:
+        return False
+    return contains in json.dumps(message.get("blocks") or [], ensure_ascii=False)
 
 
 class LiveSlackTransport:
@@ -109,9 +130,15 @@ class LiveSlackTransport:
     def react(self, channel: str, ts: str, name: str) -> SendResult:
         return SendResult(False, "incoming webhooks cannot add reactions")
 
+    def find_message(
+        self, channel: str, *, text: str, contains: str, oldest: float, latest: float
+    ) -> SendResult:
+        return SendResult(False, "incoming webhooks cannot read history")
+
 
 class BotSlackTransport:
-    """Web API with a bot token (scopes: ``chat:write``, ``reactions:write``)."""
+    """Web API with a bot token (scopes: ``chat:write``, ``reactions:write``;
+    ``channels:history`` / ``groups:history`` for :meth:`find_message`)."""
 
     threads = True
 
@@ -150,9 +177,47 @@ class BotSlackTransport:
             return SendResult(True, "already_reacted", channel=channel, ts=ts)
         return result
 
+    def find_message(
+        self, channel: str, *, text: str, contains: str, oldest: float, latest: float
+    ) -> SendResult:
+        """The ``ts`` of the first top-level message in ``[oldest, latest]``
+        that :func:`matches_message` accepts."""
+        params = {
+            "channel": channel,
+            "oldest": f"{oldest:.6f}",
+            "latest": f"{latest:.6f}",
+            "inclusive": "true",
+            "limit": "200",
+        }
+        messages: list[dict[str, Any]] = []
+        result = self._request(
+            "GET", "conversations.history", params=params, messages=messages
+        )
+        if not result.ok:
+            return result
+        for message in messages:
+            if matches_message(message, text=text, contains=contains):
+                return SendResult(
+                    True, "found", channel=channel, ts=str(message.get("ts"))
+                )
+        return SendResult(False, "not_found")
+
     def _call(self, method: str, body: dict[str, Any]) -> SendResult:
+        return self._request("POST", method, body=body)
+
+    def _request(
+        self,
+        verb: str,
+        method: str,
+        *,
+        body: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> SendResult:
         try:
-            response = self._client.post(f"{self._api_base}/{method}", json=body)
+            response = self._client.request(
+                verb, f"{self._api_base}/{method}", json=body, params=params
+            )
         except httpx.TimeoutException:
             return SendResult(False, "timeout", retryable=True)
         except httpx.HTTPError as exc:
@@ -176,6 +241,10 @@ class BotSlackTransport:
         if not isinstance(data, dict):  # pragma: no cover - defensive
             return SendResult(False, "slack returned a non-object body")
         if data.get("ok") is True:
+            if messages is not None:
+                messages.extend(
+                    m for m in data.get("messages") or [] if isinstance(m, dict)
+                )
             channel = data.get("channel")
             ts = data.get("ts")
             return SendResult(
@@ -201,6 +270,9 @@ class FakeSlackTransport:
     sent: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     thread_of: list[str | None] = field(default_factory=list)
     reactions: list[tuple[str, str, str]] = field(default_factory=list)
+    # Channel history `find_message` searches, as (channel, message) pairs.
+    history: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    lookups: int = 0
     fail_times: int = 0
     fail_reactions: bool = False
     threads: bool = True
@@ -225,6 +297,22 @@ class FakeSlackTransport:
             return SendResult(False, "missing_scope")
         self.reactions.append((channel, ts, name))
         return SendResult(True, "ok", channel=channel, ts=ts)
+
+    def find_message(
+        self, channel: str, *, text: str, contains: str, oldest: float, latest: float
+    ) -> SendResult:
+        self.lookups += 1
+        if not self.threads:
+            return SendResult(False, "incoming webhooks cannot read history")
+        for where, message in self.history:
+            ts = float(str(message.get("ts") or 0))
+            if (
+                where == channel
+                and oldest <= ts <= latest
+                and matches_message(message, text=text, contains=contains)
+            ):
+                return SendResult(True, "found", channel=channel, ts=str(message["ts"]))
+        return SendResult(False, "not_found")
 
     def texts(self) -> list[str]:
         return [str(payload.get("text", "")) for _, payload in self.sent]

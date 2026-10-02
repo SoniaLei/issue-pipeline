@@ -677,7 +677,10 @@ Two transports, chosen by `SLACK_TRANSPORT`:
   scopes `chat:write` and `reactions:write`), one channel id per destination
   (`SLACK_CHANNELS`). `chat.postMessage` returns the message `ts`, which
   enables the threaded lifecycle below (D-036). The bot must be invited to
-  each channel.
+  each channel. With `channels:history` (and `groups:history` for private
+  channels) the bot can also find a *PR opened* post that went out through a
+  webhook, so runs that straddle a switch from `webhook` to `bot` still get a
+  thread (D-042); without it those runs' follow-ups stay top-level.
 
 In both, each allowlisted repository maps to an approved **destination key**,
 and only the key resolves to a URL or channel id. A destination is never
@@ -813,8 +816,9 @@ Two independence properties:
 
 1. Agree workspace and exact channels with the owner.
 2. Create or reuse an approved Slack app. Webhook transport: enable Incoming
-   Webhooks. Bot transport: add bot scopes `chat:write` and `reactions:write`,
-   install to the workspace, invite the bot to each channel.
+   Webhooks. Bot transport: add bot scopes `chat:write` and `reactions:write`
+   (plus `channels:history` / `groups:history` to adopt webhook-era anchors,
+   D-042), install to the workspace, invite the bot to each channel.
 3. Authorize a webhook per destination, or note each channel's id (`C…`).
 4. Store the webhook URLs or the bot token as secrets; configure
    repository → destination routing and destination → URL/channel.
