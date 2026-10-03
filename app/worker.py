@@ -444,7 +444,14 @@ class Worker:
             # identical retry fails identically at the same price.
             target, reason = State.FAILED, "acu_limit"
 
-        elapsed = utcnow() - datetime.fromisoformat(str(run["created_at"]))
+        # The duration cap runs from session creation: time spent held in the
+        # queue (D-015) is not session time, and a fresh session cannot expire.
+        started = (
+            self.store.session_started_at(str(run["id"])) if run["session_id"] else None
+        )
+        elapsed = (
+            utcnow() - datetime.fromisoformat(started) if started else timedelta(0)
+        )
         if (
             target not in {State.PR_OPEN, State.FAILED}
             and elapsed.total_seconds() > self.settings.run_max_seconds
