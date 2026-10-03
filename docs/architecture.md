@@ -147,8 +147,9 @@ entered only by check evaluation, which is gated off (D-011). With the gate off,
 a task stays in `pr_open` from the PR opening until it closes. The state is
 defined now so that enabling verification later is a flag and a transition, not
 a migration. The dashboard nevertheless *reports* a `pr_open` run whose
-current head has passing check suites under "awaiting review" — a report-time
-derivation from `checks_state`, not a state change (D-030).
+current head is *verified* — checks passed and, when `REVIEW_GATE_MODE` is
+`required`, Devin Review clear (§8b) — under "awaiting review": a report-time
+derivation, not a state change (D-030, D-033).
 
 Revocation after execution has started is a flag on the run, not a state: see
 §5 Revocation and `decisions.md` D-006.
@@ -1222,7 +1223,7 @@ it shipped as the bot transport in D-036.
 
 ## 16. Documentation, DeepWiki and the overnight sweep (D-034, D-035)
 
-Four kinds of text describe this system, and they are not interchangeable:
+Five kinds of text describe this system, and they are not interchangeable:
 
 | Text | Where | Says | Changed by |
 | --- | --- | --- | --- |
