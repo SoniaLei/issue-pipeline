@@ -488,3 +488,68 @@ def test_a_failed_prune_backs_off_1_2_4_minutes_then_waits_the_interval(
     tick_at(success + PRUNE_INTERVAL_SECONDS)
     tick_at(success + PRUNE_INTERVAL_SECONDS + 60)
     assert len(attempts) == 7
+
+
+def test_daily_cap_counts_sessions_started_not_runs_approved_today(
+    store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    """A run approved days ago and carried over is still a session started
+    today, and counts against today's cap (D-015)."""
+    settings = dataclasses.replace(
+        settings,
+        max_daily_sessions=1,
+        max_concurrent_runs=10,
+        run_max_seconds=7 * 24 * 3600,
+    )
+    devin = SimulatedDevinClient(
+        script=[{"status": "running", "status_detail": "working"}]
+    )
+    worker = Worker(store, settings, devin, slack, owner="test")
+    intake = Intake(store, settings)
+
+    carried = str(
+        intake.handle(delivery_id="d-old", event="issues", payload=_issue(1)).run_id
+    )
+    approved_long_ago = (utcnow() - timedelta(days=3)).isoformat()
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET created_at = ? WHERE id = ?", (approved_long_ago, carried)
+        )
+    fresh = str(
+        intake.handle(delivery_id="d-new", event="issues", payload=_issue(2)).run_id
+    )
+    for _ in range(2):
+        worker.advance_one()
+
+    started = [
+        run_id for run_id in (carried, fresh) if _run(store, run_id)["session_id"]
+    ]
+    assert len(started) == 1
+    held = _run(store, fresh) if started == [carried] else _run(store, carried)
+    assert held["state"] == State.QUEUED.value
+    assert held["failure_reason"] == "daily_cap"
+
+
+def test_a_run_held_in_the_queue_past_the_run_cap_starts_one_session(
+    store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    """Time spent queued is not session time: a carried-over run gets its
+    session recorded and is not expired on creation (D-015)."""
+    devin = SimulatedDevinClient(
+        script=[{"status": "running", "status_detail": "working"}]
+    )
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = queued(Intake(store, settings))
+    held_since = utcnow() - timedelta(seconds=settings.run_max_seconds + 3600)
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET created_at = ? WHERE id = ?",
+            (held_since.isoformat(), run_id),
+        )
+    for _ in range(4):
+        worker.advance_one()
+
+    run = _run(store, run_id)
+    assert run["session_id"] is not None
+    assert run["state"] == State.RUNNING.value
+    assert len(devin._sessions) == 1

@@ -285,6 +285,14 @@ def new_run_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+# The durable `session created` event, or the run's creation for rows that
+# predate it.
+_SESSION_STARTED_AT = """COALESCE(
+    (SELECT MIN(e.at) FROM run_events e
+     WHERE e.run_id = runs.id AND e.kind = 'session' AND e.reason = 'created'),
+    runs.created_at)"""
+
+
 class Store:
     """SQLite-backed persistence.
 
@@ -1078,16 +1086,29 @@ class Store:
         conn.execute("UPDATE runs SET reconciled_at = ? WHERE id = ?", (at, run_id))
 
     def count_sessions_started_since(self, repo: str, since: datetime) -> int:
+        """Sessions created since ``since``, by when the session was created,
+        not when the run was approved: a carried-over run spends today."""
         row = self._conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS n FROM runs
             JOIN tasks ON tasks.id = runs.task_id
             WHERE tasks.repo = ? AND runs.session_id IS NOT NULL
-              AND runs.created_at >= ?
+              AND {_SESSION_STARTED_AT} >= ?
             """,
             (repo, since.isoformat()),
         ).fetchone()
         return int(row["n"])
+
+    def session_started_at(self, run_id: str) -> str | None:
+        """When the run's Devin session was created; None before it exists."""
+        row = self._conn.execute(
+            f"""
+            SELECT {_SESSION_STARTED_AT} AS at FROM runs
+            WHERE runs.id = ? AND runs.session_id IS NOT NULL
+            """,
+            (run_id,),
+        ).fetchone()
+        return str(row["at"]) if row is not None else None
 
     # --------------------------------------------------------------------- leases
 
