@@ -618,7 +618,7 @@ in the run's timeline.
 | --- | --- | --- | --- |
 | Provider progress | `pr-reviews` API | `status`, `status_at`, `attempts`, `last_error` | Has Devin reviewed this commit yet? |
 | Verdict | GitHub review by the Devin bot | `findings`, `findings_by_kind`, `review_url`, `verdict_at` | What did it find on this commit? |
-| Human review | GitHub review by a person | `runs.review_state`, `runs.reviewer` | Does a maintainer accept the change? |
+| Human review | GitHub review by a person | `runs.review_state`; reviewer on the `review` event in `run_events` | Does a maintainer accept the change? |
 
 A `completed` status with no verdict is *awaiting verdict*, never clear. A
 verdict without a status is a verdict. A row is never re-polled once it has a
