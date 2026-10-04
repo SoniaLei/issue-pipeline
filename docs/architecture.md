@@ -952,7 +952,7 @@ CREATE TABLE IF NOT EXISTS run_events (
     at          TEXT NOT NULL,
     kind        TEXT NOT NULL,             -- state|session|pr|checks|verified|
                                            -- review|review_gate|insights|
-                                           -- reconcile|protection
+                                           -- reconcile|protection|approval
     from_state  TEXT,
     to_state    TEXT,
     reason      TEXT,
