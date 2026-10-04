@@ -173,3 +173,17 @@ def test_live_mode_refuses_to_start_without_a_dashboard_token(
         load_settings()
     monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
     assert load_settings().dashboard_token == "s3cret"
+
+
+def test_architecture_schema_is_a_copy_of_the_store_schema() -> None:
+    """architecture.md §10 says its DDL is a copy of `SCHEMA`; keep it one."""
+    from pathlib import Path
+
+    from app.store import SCHEMA
+
+    doc = (Path(__file__).parent.parent / "docs" / "architecture.md").read_text()
+    section = doc[doc.index("## 10. Schema") :]
+    start = section.index("```sql\n") + len("```sql\n")
+    copy = section[start : section.index("```", start)]
+
+    assert copy.strip() == SCHEMA.strip()
