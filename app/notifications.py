@@ -188,6 +188,14 @@ def build_payload(
         lines.append(f"Devin session: {_link(session_url, 'open session')}")
     if run_id:
         lines.append(f"Run: `{run_id}`")
+    if pr_url and run is not None and run["approval_revoked_at"]:
+        # D-006: a revoked run that still produced a PR is announced as
+        # normal, but the reviewer must see the withdrawal before merging.
+        revoked_by = escape(str(run["approval_revoked_by"] or "unknown actor"))
+        lines.append(
+            f"Approval withdrawn mid-run by {revoked_by}; "
+            "the session was allowed to finish"
+        )
     if detail:
         lines.append(f"Detail: {escape(detail)}")
     lines.append(f"Next action: {next_action}")

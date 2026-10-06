@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from app.config import Settings
@@ -28,7 +29,12 @@ from app.slack_client import FakeSlackTransport
 from app.states import State
 from app.store import Store
 from app.worker import Worker
-from tests.conftest import deliver
+from tests.conftest import (
+    deliver,
+    load_fixture,
+    next_delivery_id,
+    substitute_run_id,
+)
 
 
 def test_mentions_are_neutralised_and_markup_escaped() -> None:
@@ -232,3 +238,21 @@ class _NullDevin:
 
     def send_message(self, session_id: str, message: str) -> None:  # pragma: no cover
         raise AssertionError("notification delivery must not touch Devin")
+
+
+def test_pr_opened_after_a_mid_run_revocation_carries_the_note(
+    intake: Intake, store: Store
+) -> None:
+    queued = deliver(intake, "issues", "issue_labeled.json")
+    run_id = str(queued.run_id)
+    with store.transaction() as conn:
+        store.update_run(conn, run_id, state=State.RUNNING.value)
+    deliver(intake, "issues", "issue_unlabeled.json")
+
+    payload = substitute_run_id(load_fixture("pr_opened.json"), run_id)
+    intake.handle(delivery_id=next_delivery_id(), event="pull_request", payload=payload)
+
+    opened = [r for r in store.all_notifications() if r["kind"] == "pr_opened"]
+    assert len(opened) == 1
+    text = json.loads(str(opened[0]["payload"]))["blocks"][0]["text"]["text"]
+    assert "Approval withdrawn mid-run by SoniaLei" in text
