@@ -33,7 +33,7 @@ Two processes run under Docker Compose against a shared database volume:
 | Process | Responsibility |
 | --- | --- |
 | `api` | Receives webhooks, validates and persists them, serves the report and health endpoints. Performs no external calls on the request path. |
-| `worker` | Claims queued work under a lease, creates and polls Devin sessions, recovers orphaned sessions by tag, drains the notification outbox, and when idle re-reads one active run's issue and PR from the GitHub API (§6). |
+| `worker` | Claims queued work under a lease, creates and polls Devin sessions, recovers orphaned sessions by tag, drains the notification outbox, and on every tick, busy or idle, re-reads at most one due active run's issue and PR from the GitHub API (§6). |
 
 GitHub remains the source of truth for issues, pull requests, checks, reviews and
 merges. The database holds our own task state and a cache of the last observed
@@ -303,8 +303,8 @@ Two consequences worth stating plainly:
   GitHub state on an interval, as the safety net for missed, dropped or
   out-of-order deliveries and for recovery after downtime. The Devin half is
   the session poll and tag-based orphan recovery (§8). The GitHub half
-  (`app/reconcile.py`, D-041) runs on worker ticks that found no queued work,
-  plus once at startup for every active run: it fetches the run's issue
+  (`app/reconcile.py`, D-041) runs on every worker tick, busy or idle, plus
+  once at startup for every active run: it fetches the run's issue
   (state, labels, events for the actor), discovers the PR by the recorded
   branch, then reads the PR (state, merged, draft, head), the check suites for
   the current head, the reviews and the base branch's required checks. Each
