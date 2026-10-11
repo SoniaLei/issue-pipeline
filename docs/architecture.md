@@ -219,7 +219,8 @@ On every inbound request, in order:
    a constant-time comparison. Read the raw bytes before any JSON parsing; a
    re-serialized body will not match.
 2. Require an allowlisted repository and a supported event/action pair. Anything
-   else is acknowledged with `204` and dropped, so GitHub does not retry.
+   else is acknowledged with `200` (the JSON body says `accepted: false` and
+   why) and dropped, so GitHub does not retry.
 3. Deduplicate on `X-GitHub-Delivery`. A repeat delivery is recorded and ignored.
 4. Persist the event and any resulting task/run/outbox changes in one
    transaction.
