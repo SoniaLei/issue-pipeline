@@ -1222,7 +1222,7 @@ it shipped as the bot transport in D-036.
 
 ## 16. Documentation, DeepWiki and the overnight sweep (D-034, D-035)
 
-Four kinds of text describe this system, and they are not interchangeable:
+Five kinds of text describe this system, and they are not interchangeable:
 
 | Text | Where | Says | Changed by |
 | --- | --- | --- | --- |
