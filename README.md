@@ -192,10 +192,11 @@ the ones it can check are present:
      id per destination in `SLACK_CHANNELS`
      (`engineering-updates=C0…,automation-alerts=C0…`; the id is at the
      bottom of a channel's *About* tab). Invite the bot to each channel
-     (`/invite @app`). The run's *PR opened* post becomes its anchor: checks
-     failed, Devin Review findings, verified, human review, merged and
-     closed arrive as replies in its thread, each adding a reaction to the
-     anchor (:red_circle: :mag: :large_green_circle: :thumbsup:
+     (`/invite @app`). The run's *PR opened* post becomes its anchor: ready
+     for review, checks failed, Devin Review findings, verified, human
+     review, needs human, merged and closed arrive as replies in its thread,
+     each adding a reaction to the anchor (:eyes: :red_circle: :mag:
+     :large_green_circle: :thumbsup: or :pencil2: :warning:
      :white_check_mark: :no_entry_sign:),
      so the channel reads one line per PR. Follow-ups wait for a retrying
      anchor and fall back to top-level if it never delivered; a reaction
