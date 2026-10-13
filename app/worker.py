@@ -370,8 +370,13 @@ class Worker:
         if exc.retryable:
             try:
                 found = self.devin.find_session_by_tag(f"run:{tag_run_id}")
-            except DevinError:
-                found = None
+            except DevinError as lookup_exc:
+                # Nothing can say whether the create went through, so a second
+                # create could start a second paid session (D-025).
+                self._fail_create(
+                    run_id, task_id, "uncertain_create", f"{exc}; {lookup_exc}"
+                )
+                return
             if found is not None:
                 with self.store.transaction() as conn:
                     self._record_snapshot(conn, run_id, found)
@@ -385,21 +390,31 @@ class Worker:
                 )
             return
 
+        self._fail_create(run_id, task_id, "create_failed", str(exc))
+
+    def _fail_create(
+        self, run_id: str, task_id: int, failure_reason: str, detail: str
+    ) -> None:
+        notify_reason = (
+            "uncertain_create"
+            if failure_reason == "uncertain_create"
+            else "session_error"
+        )
         with self.store.transaction() as conn:
             self.store.update_run(
                 conn,
                 run_id,
                 state=State.FAILED.value,
-                failure_reason="create_failed",
+                failure_reason=failure_reason,
             )
             self._notify(
                 conn,
                 task_id=task_id,
                 run_id=run_id,
                 kind=Kind.NEEDS_HUMAN,
-                reason="session_error",
+                reason=notify_reason,
                 revision=run_id,
-                detail=str(exc),
+                detail=detail,
             )
 
     # ------------------------------------------------------------------- polling
