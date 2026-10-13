@@ -220,6 +220,45 @@ def test_an_ambiguous_create_is_reconciled_by_tag_not_retried(
     assert run["state"] == State.RUNNING.value
 
 
+def test_a_create_whose_tag_lookup_is_unavailable_fails_uncertain_not_retried(
+    store: Store, settings: Settings, slack: FakeSlackTransport
+) -> None:
+    """D-025: if the listing is unavailable, `failed`/`uncertain_create`,
+    never a second create."""
+
+    class BlindClient(SimulatedDevinClient):
+        def __init__(self) -> None:
+            super().__init__(script=[{"status": "running", "status_detail": "working"}])
+            self.create_calls = 0
+
+        def create_session(self, **kwargs: Any) -> SessionSnapshot:
+            self.create_calls += 1
+            super().create_session(**kwargs)
+            raise DevinError("timeout calling /sessions", retryable=True)
+
+        def find_session_by_tag(self, tag: str) -> SessionSnapshot | None:
+            raise DevinError("timeout calling /sessions", retryable=True)
+
+    devin = BlindClient()
+    worker = Worker(store, settings, devin, slack, owner="test")
+    run_id = queued(Intake(store, settings))
+    for _ in range(3):
+        worker.advance_one()
+
+    run = store.get_run(run_id)
+    assert run is not None
+    assert devin.create_calls == 1
+    assert run["state"] == State.FAILED.value
+    assert run["failure_reason"] == "uncertain_create"
+    reasons = [
+        row["reason"]
+        for row in store._conn.execute(
+            "SELECT reason FROM outbox WHERE run_id = ?", (run_id,)
+        )
+    ]
+    assert reasons == ["uncertain_create"]
+
+
 def test_an_expired_lease_is_reclaimed(store: Store, settings: Settings) -> None:
     intake = Intake(store, settings)
     run_id = queued(intake)
