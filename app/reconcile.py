@@ -52,7 +52,7 @@ from typing import Any
 
 from app.config import Settings
 from app.github_client import GitHubClient, GitHubError, MAX_PAGES, PAGE_SIZE
-from app.intake import HUMAN_REVIEW_OUTCOMES, Intake
+from app.intake import HUMAN_REVIEW_OUTCOMES, Intake, PASSING_CONCLUSIONS
 from app.review_gate import is_review_bot
 from app.states import can_transition, is_terminal, State
 from app.store import now_iso, Store, utcnow
@@ -82,10 +82,10 @@ def _as_open(pull: dict[str, Any]) -> dict[str, Any]:
     return {**pull, "state": "open"}
 
 
-def _is_successful_suite(suite: dict[str, Any]) -> bool:
+def _is_passing_suite(suite: dict[str, Any]) -> bool:
     return (
         str(suite.get("status") or "") == "completed"
-        and str(suite.get("conclusion") or "") == "success"
+        and str(suite.get("conclusion") or "") in PASSING_CONCLUSIONS
     )
 
 
@@ -416,7 +416,7 @@ class Reconciler:
         # time, a passing suite could be the only one it knows and verify the
         # head before the failing or pending one arrives; so those go first.
         suites = sorted(
-            self.github.list_check_suites(repo, head), key=_is_successful_suite
+            self.github.list_check_suites(repo, head), key=_is_passing_suite
         )
         for suite in suites:
             suite_id = str(suite.get("id") or "")
