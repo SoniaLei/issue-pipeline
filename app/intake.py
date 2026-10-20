@@ -40,7 +40,13 @@ from app.review_gate import (
     is_verified,
     parse_summary,
 )
-from app.states import can_transition, check_transition, PRE_EXECUTION, State
+from app.states import (
+    can_transition,
+    check_transition,
+    is_terminal,
+    PRE_EXECUTION,
+    State,
+)
 from app.store import now_iso, Store
 
 _PR_LIFECYCLE = frozenset(
@@ -886,7 +892,7 @@ class Intake:
             },
         )
         if commit == run["head_sha"]:
-            if findings > 0:
+            if findings > 0 and not is_terminal(State(str(run["state"]))):
                 self._notify(
                     conn,
                     task_id=task_id,
@@ -973,6 +979,9 @@ class Intake:
                 "mode": mode,
             },
         )
+        if is_terminal(State(str(run["state"]))):
+            # The PR has left review; "ready for human review" would be false.
+            return
         self._notify(
             conn,
             task_id=task_id,
@@ -1101,8 +1110,8 @@ class Intake:
     def _notify_checks_failed(
         self, conn: sqlite3.Connection, run: sqlite3.Row, head_sha: str
     ) -> None:
-        if run["head_sha"] != head_sha:
-            # A failure on a superseded head is history, not news.
+        if run["head_sha"] != head_sha or is_terminal(State(str(run["state"]))):
+            # A failure on a superseded head or a closed PR is history, not news.
             return
         self._notify(
             conn,
